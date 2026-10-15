@@ -54,7 +54,12 @@ FORCEINLINE uint32 GetTypeHash(const FPEPItemId& Id)
 	return GetTypeHash(Id.Value);
 }
 
-/** Generic PEP operation result for infrastructure-level operations that need a reason tag. */
+/**
+ * Generic PEP operation result for infrastructure-level operations that need a reason tag.
+ * Domain results carry the same outcome and reason plus their own context (FPEPItemResult adds the
+ * item id) and convert down to this type, e.g. FPEPItemResult::ToOperationResult(); PEPCore never
+ * depends on them.
+ */
 USTRUCT(BlueprintType)
 struct PEPCORE_API FPEPOperationResult
 {

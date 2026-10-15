@@ -3,13 +3,15 @@
 #include "CoreMinimal.h"
 #include "Engine/AssetManagerTypes.h"
 #include "GameplayTagContainer.h"
-#include "Item/Fragments/PEPItemFragment_Durability.h"
-#include "Item/Fragments/PEPItemFragment_Resource.h"
-#include "Item/Fragments/PEPItemFragment_Stackable.h"
-#include "Item/Fragments/PEPItemFragment_Weight.h"
-#include "Item/Fragments/PEPItemFragment_WorldPresentation.h"
+#include "UObject/SoftObjectPtr.h"
 #include "PEPItemQueryTypes.generated.h"
 
+/*
+ * Plain query result types. Deliberately free of fragment headers: include the fragment you use,
+ * or PEPItemQuery.h for the query functions themselves.
+ */
+
+class UStaticMesh;
 class UTexture2D;
 
 USTRUCT(BlueprintType)

@@ -16,10 +16,14 @@ EDataValidationResult FPEPItemFragment_Weight::ValidateFragmentData(
 	FDataValidationContext& Context,
 	const int32 FragmentIndex) const
 {
-	if (GetEffectiveUnitWeight() < 0.0f)
+	// The effective value is already clamped and NaN-safe, so check the authored one.
+	const float AuthoredUnitWeight = bUseProjectDefaultUnitWeight
+		? PEPItemSettings().DefaultUnitWeight
+		: UnitWeight;
+	if (!FMath::IsFinite(AuthoredUnitWeight) || AuthoredUnitWeight < 0.0f)
 	{
 		Context.AddError(FText::FromString(FString::Printf(
-			TEXT("DefinitionFragments[%d].Weight effective UnitWeight must not be negative."),
+			TEXT("DefinitionFragments[%d].Weight effective UnitWeight must be finite and not negative."),
 			FragmentIndex)));
 		return EDataValidationResult::Invalid;
 	}

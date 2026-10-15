@@ -7,6 +7,8 @@
 #include "Item/Fragments/PEPItemFragment_Resource.h"
 #include "Item/Fragments/PEPItemFragment_Stackable.h"
 #include "Item/Fragments/PEPItemFragment_WorldPresentation.h"
+#include "Engine/GameInstance.h"
+#include "Item/PEPIdAllocatorSubsystem.h"
 #include "Item/PEPItemDefinition.h"
 #include "Item/PEPItemInstance.h"
 #include "Serialization/MemoryReader.h"
@@ -15,21 +17,46 @@
 
 namespace PEPItemSaveGameArchiveTests
 {
-	/** Same archive setup as a USaveGame-style save: names as strings, only SaveGame properties. */
-	FPEPItemInstance RoundTrip(FPEPItemInstance& Item)
+	/**
+	 * Same archive setup as a USaveGame-style save: names as strings, only SaveGame properties.
+	 * With Defaults, tagged serialization skips every property equal to it, the way a struct
+	 * nested in a UObject is delta-saved against its archetype.
+	 */
+	TArray<uint8> Write(FPEPItemInstance& Item, const FPEPItemInstance* Defaults = nullptr)
 	{
 		TArray<uint8> Bytes;
 		FMemoryWriter Writer(Bytes, true);
 		FObjectAndNameAsStringProxyArchive WriterProxy(Writer, true);
 		WriterProxy.ArIsSaveGame = true;
-		FPEPItemInstance::StaticStruct()->SerializeItem(WriterProxy, &Item, nullptr);
+		FPEPItemInstance::StaticStruct()->SerializeItem(WriterProxy, &Item, Defaults);
+		return Bytes;
+	}
 
-		FPEPItemInstance Loaded;
+	/** Loads over OutLoaded, so a property absent from the archive keeps OutLoaded's value. */
+	void ReadInto(const TArray<uint8>& Bytes, FPEPItemInstance& OutLoaded)
+	{
 		FMemoryReader Reader(Bytes, true);
 		FObjectAndNameAsStringProxyArchive ReaderProxy(Reader, true);
 		ReaderProxy.ArIsSaveGame = true;
-		FPEPItemInstance::StaticStruct()->SerializeItem(ReaderProxy, &Loaded, nullptr);
+		FPEPItemInstance::StaticStruct()->SerializeItem(ReaderProxy, &OutLoaded, nullptr);
+	}
+
+	FPEPItemInstance RoundTrip(FPEPItemInstance& Item)
+	{
+		FPEPItemInstance Loaded;
+		ReadInto(Write(Item), Loaded);
 		return Loaded;
+	}
+
+	UPEPItemDefinition* MakeStackDefinition()
+	{
+		UPEPItemDefinition* Definition = NewObject<UPEPItemDefinition>(GetTransientPackage());
+		FPEPItemFragment_Stackable Stackable;
+		Stackable.bUseProjectDefaultMaxStackSize = false;
+		Stackable.MaxStackSize = 10;
+		Definition->DefinitionFragments.Add(FInstancedStruct::Make(Stackable));
+		PEPItemAutomationTestSupport::RegisterTransientDefinitionForTests(Definition);
+		return Definition;
 	}
 }
 
@@ -129,6 +156,87 @@ bool FPEPItemSaveGameArchiveFutureVersionTest::RunTest(const FString& Parameters
 	FPEPItemInstanceValidationResult Validation;
 	TestFalse(TEXT("a record from a newer build is rejected rather than downgraded"),
 		Loaded.ValidateInstance(Validation));
+
+	PEPItemAutomationTestSupport::UnregisterTransientDefinitionForTests(Definition->GetPrimaryAssetId());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPItemSaveGameArchiveUnversionedTest,
+	"PEP.Items.Save.UnversionedRecordLoadsAsCurrent",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPItemSaveGameArchiveUnversionedTest::RunTest(const FString& Parameters)
+{
+	UPEPItemDefinition* Definition = PEPItemSaveGameArchiveTests::MakeStackDefinition();
+	FPEPItemInstance Item = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	if (FPEPItemState_Stack* State = FPEPItemMutableAccess::GetMutableState<FPEPItemState_Stack>(Item))
+	{
+		State->Count = 3;
+	}
+	TestEqual(TEXT("a created record is stamped current"),
+		Item.SchemaVersion, FPEPItemInstance::CurrentSchemaVersion);
+
+	// A record written as unversioned (0) is legacy version 1 data and is upgraded on load.
+	Item.SchemaVersion = FPEPItemInstance::UnversionedSchemaVersion;
+	const FPEPItemInstance LoadedFromZero = PEPItemSaveGameArchiveTests::RoundTrip(Item);
+	TestEqual(TEXT("a record saved with version 0 loads as current"),
+		LoadedFromZero.SchemaVersion, FPEPItemInstance::CurrentSchemaVersion);
+	FPEPItemInstanceValidationResult Validation;
+	TestTrue(TEXT("the migrated record validates"), LoadedFromZero.ValidateInstance(Validation));
+	const FPEPItemState_Stack* MigratedCount = LoadedFromZero.GetState<FPEPItemState_Stack>();
+	TestTrue(TEXT("migration keeps the state"), MigratedCount && MigratedCount->Count == 3);
+
+	// Delta-saved against a default record, the version field matches the default and is skipped:
+	// this is what saves written before the field was persisted look like.
+	const FPEPItemInstance DefaultRecord;
+	const TArray<uint8> WithoutVersion = PEPItemSaveGameArchiveTests::Write(Item, &DefaultRecord);
+
+	FPEPItemInstance Probe;
+	Probe.SchemaVersion = FPEPItemInstance::CurrentSchemaVersion + 1;
+	PEPItemSaveGameArchiveTests::ReadInto(WithoutVersion, Probe);
+	TestEqual(TEXT("the archive really omits SchemaVersion (the probe keeps its own value)"),
+		Probe.SchemaVersion, FPEPItemInstance::CurrentSchemaVersion + 1);
+
+	FPEPItemInstance LoadedWithoutVersion;
+	PEPItemSaveGameArchiveTests::ReadInto(WithoutVersion, LoadedWithoutVersion);
+	TestEqual(TEXT("a record without SchemaVersion loads as current"),
+		LoadedWithoutVersion.SchemaVersion, FPEPItemInstance::CurrentSchemaVersion);
+	TestTrue(TEXT("its identity survives"),
+		LoadedWithoutVersion.ItemId == Item.ItemId && LoadedWithoutVersion.DefinitionId == Item.DefinitionId);
+	TestTrue(TEXT("and it validates"), LoadedWithoutVersion.ValidateInstance(Validation));
+
+	PEPItemAutomationTestSupport::UnregisterTransientDefinitionForTests(Definition->GetPrimaryAssetId());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPItemSaveGameArchiveObservedIdTest,
+	"PEP.Items.Save.LoadedIdsAreNeverReallocated",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPItemSaveGameArchiveObservedIdTest::RunTest(const FString& Parameters)
+{
+	UPEPItemDefinition* Definition = PEPItemSaveGameArchiveTests::MakeStackDefinition();
+	FPEPItemInstance Item = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	TestTrue(TEXT("the allocator produced an id"), Item.ItemId.IsValid() && Item.ItemId.Value >= 0);
+
+	// A save from a later session holds ids this process has not reached yet.
+	Item.ItemId.Value += 100;
+	const FPEPItemInstance Loaded = PEPItemSaveGameArchiveTests::RoundTrip(Item);
+	TestTrue(TEXT("the loaded id survives"), Loaded.ItemId == Item.ItemId);
+
+	const FPEPItemInstance Next = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	TestTrue(TEXT("the next allocation lands past every loaded id"), Next.ItemId.Value > Item.ItemId.Value);
+
+	// Restoring an older allocator snapshot never pulls the counter back below loaded ids. The
+	// subsystem needs a GameInstance outer; this one has no world, so it counts as the authority.
+	UGameInstance* GameInstance = NewObject<UGameInstance>(GetTransientPackage());
+	UPEPIdAllocatorSubsystem* Allocator = NewObject<UPEPIdAllocatorSubsystem>(GameInstance);
+	FPEPItemIdAllocatorSaveState OldState;
+	OldState.NextId = 0;
+	Allocator->RestoreFromSaveState(OldState);
+	TestTrue(TEXT("restore is monotonic"), Allocator->GetSaveState().NextId > Next.ItemId.Value);
 
 	PEPItemAutomationTestSupport::UnregisterTransientDefinitionForTests(Definition->GetPrimaryAssetId());
 	return true;

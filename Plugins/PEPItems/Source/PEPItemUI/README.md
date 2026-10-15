@@ -20,7 +20,9 @@ Le widget contient les widgets nommés et variables suivants, reliés aux `BindW
 
 Appeler `SetItemInstance` pour construire le snapshot de présentation et actualiser le widget. `ClearItem` vide les champs et invalide les chargements d’icône en cours. Le widget ne s’abonne pas à un inventaire : le widget propriétaire doit le rafraîchir lorsque son modèle change. Chaque projet peut créer un widget enfant et personnaliser le style ou ajouter des informations propres au jeu.
 
-`BuildItemViewData` retourne des données de présentation et ne modifie jamais l’instance. Il ne charge pas la définition : si elle n’est pas déjà en mémoire, le helper renvoie `false`. Le propriétaire doit charger cette définition de façon asynchrone puis rappeler `SetItemInstance`. Une fois les données de présentation disponibles, le widget charge lui-même l’icône soft de façon asynchrone. Les autres champs de définition sont accessibles via les requêtes d’ItemCore.
+Le snapshot courant se lit par `GetViewData()` (Blueprint Pure); la propriété `ViewData` reste lisible par les Blueprints enfants mais n’est plus publique. Après chaque `SetItemInstance` ou `ClearItem`, le widget met à jour ses widgets natifs puis déclenche l’événement Blueprint `OnItemViewDataChanged(NewViewData)` : c’est le point d’extension des widgets enfants, sans sondage de `ViewData`. En C++, `RefreshView()` est virtuelle (appeler `Super` pour conserver le comportement par défaut).
+
+`BuildItemViewData` retourne des données de présentation et ne modifie jamais l’instance. Il ne charge pas la définition : si elle n’est pas déjà en mémoire, le helper renvoie `false`. `bHasStack` n’est vrai que si l’item est stackable et porte un état de stack valide. Le propriétaire doit charger cette définition de façon asynchrone puis rappeler `SetItemInstance`. Une fois les données de présentation disponibles, le widget charge lui-même l’icône soft de façon asynchrone. Les autres champs de définition sont accessibles via les requêtes d’ItemCore.
 
 ## Drag & drop générique
 

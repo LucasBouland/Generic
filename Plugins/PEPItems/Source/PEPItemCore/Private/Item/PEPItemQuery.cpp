@@ -1,5 +1,6 @@
 #include "Item/PEPItemQuery.h"
 
+#include "Item/Fragments/PEPItemFragment_Weight.h"
 #include "Item/PEPItemSettings.h"
 #include "Item/PEPItemLogChannels.h"
 
@@ -84,6 +85,18 @@ namespace PEPItemQuery
 		return true;
 	}
 
+	bool DoesDefinitionMatchRequiredBlockedTags(
+		const UPEPItemDefinition* Definition,
+		const FGameplayTagContainer& RequiredTags,
+		const FGameplayTagContainer& BlockedTags)
+	{
+		// HasAllOwnedTags is true for an empty container and HasAnyOwnedTags false, which is exactly
+		// "no requirement" and "nothing blocked".
+		return Definition
+			&& Definition->HasAllOwnedTags(RequiredTags)
+			&& !Definition->HasAnyOwnedTags(BlockedTags);
+	}
+
 	bool DoesItemMatchRequiredBlockedTags(
 		const FPEPItemInstance& Item,
 		const FGameplayTagContainer& RequiredTags,
@@ -91,20 +104,8 @@ namespace PEPItemQuery
 	{
 		// Fail closed even when no filters are supplied. An empty filter means "any valid item",
 		// not an invalid instance or one whose definition is unavailable.
-		const UPEPItemDefinition* Definition = GetDefinition(Item);
-		if (!Item.IsValid() || !Definition)
-		{
-			return false;
-		}
-		if (!Definition->HasAllOwnedTags(RequiredTags))
-		{
-			return false;
-		}
-		if (!BlockedTags.IsEmpty() && Definition->HasAnyOwnedTags(BlockedTags))
-		{
-			return false;
-		}
-		return true;
+		return Item.IsValid()
+			&& DoesDefinitionMatchRequiredBlockedTags(GetDefinition(Item), RequiredTags, BlockedTags);
 	}
 
 	bool GetStackData(
@@ -113,19 +114,27 @@ namespace PEPItemQuery
 	{
 		OutData = FPEPItemStackData();
 		const FPEPItemFragment_Stackable* Fragment = GetFragment<FPEPItemFragment_Stackable>(Item);
-		if (!Fragment)
+		const FPEPItemState_Stack* State = GetState<FPEPItemState_Stack>(Item);
+		if (!Fragment || !State)
 		{
 			PEPItemLog::LogQueryFailure(TEXT("PEPItemQuery.GetStackData"), Item);
 			return false;
 		}
 
-		const FPEPItemState_Stack* State = GetState<FPEPItemState_Stack>(Item);
+		// Same contract as durability and resource: a missing or out-of-range state is reported as
+		// such, never papered over with a guessed count.
+		const int32 MaxStackSize = Fragment->GetEffectiveMaxStackSize();
+		if (State->Count < 0 || State->Count > MaxStackSize)
+		{
+			PEPItemLog::LogQueryFailure(TEXT("PEPItemQuery.GetStackData"), Item);
+			return false;
+		}
+
 		OutData.bValid = true;
-		OutData.MaxStackSize = PEPItemSettings().GetEffectiveMaxStackSize(
-			Fragment->MaxStackSize, Fragment->bUseProjectDefaultMaxStackSize);
-		OutData.Count = FMath::Clamp(State ? State->Count : 1, 0, OutData.MaxStackSize);
-		OutData.FreeSpace = FMath::Max(0, OutData.MaxStackSize - OutData.Count);
-		OutData.bFull = OutData.Count >= OutData.MaxStackSize;
+		OutData.MaxStackSize = MaxStackSize;
+		OutData.Count = State->Count;
+		OutData.FreeSpace = MaxStackSize - State->Count;
+		OutData.bFull = State->Count >= MaxStackSize;
 		return true;
 	}
 
@@ -192,26 +201,47 @@ namespace PEPItemQuery
 		FPEPItemWeightData& OutData)
 	{
 		OutData = FPEPItemWeightData();
-		if (!Item.IsValid())
+		// Without the definition, "no Weight fragment" and "not loaded" look the same; reporting the
+		// project default for an unloaded item would be a confident wrong answer.
+		const UPEPItemDefinition* Definition = GetDefinition(Item);
+		if (!Item.IsValid() || !Definition)
 		{
 			PEPItemLog::LogQueryFailure(TEXT("PEPItemQuery.GetWeightData"), Item);
 			return false;
 		}
 
-		const FPEPItemFragment_Weight* Fragment = GetFragment<FPEPItemFragment_Weight>(Item);
-		OutData.bUsesDefaultWeight = Fragment == nullptr;
-		OutData.UnitWeight = Fragment
-			                     ? Fragment->GetEffectiveUnitWeight()
-			                     : PEPItemSettings().GetEffectiveUnitWeight(0.0f, true);
+		const FPEPItemFragment_Weight* Fragment = Definition->GetDefinitionFragment<FPEPItemFragment_Weight>();
+		const float UnitWeight = Fragment
+			                         ? Fragment->GetEffectiveUnitWeight()
+			                         : PEPItemSettings().GetEffectiveUnitWeight(0.0f, true);
 
 		// A stack weighs its unit weight times its count; anything else counts as a single unit.
-		// Read the state directly rather than through GetStackData, which would log a query
-		// failure for every non-stackable item.
-		const FPEPItemState_Stack* StackState = GetState<FPEPItemState_Stack>(Item);
-		const int32 UnitCount = StackState ? FMath::Max(0, StackState->Count) : 1;
-		OutData.StackWeight = OutData.UnitWeight * static_cast<float>(UnitCount);
+		int32 UnitCount = 1;
+		if (const FPEPItemFragment_Stackable* StackFragment =
+			Definition->GetDefinitionFragment<FPEPItemFragment_Stackable>())
+		{
+			const FPEPItemState_Stack* StackState = GetState<FPEPItemState_Stack>(Item);
+			if (!StackState
+				|| StackState->Count < 0
+				|| StackState->Count > StackFragment->GetEffectiveMaxStackSize())
+			{
+				PEPItemLog::LogQueryFailure(TEXT("PEPItemQuery.GetWeightData"), Item);
+				return false;
+			}
+			UnitCount = StackState->Count;
+		}
+
+		const float StackWeight = UnitWeight * static_cast<float>(UnitCount);
+		if (!FMath::IsFinite(StackWeight))
+		{
+			PEPItemLog::LogQueryFailure(TEXT("PEPItemQuery.GetWeightData"), Item);
+			return false;
+		}
 
 		OutData.bValid = true;
+		OutData.bUsesDefaultWeight = Fragment == nullptr;
+		OutData.UnitWeight = UnitWeight;
+		OutData.StackWeight = StackWeight;
 		return true;
 	}
 
@@ -231,10 +261,10 @@ namespace PEPItemQuery
 	}
 }
 
-UPEPItemDefinition* UPEPItemQueryLibrary::GetItemDefinition(
+const UPEPItemDefinition* UPEPItemQueryLibrary::GetItemDefinition(
 	const FPEPItemInstance& Item)
 {
-	return const_cast<UPEPItemDefinition*>(PEPItemQuery::GetDefinition(Item));
+	return PEPItemQuery::GetDefinition(Item);
 }
 
 bool UPEPItemQueryLibrary::GetItemDisplayData(

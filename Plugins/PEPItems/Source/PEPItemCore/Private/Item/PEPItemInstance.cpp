@@ -8,6 +8,7 @@
 #include "Item/PEPIdAllocatorSubsystem.h"
 #include "Engine/AssetManager.h"
 #include "Core/PEPTypes.h"
+#include "CoreGlobals.h"
 
 
 FPEPItemInstance::FPEPItemInstance() = default;
@@ -112,7 +113,16 @@ FPEPItemInstance FPEPItemInstance::DuplicateWithNewId() const
 	}
 	Duplicate = *this;
 	Duplicate.ItemId.Value = UPEPIdAllocatorSubsystem::AllocateNext();
-	Duplicate.NormalizeStateFragments();
+	// A record created by this build carries this build's layout: an older source's data is
+	// upgraded with it (migration also normalizes). A newer one is copied as is and stays invalid.
+	if (Duplicate.SchemaVersion >= UnversionedSchemaVersion && Duplicate.SchemaVersion < CurrentSchemaVersion)
+	{
+		Duplicate.MigrateInstanceFromVersion(Duplicate.SchemaVersion);
+	}
+	else
+	{
+		Duplicate.NormalizeStateFragments();
+	}
 	return Duplicate;
 }
 
@@ -124,7 +134,7 @@ bool FPEPItemInstance::TryDuplicateWithNewId(FPEPItemInstance& OutItem) const
 
 void FPEPItemInstance::Reset()
 {
-	SchemaVersion = CurrentSchemaVersion;
+	SchemaVersion = UnversionedSchemaVersion;
 	ItemId.Reset();
 	DefinitionId = FPrimaryAssetId();
 	StateFragments.Reset();
@@ -137,6 +147,8 @@ void FPEPItemInstance::InitializeNew(const UPEPItemDefinition* Definition)
 	{
 		return;
 	}
+	// Built by this build, so it is current by construction; only archives carry older layouts.
+	SchemaVersion = CurrentSchemaVersion;
 	ItemId.Value = UPEPIdAllocatorSubsystem::AllocateNext();
 	DefinitionId = Definition->GetPrimaryAssetId();
 	Definition->BuildDefaultStateFragments(StateFragments);
@@ -159,7 +171,15 @@ const UPEPItemDefinition* FPEPItemInstance::GetDefinitionIfLoaded() const
 
 	const UPEPItemDefinition* Definition = nullptr;
 #if WITH_DEV_AUTOMATION_TESTS
-	Definition = PEPItemAutomationTestSupport::FindTransientDefinitionForTests(DefinitionId);
+	/*
+	 * Development builds, dedicated servers included, compile the test registry in. It is only
+	 * consulted while an automation test runs, so a stale or deliberately registered transient
+	 * definition can never shadow the real asset in a game.
+	 */
+	if (GIsAutomationTesting)
+	{
+		Definition = PEPItemAutomationTestSupport::FindTransientDefinitionForTests(DefinitionId);
+	}
 #endif
 	if (!Definition)
 	{
@@ -281,7 +301,9 @@ namespace
 			if (FPEPItemState_Resource* ResourceState = FPEPItemMutableAccess::GetMutableState<
 				FPEPItemState_Resource>(Item))
 			{
-				const int32 MaxResource = FMath::Max(1, ResourceFragment->MaxResource);
+				// Same range ValidateInstance accepts. A non-positive MaxResource is a definition error
+				// repair cannot fix; clamping to it still leaves the state at its only defensible value.
+				const int32 MaxResource = FMath::Max(0, ResourceFragment->MaxResource);
 				ResourceState->Current = FMath::Clamp(ResourceState->Current, 0, MaxResource);
 			}
 		}
@@ -290,7 +312,8 @@ namespace
 
 void FPEPItemInstance::NormalizeStateFragments()
 {
-	TArray<const UScriptStruct*> SeenStructs;
+	// Items carry a handful of states; the inline buffer keeps this off the heap on every call.
+	TArray<const UScriptStruct*, TInlineAllocator<8>> SeenStructs;
 	StateFragments.RemoveAll(
 		[&SeenStructs](const FInstancedStruct& Entry)
 		{
@@ -320,7 +343,12 @@ bool FPEPItemInstance::ValidateInstance(
 	FPEPItemInstanceValidationResult& OutResult) const
 {
 	OutResult = FPEPItemInstanceValidationResult();
-	if (SchemaVersion <= 0 || SchemaVersion > CurrentSchemaVersion)
+	if (SchemaVersion == UnversionedSchemaVersion)
+	{
+		OutResult.AddError(NSLOCTEXT("PEPItemValidation", "UnversionedSchema",
+			"Item schema version is unset; migrate the record before using it."));
+	}
+	else if (SchemaVersion < 0 || SchemaVersion > CurrentSchemaVersion)
 	{
 		OutResult.AddError(FText::Format(
 			NSLOCTEXT("PEPItemValidation", "InvalidSchemaVersion", "Invalid item schema version: {0}."),
@@ -342,7 +370,13 @@ bool FPEPItemInstance::ValidateInstance(
 		                             "Item definition is missing or not loaded."));
 	}
 
-	TArray<const UScriptStruct*> SeenStateTypes;
+	/*
+	 * Validation runs at every mutation boundary (each stack rule validates its operands), so the
+	 * bookkeeping below stays on inline buffers sized for the built-in fragments, and the state
+	 * list is walked once to collect both the families and the per-unit states.
+	 */
+	TArray<const UScriptStruct*, TInlineAllocator<8>> SeenStateTypes;
+	TArray<const UScriptStruct*, TInlineAllocator<4>> DivisibleStateTypes;
 	for (const FInstancedStruct& Entry : StateFragments)
 	{
 		const UScriptStruct* StateStruct = Entry.GetScriptStruct();
@@ -364,11 +398,20 @@ bool FPEPItemInstance::ValidateInstance(
 			}
 		}
 		SeenStateTypes.Add(StateStruct);
+
+		const FPEPItemStateFragment* State = Entry.GetPtr<FPEPItemStateFragment>();
+		if (State && State->GetStackability() == EPEPStateStackability::Divisible)
+		{
+			DivisibleStateTypes.Add(StateStruct);
+		}
 	}
 
 	if (Definition)
 	{
-		TArray<const UScriptStruct*> OwnedStateTypes;
+		TArray<const UScriptStruct*, TInlineAllocator<8>> OwnedStateTypes;
+		// GetOwnedStateStructs is a virtual taking a heap-allocated array: reuse one buffer for every
+		// fragment instead of allocating per fragment.
+		TArray<const UScriptStruct*> FragmentOwnedStates;
 		for (const FInstancedStruct& FragmentEntry : Definition->GetDefinitionFragments())
 		{
 			const FPEPItemFragment* Fragment = FragmentEntry.GetPtr<FPEPItemFragment>();
@@ -376,7 +419,7 @@ bool FPEPItemInstance::ValidateInstance(
 			{
 				continue;
 			}
-			TArray<const UScriptStruct*> FragmentOwnedStates;
+			FragmentOwnedStates.Reset();
 			Fragment->GetOwnedStateStructs(FragmentOwnedStates);
 			for (const UScriptStruct* OwnedState : FragmentOwnedStates)
 			{
@@ -432,16 +475,12 @@ bool FPEPItemInstance::ValidateInstance(
 				}
 			}
 
-			for (const FInstancedStruct& StateEntry : StateFragments)
+			for (const UScriptStruct* DivisibleStateType : DivisibleStateTypes)
 			{
-				const FPEPItemStateFragment* State = StateEntry.GetPtr<FPEPItemStateFragment>();
-				if (State && State->GetStackability() == EPEPStateStackability::Divisible)
-				{
-					OutResult.AddError(FText::Format(
-						NSLOCTEXT("PEPItemValidation", "StackableItemHasPerUnitState",
-							"Stackable item carries per-unit state that cannot be split safely: {0}."),
-						FText::FromString(StateEntry.GetScriptStruct()->GetName())));
-				}
+				OutResult.AddError(FText::Format(
+					NSLOCTEXT("PEPItemValidation", "StackableItemHasPerUnitState",
+						"Stackable item carries per-unit state that cannot be split safely: {0}."),
+					FText::FromString(DivisibleStateType->GetName())));
 			}
 		}
 
@@ -487,31 +526,60 @@ bool FPEPItemInstance::ValidateInstance(
 
 bool FPEPItemInstance::MigrateInstanceFromVersion(const int32 LoadedSchemaVersion)
 {
-	if (LoadedSchemaVersion > CurrentSchemaVersion || LoadedSchemaVersion <= 0)
+	if (LoadedSchemaVersion < UnversionedSchemaVersion || LoadedSchemaVersion > CurrentSchemaVersion)
 	{
 		return false;
 	}
-	SchemaVersion = CurrentSchemaVersion;
+
+	/*
+	 * An unversioned record predates the persisted field (or was delta-skipped as the old default
+	 * of 1), so it holds version 1 data. Each future version adds its step below, in order:
+	 *     if (Version == 1) { ...upgrade 1 -> 2...; Version = 2; }
+	 */
+	int32 Version = LoadedSchemaVersion == UnversionedSchemaVersion ? 1 : LoadedSchemaVersion;
+	checkf(Version == CurrentSchemaVersion,
+		TEXT("MigrateInstanceFromVersion has no upgrade step from schema %d to %d."),
+		Version, CurrentSchemaVersion);
+
+	SchemaVersion = Version;
 	NormalizeStateFragments();
 	return true;
 }
 
 void FPEPItemInstance::PostSerialize(const FArchive& Ar)
 {
+	if (!Ar.IsLoading())
+	{
+		return;
+	}
+
 	/*
 	 * Archive loads (save games, object duplication) are where a record written by an older build
 	 * enters the game, so the upgrade happens here once instead of in every importer. A version
 	 * newer than this build is left untouched: ValidateInstance then rejects it rather than the data
 	 * being silently relabelled as current.
 	 */
-	if (Ar.IsLoading() && SchemaVersion < CurrentSchemaVersion)
+	if (SchemaVersion < CurrentSchemaVersion)
 	{
 		MigrateInstanceFromVersion(SchemaVersion);
+	}
+
+	/*
+	 * A loaded id must never be allocated again, even if the project restores the allocator state
+	 * after loading its items, or never saved it. Atomic, so safe on a loading thread.
+	 */
+	if (ItemId.IsValid())
+	{
+		UPEPIdAllocatorSubsystem::ObserveLoadedId(ItemId.Value);
 	}
 }
 
 bool FPEPItemInstance::RepairLoadedInstance()
 {
+	if (SchemaVersion < CurrentSchemaVersion)
+	{
+		MigrateInstanceFromVersion(SchemaVersion);
+	}
 	NormalizeStateFragments();
 	const UPEPItemDefinition* Definition = GetDefinitionIfLoaded();
 	if (Definition)

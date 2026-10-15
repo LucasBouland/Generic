@@ -25,4 +25,4 @@ Do not add a module dependency to PEPCore merely to make a type convenient to in
 
 `FPEPItemId` remains in `/Script/PEPCore` to keep its shared reflected identity type stable. Runtime IDs are allocated only while creating an item through the authority-checked PEPItemCore API; the allocator itself is not a public Blueprint operation. Other moved reflected types and classes have CoreRedirects in their new plugins; keep those redirects while assets may still reference their old `/Script/PEPCore` paths.
 
-`PEPCore` does not own item, inventory, equipment, weapon, interaction, action or UI result types. It owns `FPEPOperationResult` only when a result needs generic success/failure and a canonical reason tag.
+`PEPCore` does not own item, inventory, equipment, weapon, interaction, action or UI result types. It owns `FPEPOperationResult` only when a result needs generic success/failure and a canonical reason tag. Domain results carry the same `bSuccess`/`ReasonTag` pair plus their own context and convert down to it — for example `FPEPItemResult::ToOperationResult()` in PEPItemCore, which drops only the item id. PEPCore never depends on those domain types.

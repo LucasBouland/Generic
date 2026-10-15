@@ -32,6 +32,34 @@ namespace PEPItemMutation
 		int32 SplitCount,
 		FPEPItemInstance& OutSplitItem);
 
+	/**
+	 * Id carried by records produced by PreviewSplitStack: Value is MAX_int32. Valid as an id, so a
+	 * preview passes the same placement and validation checks as the real split, yet it can never
+	 * name a stored item: the allocator refuses to hand out MAX_int32. Never store, replicate or
+	 * persist a record carrying it.
+	 */
+	inline FPEPItemId GetPreviewItemId()
+	{
+		FPEPItemId PreviewId;
+		PreviewId.Value = MAX_int32;
+		return PreviewId;
+	}
+
+	/**
+	 * What SplitStack would produce, without allocating an id or touching SourceItem: same rule,
+	 * same state math. OutSourceAfter is SourceItem with SplitCount units taken off; OutSplitItem
+	 * is the new stack, carrying GetPreviewItemId() instead of a real id. Safe on clients and in
+	 * const contexts; the authority still calls SplitStack, which re-runs the rule on live state.
+	 *
+	 * @return The CanSplitStack result. On success its ItemId is the source's, never the preview id.
+	 *         On failure both outputs are reset.
+	 */
+	PEPITEMCORE_API FPEPItemResult PreviewSplitStack(
+		const FPEPItemInstance& SourceItem,
+		int32 SplitCount,
+		FPEPItemInstance& OutSourceAfter,
+		FPEPItemInstance& OutSplitItem);
+
 	PEPITEMCORE_API bool DuplicateItemWithNewId(
 		const FPEPItemInstance& SourceItem,
 		FPEPItemInstance& OutDuplicateItem);

@@ -2,6 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
+#include "Item/Fragments/PEPItemFragment_Durability.h"
+#include "Item/Fragments/PEPItemFragment_Resource.h"
+#include "Item/Fragments/PEPItemFragment_Stackable.h"
+#include "Item/Fragments/PEPItemFragment_WorldPresentation.h"
 #include "Item/PEPItemDefinition.h"
 #include "Item/PEPItemInstance.h"
 #include "Item/PEPItemQueryTypes.h"
@@ -40,11 +44,30 @@ namespace PEPItemQuery
 		const FPEPItemInstance& Item,
 		FGameplayTagContainer& OutTags);
 
+	/**
+	 * The single tag filter used by every PEP domain (container slots, equipment slots, unlock keys).
+	 * Fails closed on a null definition. Every RequiredTags tag must be owned (empty means no
+	 * requirement); no BlockedTags tag may be owned (empty blocks nothing).
+	 */
+	PEPITEMCORE_API bool DoesDefinitionMatchRequiredBlockedTags(
+		const UPEPItemDefinition* Definition,
+		const FGameplayTagContainer& RequiredTags,
+		const FGameplayTagContainer& BlockedTags);
+
+	/**
+	 * DoesDefinitionMatchRequiredBlockedTags on the item's loaded definition. Fails closed on an
+	 * invalid item or an unloaded definition, even when both filters are empty: an empty filter means
+	 * "any valid item", not "anything at all".
+	 */
 	PEPITEMCORE_API bool DoesItemMatchRequiredBlockedTags(
 		const FPEPItemInstance& Item,
 		const FGameplayTagContainer& RequiredTags,
 		const FGameplayTagContainer& BlockedTags);
 
+	/**
+	 * Fails (bValid false) when the definition is not loaded or not stackable, or when the stack
+	 * state is missing or outside 0..MaxStackSize — the same contract as durability and resource.
+	 */
 	PEPITEMCORE_API bool GetStackData(
 		const FPEPItemInstance& Item,
 		FPEPItemStackData& OutData);
@@ -57,7 +80,12 @@ namespace PEPItemQuery
 		const FPEPItemInstance& Item,
 		FPEPItemResourceData& OutData);
 
-	/** Always succeeds for a valid item: a definition without a Weight fragment uses the project default. */
+	/**
+	 * Succeeds for a valid item whose definition is loaded: a definition without a Weight fragment
+	 * uses the project default. Fails (bValid false) when the definition is not loaded, since the
+	 * fragment cannot then be told apart from its absence, and when a stackable item has no valid
+	 * stack state.
+	 */
 	PEPITEMCORE_API bool GetWeightData(
 		const FPEPItemInstance& Item,
 		FPEPItemWeightData& OutData);
@@ -122,8 +150,9 @@ class PEPITEMCORE_API UPEPItemQueryLibrary : public UBlueprintFunctionLibrary
 	GENERATED_BODY()
 
 public:
+	/** The loaded definition, or null when it is not resident. Read-only: definitions are shared assets. */
 	UFUNCTION(BlueprintPure, Category="PEP|Item|Query")
-	static UPEPItemDefinition* GetItemDefinition(
+	static const UPEPItemDefinition* GetItemDefinition(
 		const FPEPItemInstance& Item);
 
 	UFUNCTION(BlueprintPure, Category="PEP|Item|Query")

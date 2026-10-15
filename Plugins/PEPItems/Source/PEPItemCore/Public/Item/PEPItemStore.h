@@ -214,12 +214,16 @@ public:
 	 * Hands responsibility for locations under RootLocationTag to a domain plugin.
 	 * The store keeps owning storage; the registrant decides what may go where.
 	 *
+	 * No default for bAllowAutoPlacement, for the same reason as the access context above: a default
+	 * on a virtual binds to the static type of the call. Whether automatic placement may pick these
+	 * locations is the registrant's decision and is always written out at the call site.
+	 *
 	 * @return false when the tag is invalid or already claimed by another registrant.
 	 */
 	virtual bool RegisterLocationValidator(
 		FGameplayTag RootLocationTag,
 		FPEPItemLocationValidator Validator,
-		bool bAllowAutoPlacement = true) = 0;
+		bool bAllowAutoPlacement) = 0;
 
 	/** @param BoundObject  Only releases the tag if the registered delegate is bound to this object. */
 	virtual void UnregisterLocationValidator(FGameplayTag RootLocationTag, const UObject* BoundObject) = 0;

@@ -47,6 +47,32 @@ namespace PEPItemMutation
 		return FPEPItemResult::Success(TargetItem.ItemId, PEPCoreTags::Reason_None);
 	}
 
+	namespace Private
+	{
+		/**
+		 * The state math shared by SplitStack and PreviewSplitStack. Expects SplitItem to be a copy of
+		 * Source carrying its new id, and the split already approved by CanSplitStack.
+		 */
+		FPEPItemResult DivideStack(
+			FPEPItemInstance& Source,
+			const int32 SplitCount,
+			FPEPItemInstance& SplitItem)
+		{
+			FPEPItemState_Stack* SourceState = FPEPItemMutableAccess::GetMutableState<
+				FPEPItemState_Stack>(Source);
+			FPEPItemState_Stack* SplitState = FPEPItemMutableAccess::GetMutableState<
+				FPEPItemState_Stack>(SplitItem);
+			if (!SourceState || !SplitState)
+			{
+				return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Source.ItemId);
+			}
+
+			SourceState->Count -= SplitCount;
+			SplitState->Count = SplitCount;
+			return FPEPItemResult::Success(SplitItem.ItemId, PEPCoreTags::Reason_None);
+		}
+	}
+
 	FPEPItemResult SplitStack(
 		FPEPItemInstance& SourceItem,
 		const int32 SplitCount,
@@ -65,19 +91,46 @@ namespace PEPItemMutation
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, SourceItem.ItemId);
 		}
 
-		FPEPItemState_Stack* SourceStack = FPEPItemMutableAccess::GetMutableState<
-			FPEPItemState_Stack>(SourceItem);
-		FPEPItemState_Stack* SplitStack = FPEPItemMutableAccess::GetMutableState<
-			FPEPItemState_Stack>(OutSplitItem);
-		if (!SourceStack || !SplitStack)
+		const FPEPItemResult DivideResult = Private::DivideStack(SourceItem, SplitCount, OutSplitItem);
+		if (!DivideResult.bSuccess)
 		{
 			OutSplitItem = FPEPItemInstance();
-			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, SourceItem.ItemId);
+		}
+		return DivideResult;
+	}
+
+	FPEPItemResult PreviewSplitStack(
+		const FPEPItemInstance& SourceItem,
+		const int32 SplitCount,
+		FPEPItemInstance& OutSourceAfter,
+		FPEPItemInstance& OutSplitItem)
+	{
+		// Outputs are written last, so a caller may pass the source as one of them.
+		const FPEPItemResult RuleResult = PEPItemRules::CanSplitStack(SourceItem, SplitCount);
+		if (!RuleResult.bSuccess)
+		{
+			OutSourceAfter = FPEPItemInstance();
+			OutSplitItem = FPEPItemInstance();
+			return RuleResult;
 		}
 
-		SourceStack->Count -= SplitCount;
-		SplitStack->Count = SplitCount;
-		return FPEPItemResult::Success(OutSplitItem.ItemId, PEPCoreTags::Reason_None);
+		// Mirrors DuplicateWithNewId, minus the allocation: copy, re-key, normalize.
+		FPEPItemInstance SourceAfter = SourceItem;
+		FPEPItemInstance SplitItem = SourceItem;
+		SplitItem.ItemId = GetPreviewItemId();
+		SplitItem.NormalizeStateFragments();
+
+		const FPEPItemResult DivideResult = Private::DivideStack(SourceAfter, SplitCount, SplitItem);
+		if (!DivideResult.bSuccess)
+		{
+			OutSourceAfter = FPEPItemInstance();
+			OutSplitItem = FPEPItemInstance();
+			return DivideResult;
+		}
+
+		OutSourceAfter = MoveTemp(SourceAfter);
+		OutSplitItem = MoveTemp(SplitItem);
+		return RuleResult;
 	}
 
 	bool DuplicateItemWithNewId(

@@ -65,12 +65,10 @@ public:
 	UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category="Fragment Bundles")
 	TArray<FPEPItemFragmentBundle> FragmentBundles;
 
-	/**
-	 * The class to spawn for an item entering the world, loaded if it is not resident yet.
-	 *
-	 * Synchronous, and deliberately so: it is one small Blueprint class, needed at the instant a
-	 * drop happens, and resident from the first one onwards. Returning null means the project has
-	 * not chosen a class — nothing can be dropped until it does, which is why it warns once.
+	/*
+	 * Effective values: the fragment's own value, or the project default when it opts in. Always
+	 * in range and finite, whatever an ini or an asset holds: NaN or infinite durability falls back
+	 * to 1, NaN or infinite weight to 0.
 	 */
 	int32 GetEffectiveMaxStackSize(int32 FragmentMaxStackSize, bool bUseProjectDefault) const;
 	float GetEffectiveStartingDurability(float FragmentStartingDurability, bool bUseProjectDefault) const;

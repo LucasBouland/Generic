@@ -64,7 +64,7 @@ public:
 
 /**
  * Runtime item record. This is data only; it does not own gameplay authority.
- * Read through PEPItemQuery. Write through PEPItemMutation or PEPItemHelpersMutation.
+ * Read through PEPItemQuery. Write through PEPItemMutation (or PEPItemScalarMutation for tagged values).
  */
 USTRUCT(BlueprintType)
 struct PEPITEMCORE_API FPEPItemInstance
@@ -88,10 +88,22 @@ public:
 	FPEPItemInstance& operator=(const FPEPItemInstance& Other);
 	FPEPItemInstance& operator=(FPEPItemInstance&& Other);
 
+	/**
+	 * Layout of a record that carries no version: one written before SchemaVersion was persisted, or
+	 * one a delta archive skipped because it matched the old default. Both hold version 1 data.
+	 * A record still at this value has not been migrated, and ValidateInstance refuses it.
+	 */
+	static constexpr int32 UnversionedSchemaVersion = 0;
 	static constexpr int32 CurrentSchemaVersion = 1;
 
+	/**
+	 * Defaults to UnversionedSchemaVersion so that an archive missing the field reads as legacy data
+	 * rather than being silently labelled current, and so that every real record differs from the
+	 * default and is always written. Creation paths (MakeNew, InitializeNew) stamp
+	 * CurrentSchemaVersion; archive loads upgrade older records in PostSerialize.
+	 */
 	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item")
-	int32 SchemaVersion = CurrentSchemaVersion;
+	int32 SchemaVersion = UnversionedSchemaVersion;
 
 	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item")
 	FPEPItemId ItemId;
@@ -112,6 +124,7 @@ public:
 		return DefinitionId.IsValid();
 	}
 
+	/** Returns the record to its default-constructed, unversioned and invalid state. */
 	void Reset();
 	/**
 	 * Returns the definition only if it is already resident. Gameplay code must rely on definitions
@@ -129,11 +142,31 @@ public:
 	const FPEPItemStateFragment* FindStateByStruct(const UScriptStruct* StateStruct) const;
 
 	void NormalizeStateFragments();
+
+	/**
+	 * Structural and range validation against the loaded definition. Rejects an unversioned record
+	 * (migrate it first) and one written by a newer build.
+	 */
 	bool ValidateInstance(FPEPItemInstanceValidationResult& OutResult) const;
+
+	/**
+	 * Upgrades a record read with LoadedSchemaVersion to CurrentSchemaVersion.
+	 * Accepts UnversionedSchemaVersion as legacy version 1 data. Returns false, leaving the record
+	 * untouched, for a negative version or one newer than this build.
+	 */
 	bool MigrateInstanceFromVersion(int32 LoadedSchemaVersion);
+
+	/**
+	 * Explicit, project-driven repair of a loaded record: migrates an older schema, restores missing
+	 * owned states and clamps core values into the ranges ValidateInstance accepts.
+	 * @return the validation result after repair.
+	 */
 	bool RepairLoadedInstance();
 
-	/** Upgrades records loaded from an archive written by an older schema. See TStructOpsTypeTraits below. */
+	/**
+	 * On archive loads: upgrades records written by an older schema and reports the loaded ItemId to
+	 * the allocator so it is never handed out again. See TStructOpsTypeTraits below.
+	 */
 	void PostSerialize(const FArchive& Ar);
 
 	template <typename TState>

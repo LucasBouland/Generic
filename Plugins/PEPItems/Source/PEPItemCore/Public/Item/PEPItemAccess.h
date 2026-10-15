@@ -28,28 +28,40 @@ enum class EPEPAccessRole : uint8
 struct PEPITEMCORE_API FPEPItemAccessContext
 {
 	/**
-	 * Null for server-internal mutations that answer to no player: loot generation, quest rewards,
-	 * an ability spending a charge. Build those through System() so the bypass greps.
-	 *
-	 * Weak, and the distinction matters: never set is a server mutation, whereas set but since
-	 * destroyed is a requester that no longer exists. Only the first may keep owner permissions.
+	 * The player the request answers to. Null for a System() context, and for a context built
+	 * From() a null or since-destroyed controller: neither of the latter is the server, so a store
+	 * treats them as an outsider with no identity.
 	 */
 	TWeakObjectPtr<const AController> Requester;
 
+	/**
+	 * Server-internal mutations that answer to no player: loot generation, quest rewards, an
+	 * ability spending a charge. The only way to obtain a system context, so the bypass greps.
+	 */
 	static FPEPItemAccessContext System()
 	{
-		return FPEPItemAccessContext();
+		FPEPItemAccessContext Context;
+		Context.bSystem = true;
+		return Context;
 	}
 
 	/**
 	 * Defined out of line: assigning the weak pointer needs AController complete, and this header
 	 * reaches most of the item code through the container fragment. The forward declaration stays.
+	 * Never yields a system context, whatever InRequester is — including null.
 	 */
 	static FPEPItemAccessContext From(const AController* InRequester);
 
-	/** Explicitly null, not merely stale: a controller destroyed mid-request is not the server. */
+	/**
+	 * True only for a context built by System(). A default-constructed context, From(nullptr) and a
+	 * requester destroyed mid-request are not the server and must not inherit owner permissions.
+	 */
 	bool IsSystem() const
 	{
-		return Requester.IsExplicitlyNull();
+		return bSystem;
 	}
+
+private:
+	/** Set by System() alone; nothing else can grant it, so an absent requester never reads as one. */
+	bool bSystem = false;
 };

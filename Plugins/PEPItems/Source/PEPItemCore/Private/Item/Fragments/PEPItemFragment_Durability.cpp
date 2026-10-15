@@ -99,12 +99,17 @@ EDataValidationResult FPEPItemFragment_Durability::ValidateFragmentData(
 	FDataValidationContext& Context,
 	const int32 FragmentIndex) const
 {
-	const float EffectiveStartingDurability = PEPItemSettings().GetEffectiveStartingDurability(
-		StartingDurability, bUseProjectDefaultStartingDurability);
-	if (EffectiveStartingDurability < 0.0f || EffectiveStartingDurability > 1.0f)
+	// The effective value is already clamped and NaN-safe, so check the authored one: that is what
+	// the designer has to fix.
+	const float AuthoredStartingDurability = bUseProjectDefaultStartingDurability
+		? PEPItemSettings().DefaultStartingDurability
+		: StartingDurability;
+	if (!FMath::IsFinite(AuthoredStartingDurability)
+		|| AuthoredStartingDurability < 0.0f
+		|| AuthoredStartingDurability > 1.0f)
 	{
 		Context.AddError(FText::FromString(FString::Printf(
-			TEXT("DefinitionFragments[%d].Durability StartingDurability must be between 0.0 and 1.0."),
+			TEXT("DefinitionFragments[%d].Durability effective StartingDurability must be a finite value between 0.0 and 1.0."),
 			FragmentIndex)));
 		return EDataValidationResult::Invalid;
 	}

@@ -6,7 +6,7 @@
 
 /**
  * Narrow mutation access for PEP item mutation modules.
- * Gameplay/UI code should not include this header directly; use PEPItemMutation or PEPItemHelpersMutation.
+ * Gameplay/UI code should not include this header directly; use PEPItemMutation or PEPItemScalarMutation.
  */
 struct PEPITEMCORE_API FPEPItemMutableAccess
 {

@@ -30,11 +30,13 @@ namespace PEPItemRules
 		const FPEPItemInstance& FirstItem,
 		const FPEPItemInstance& SecondItem);
 
+	/** Forwards to PEPItemQuery::DoesDefinitionMatchRequiredBlockedTags; one implementation, one semantic. */
 	PEPITEMCORE_API bool DoesDefinitionMatchRequiredBlockedTags(
 		const UPEPItemDefinition* Definition,
 		const FGameplayTagContainer& RequiredTags,
 		const FGameplayTagContainer& BlockedTags);
 
+	/** Forwards to PEPItemQuery::DoesItemMatchRequiredBlockedTags; one implementation, one semantic. */
 	PEPITEMCORE_API bool DoesItemMatchRequiredBlockedTags(
 		const FPEPItemInstance& Item,
 		const FGameplayTagContainer& RequiredTags,
@@ -63,7 +65,8 @@ namespace PEPItemRules
 	 * Resolves the durability a damage or repair of Amount would land on, clamped to 0..1.
 	 * Shared by the rule and the mutation so the offset policy exists in one place.
 	 *
-	 * @param Amount     Magnitude of the change; must be positive whichever direction is asked for.
+	 * @param Amount     Magnitude of the change; must be finite and not negative whichever direction
+	 *                   is asked for. NaN and infinities are refused rather than clamped to 0 or 1.
 	 * @param bIsRepair  True adds, false subtracts.
 	 */
 	PEPITEMCORE_API FPEPItemResult ResolveDurabilityOffset(

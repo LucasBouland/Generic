@@ -9,7 +9,7 @@
 void UPEPItemViewWidget::SetItemInstance(const FPEPItemInstance& Item)
 {
 	UPEPItemUILibrary::BuildItemViewData(Item, ViewData);
-	RefreshView();
+	HandleViewDataChanged();
 }
 
 void UPEPItemViewWidget::ClearItem()
@@ -17,7 +17,13 @@ void UPEPItemViewWidget::ClearItem()
 	ViewData = FPEPItemViewData();
 	++IconRequestGeneration;
 	IconLoadHandle.Reset();
+	HandleViewDataChanged();
+}
+
+void UPEPItemViewWidget::HandleViewDataChanged()
+{
 	RefreshView();
+	OnItemViewDataChanged(ViewData);
 }
 
 void UPEPItemViewWidget::NativeOnInitialized()

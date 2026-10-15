@@ -27,7 +27,8 @@ enum class EPEPStateStackability : uint8
 
 /**
  * Mutable runtime state for an item instance.
- * State should be changed only by mutation helpers after rules have produced a valid plan.
+ * Changed only through PEPItemMutation / PEPItemScalarMutation, which re-run their rule against live
+ * state on every call; nothing replays a decision computed earlier.
  */
 USTRUCT(BlueprintType)
 struct PEPITEMCORE_API FPEPItemStateFragment

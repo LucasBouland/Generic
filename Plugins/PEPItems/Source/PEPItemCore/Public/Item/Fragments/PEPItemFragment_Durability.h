@@ -9,7 +9,8 @@ struct PEPITEMCORE_API FPEPItemState_Durability : public FPEPItemStateFragment
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item", meta=(ClampMin="0.0", ClampMax="1.0"))
+	/** Condition ratio, 0..1. Authored by presets; read-only to Blueprint, written through the store. */
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadOnly, Category="PEP|Item", meta=(ClampMin="0.0", ClampMax="1.0"))
 	float Durability = 1.0f;
 	bool IsBroken() const;
 };

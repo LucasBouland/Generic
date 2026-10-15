@@ -22,6 +22,7 @@ struct PEPITEMCORE_API FPEPWorldAttachmentSocketOverride
 /**
  * Persistent, authority-owned selection of cosmetic values. The WorldActor copies only the
  * sanitized fields into its public projection; the complete item instance remains private.
+ * EditAnywhere so presets can author it; read-only to Blueprint, written through the owning store.
  */
 USTRUCT(BlueprintType)
 struct PEPITEMCORE_API FPEPItemState_WorldPresentation : public FPEPItemStateFragment
@@ -29,10 +30,10 @@ struct PEPITEMCORE_API FPEPItemState_WorldPresentation : public FPEPItemStateFra
 	GENERATED_BODY()
 
 	/** Optional full-mesh skin. Null keeps the definition's base world mesh. */
-	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadOnly, Category="PEP|Item|World Presentation")
 	TSoftObjectPtr<UStaticMesh> MeshOverride;
 
-	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadOnly, Category="PEP|Item|World Presentation")
 	FPEPWorldPresentationCosmetics Cosmetics;
 
 	virtual EPEPStateStackability GetStackability() const override

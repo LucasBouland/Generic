@@ -96,19 +96,20 @@ namespace PEPItemScalarPrivate
 				continue;
 			}
 
-			// Deux fragments ne doivent pas fournir le même ValueTag.
-			if (bFound)
-			{
-				OutAccessor = typename FTraits::FAccessor();
-				return false;
-			}
-
 			// Un fragment qui annonce le tag sans rien offrir n'est pas un fournisseur :
-			// l'ignorer, sinon le résultat dépendrait de l'ordre des fragments dans l'asset.
+			// l'ignorer avant le contrôle de doublon, sinon le résultat dépendrait de l'ordre des
+			// fragments dans l'asset (placé après un vrai fournisseur, il le ferait échouer).
 			if (!Candidate.bHasDefinitionValue
 				&& !Candidate.HasRuntimeValue())
 			{
 				continue;
+			}
+
+			// Deux fournisseurs réels ne doivent pas fournir le même ValueTag.
+			if (bFound)
+			{
+				OutAccessor = typename FTraits::FAccessor();
+				return false;
 			}
 
 			OutAccessor = Candidate;
@@ -165,32 +166,20 @@ namespace PEPItemScalarPrivate
 		return true;
 	}
 
+	/**
+	 * Reads the item's value through an already resolved accessor. Shared by GetItemValue and
+	 * ValidateSetValue so a write resolves the providing fragment once, not once per check.
+	 */
 	template <typename T>
-	bool GetItemValue(
+	bool ReadItemValue(
 		const FPEPItemInstance& Item,
 		const FGameplayTag ValueTag,
+		const typename TScalarTraits<T>::FAccessor& Accessor,
 		typename TScalarTraits<T>::FValueData& OutData)
 	{
 		using FTraits = TScalarTraits<T>;
 
 		OutData = typename FTraits::FValueData();
-		OutData.ValueTag = ValueTag;
-
-		if (!Item.IsValid() || !ValueTag.IsValid())
-		{
-			return false;
-		}
-
-		typename FTraits::FAccessor Accessor;
-
-		if (!ResolveAccessor<T>(
-			Item.GetDefinitionIfLoaded(),
-			ValueTag,
-			Accessor))
-		{
-			return false;
-		}
-
 		FillMetadata<T>(ValueTag, Accessor, OutData);
 
 		if (Accessor.ReadRuntimeValue)
@@ -225,6 +214,35 @@ namespace PEPItemScalarPrivate
 		return true;
 	}
 
+	template <typename T>
+	bool GetItemValue(
+		const FPEPItemInstance& Item,
+		const FGameplayTag ValueTag,
+		typename TScalarTraits<T>::FValueData& OutData)
+	{
+		using FTraits = TScalarTraits<T>;
+
+		OutData = typename FTraits::FValueData();
+		OutData.ValueTag = ValueTag;
+
+		if (!Item.IsValid() || !ValueTag.IsValid())
+		{
+			return false;
+		}
+
+		typename FTraits::FAccessor Accessor;
+
+		if (!ResolveAccessor<T>(
+			Item.GetDefinitionIfLoaded(),
+			ValueTag,
+			Accessor))
+		{
+			return false;
+		}
+
+		return ReadItemValue<T>(Item, ValueTag, Accessor, OutData);
+	}
+
 	/**
 	 * Front half shared by the rule and the mutation: everything that must hold before a write,
 	 * up to but not including the write itself. Leaves the resolved accessor with the caller so
@@ -250,9 +268,19 @@ namespace PEPItemScalarPrivate
 				Item.ItemId);
 		}
 
+		if (!ResolveAccessor<T>(
+			Item.GetDefinitionIfLoaded(),
+			ValueTag,
+			OutAccessor))
+		{
+			return FPEPItemResult::Failure(
+				PEPCoreTags::Reason_BlockedByState,
+				Item.ItemId);
+		}
+
 		typename FTraits::FValueData Data;
 
-		if (!GetItemValue<T>(Item, ValueTag, Data))
+		if (!ReadItemValue<T>(Item, ValueTag, OutAccessor, Data))
 		{
 			return FPEPItemResult::Failure(
 				PEPCoreTags::Reason_BlockedByState,
@@ -264,16 +292,6 @@ namespace PEPItemScalarPrivate
 		{
 			return FPEPItemResult::Failure(
 				PEPCoreTags::Reason_BlockedByState,
-				Item.ItemId);
-		}
-
-		if (!ResolveAccessor<T>(
-			Item.GetDefinitionIfLoaded(),
-			ValueTag,
-			OutAccessor))
-		{
-			return FPEPItemResult::Failure(
-				PEPCoreTags::Reason_InvalidTarget,
 				Item.ItemId);
 		}
 
@@ -325,6 +343,56 @@ namespace PEPItemScalarPrivate
 		return FPEPItemResult::Success(
 			Item.ItemId,
 			PEPCoreTags::Reason_None);
+	}
+
+	/**
+	 * Everything CanConsumeIntValue checks, with a single accessor resolution: read the live value,
+	 * take Amount off, then apply to the remainder exactly the checks ValidateSetValue would.
+	 * Consumption is the hot path (ammunition, charges), so it does not re-resolve per step.
+	 */
+	FPEPItemResult ValidateConsumeIntValue(
+		const FPEPItemInstance& Item,
+		const FGameplayTag ValueTag,
+		const int32 Amount,
+		int32& OutRemaining,
+		FPEPItemIntValueAccessor& OutAccessor)
+	{
+		OutRemaining = 0;
+		OutAccessor = FPEPItemIntValueAccessor();
+
+		if (Amount <= 0)
+		{
+			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, Item.ItemId);
+		}
+
+		FPEPItemIntValueData Data;
+		if (!Item.IsValid()
+			|| !ValueTag.IsValid()
+			|| !ResolveAccessor<int32>(Item.GetDefinitionIfLoaded(), ValueTag, OutAccessor)
+			|| !ReadItemValue<int32>(Item, ValueTag, OutAccessor, Data)
+			|| !Data.bHasRuntimeValue)
+		{
+			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
+		}
+
+		if (Amount > Data.RuntimeValue)
+		{
+			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
+		}
+
+		if (!Data.bCanMutate)
+		{
+			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
+		}
+
+		const int32 Remaining = Data.RuntimeValue - Amount;
+		if (!OutAccessor.IsValueAllowed(Remaining))
+		{
+			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, Item.ItemId);
+		}
+
+		OutRemaining = Remaining;
+		return FPEPItemResult::Success(Item.ItemId, PEPCoreTags::Reason_None);
 	}
 }
 
@@ -399,31 +467,8 @@ namespace PEPItemScalarRules
 		const int32 Amount,
 		int32& OutRemaining)
 	{
-		OutRemaining = 0;
-
-		if (Amount <= 0)
-		{
-			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, Item.ItemId);
-		}
-
-		FPEPItemIntValueData Data;
-		if (!PEPItemScalarQuery::GetItemIntValue(Item, ValueTag, Data) || !Data.bHasRuntimeValue)
-		{
-			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
-		}
-
-		if (Amount > Data.RuntimeValue)
-		{
-			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
-		}
-
-		const int32 Remaining = Data.RuntimeValue - Amount;
-		const FPEPItemResult SetResult = CanSetIntValue(Item, ValueTag, Remaining);
-		if (SetResult.bSuccess)
-		{
-			OutRemaining = Remaining;
-		}
-		return SetResult;
+		FPEPItemIntValueAccessor Accessor;
+		return PEPItemScalarPrivate::ValidateConsumeIntValue(Item, ValueTag, Amount, OutRemaining, Accessor);
 	}
 }
 
@@ -453,20 +498,23 @@ namespace PEPItemScalarMutation
 	{
 		OutRemaining = 0;
 
+		// The rule's accessor is reused for the write: one resolution for the whole operation.
 		int32 Remaining = 0;
-		const FPEPItemResult RuleResult = PEPItemScalarRules::CanConsumeIntValue(
-			Item, ValueTag, Amount, Remaining);
+		FPEPItemIntValueAccessor Accessor;
+		const FPEPItemResult RuleResult = PEPItemScalarPrivate::ValidateConsumeIntValue(
+			Item, ValueTag, Amount, Remaining, Accessor);
 		if (!RuleResult.bSuccess)
 		{
 			return RuleResult;
 		}
 
-		const FPEPItemResult WriteResult = SetIntValue(Item, ValueTag, Remaining);
-		if (WriteResult.bSuccess)
+		if (!Accessor.WriteRuntimeValue(Item, Remaining))
 		{
-			OutRemaining = Remaining;
+			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
 		}
-		return WriteResult;
+
+		OutRemaining = Remaining;
+		return FPEPItemResult::Success(Item.ItemId, PEPCoreTags::Reason_None);
 	}
 }
 

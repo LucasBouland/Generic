@@ -9,7 +9,12 @@ struct PEPITEMCORE_API FPEPItemState_Stack : public FPEPItemStateFragment
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item", meta=(ClampMin="1"))
+	/**
+	 * Units in the stack. Zero is legal and means depleted (the owner destroys the item), so the
+	 * editor range starts at zero like the runtime validation. EditAnywhere so presets can author
+	 * an initial count; read-only to Blueprint, which changes state through the owning store.
+	 */
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadOnly, Category="PEP|Item", meta=(ClampMin="0"))
 	int32 Count = 1;
 	virtual EPEPStateStackability GetStackability() const override;
 	virtual bool IsDepleted() const override;

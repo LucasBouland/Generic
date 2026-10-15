@@ -24,9 +24,12 @@ namespace PEPItemRules
 			return Item.ValidateInstance(Validation);
 		}
 
+		/* Stack-identity markers are rare; the inline buffer keeps merge checks off the heap. */
+		using FStackIdentityStates = TArray<const FInstancedStruct*, TInlineAllocator<4>>;
+
 		void GatherStackIdentityStates(
 			const FPEPItemInstance& Item,
-			TArray<const FInstancedStruct*>& OutStates)
+			FStackIdentityStates& OutStates)
 		{
 			for (const FInstancedStruct& Entry : Item.GetStateFragments())
 			{
@@ -48,8 +51,8 @@ namespace PEPItemRules
 			return false;
 		}
 
-		TArray<const FInstancedStruct*> FirstStates;
-		TArray<const FInstancedStruct*> SecondStates;
+		Private::FStackIdentityStates FirstStates;
+		Private::FStackIdentityStates SecondStates;
 		Private::GatherStackIdentityStates(FirstItem, FirstStates);
 		Private::GatherStackIdentityStates(SecondItem, SecondStates);
 
@@ -91,19 +94,7 @@ namespace PEPItemRules
 		const FGameplayTagContainer& RequiredTags,
 		const FGameplayTagContainer& BlockedTags)
 	{
-		if (!Definition)
-		{
-			return false;
-		}
-		if (!RequiredTags.IsEmpty() && !Definition->HasAllOwnedTags(RequiredTags))
-		{
-			return false;
-		}
-		if (!BlockedTags.IsEmpty() && Definition->HasAnyOwnedTags(BlockedTags))
-		{
-			return false;
-		}
-		return true;
+		return PEPItemQuery::DoesDefinitionMatchRequiredBlockedTags(Definition, RequiredTags, BlockedTags);
 	}
 
 	bool DoesItemMatchRequiredBlockedTags(
@@ -111,10 +102,7 @@ namespace PEPItemRules
 		const FGameplayTagContainer& RequiredTags,
 		const FGameplayTagContainer& BlockedTags)
 	{
-		return DoesDefinitionMatchRequiredBlockedTags(
-			PEPItemQuery::GetDefinition(Item),
-			RequiredTags,
-			BlockedTags);
+		return PEPItemQuery::DoesItemMatchRequiredBlockedTags(Item, RequiredTags, BlockedTags);
 	}
 
 	FPEPItemResult CanStackItems(
@@ -129,17 +117,19 @@ namespace PEPItemRules
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, SourceItem.ItemId);
 		}
-		// Validate both operands at the mutation boundary. This also rejects runtime instances
-		// whose stackable definition carries per-unit state that a merge would duplicate or lose.
-		if (!Private::IsValidStackOperand(SourceItem) || !Private::IsValidStackOperand(TargetItem))
-		{
-			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, SourceItem.ItemId);
-		}
 		if (RequestedTransferCount < 0)
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, SourceItem.ItemId);
 		}
+		// Cheap identity checks first: callers scanning a store for merge targets reject most
+		// candidates here, before paying for two full instance validations.
 		if (!AreSameDefinition(SourceItem, TargetItem))
+		{
+			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, SourceItem.ItemId);
+		}
+		// Validate both operands at the mutation boundary. This also rejects runtime instances
+		// whose stackable definition carries per-unit state that a merge would duplicate or lose.
+		if (!Private::IsValidStackOperand(SourceItem) || !Private::IsValidStackOperand(TargetItem))
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, SourceItem.ItemId);
 		}
@@ -224,7 +214,9 @@ namespace PEPItemRules
 	{
 		OutTargetDurability = 0.0f;
 
-		if (Amount < 0.0f)
+		// NaN slips through a plain `< 0` test and FMath::Clamp then maps it to a bound: a NaN repair
+		// would fully restore the item. Infinities would do the same. Refuse anything not finite.
+		if (!FMath::IsFinite(Amount) || Amount < 0.0f)
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, Item.ItemId);
 		}
