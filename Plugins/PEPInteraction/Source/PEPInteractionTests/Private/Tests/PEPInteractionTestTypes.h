@@ -9,7 +9,9 @@
 
 /**
  * Interactable relying on every interface default: instant, no start or cancel handling.
- * Offers Options, allows them while bAllowInteraction, and counts executions.
+ * Offers Options, allows them while bAllowInteraction, and counts CanInteract calls and executions.
+ * With bReturnBareFailure, ExecuteInteraction fails through UPEPInteractionLibrary without naming
+ * itself or the option, as a Blueprint interactable might.
  */
 UCLASS(NotBlueprintable)
 class APEPInteractionTestTarget : public AActor, public IPEPInteractionInteractable
@@ -30,7 +32,9 @@ public:
 
 	TArray<FGameplayTag> Options;
 	bool bAllowInteraction = true;
+	bool bReturnBareFailure = false;
 	int32 ExecuteCount = 0;
+	mutable int32 CanInteractCount = 0;
 };
 
 /** Timed interactable recording the authority notifications it receives. */
@@ -73,6 +77,29 @@ public:
 		ServerRangeTolerance = InServerRangeTolerance;
 	}
 
+	void SetValidationTimingForTest(const float InInterval, const float InGracePeriod)
+	{
+		ActiveInteractionValidationInterval = InInterval;
+		ActiveInteractionValidationGracePeriod = InGracePeriod;
+	}
+
+	bool ShouldPerformLocalSelectionForTest() const
+	{
+		return ShouldPerformLocalSelection();
+	}
+
+	/* What the owning client's request RPC runs on the authority. */
+	void ReceiveClientRequestForTest(
+		AActor* RequestedTarget,
+		const FGameplayTag InteractionTag,
+		const int32 InteractionId)
+	{
+		Server_RequestInteractWithInteractionTag_Implementation(
+			RequestedTarget,
+			InteractionTag,
+			InteractionId);
+	}
+
 	void TickActiveInteractionForTest(const double ServerTimeSeconds)
 	{
 		TickActiveInteraction(ServerTimeSeconds);
@@ -111,11 +138,20 @@ public:
 	void HandleCompleted(const FPEPInteractionResult& Result);
 
 	UFUNCTION()
-	void HandleCancelled(AActor* Target, FGameplayTag InteractionTag, FGameplayTag ReasonTag);
+	void HandleCancelled(
+		int32 InteractionId,
+		AActor* Target,
+		FGameplayTag InteractionTag,
+		FGameplayTag ReasonTag);
+
+	UFUNCTION()
+	void HandleSelectionChanged(AActor* Target, const TArray<FGameplayTag>& Options);
 
 	int32 StartedCount = 0;
 	int32 CompletedCount = 0;
 	int32 CancelledCount = 0;
+	int32 SelectionChangedCount = 0;
 	FPEPInteractionResult LastResult;
 	FGameplayTag LastCancelReason;
+	int32 LastCancelledInteractionId = 0;
 };

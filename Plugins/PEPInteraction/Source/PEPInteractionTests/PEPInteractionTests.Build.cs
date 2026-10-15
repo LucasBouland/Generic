@@ -14,7 +14,6 @@ public class PEPInteractionTests : ModuleRules
 		PrivateDependencyModuleNames.AddRange(new[]
 		{
 			"CoreUObject",
-			"DeveloperSettings",
 			"Engine",
 			"FunctionalTesting",
 			"GameplayTags",

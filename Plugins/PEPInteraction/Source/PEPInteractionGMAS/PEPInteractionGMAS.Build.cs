@@ -18,7 +18,6 @@ public class PEPInteractionGMAS : ModuleRules
 			"GameplayTags",
 			"GameplayTasks",
 			"GMCAbilitySystem",
-			"PEPCore",
 			"PEPInteraction"
 		});
 	}

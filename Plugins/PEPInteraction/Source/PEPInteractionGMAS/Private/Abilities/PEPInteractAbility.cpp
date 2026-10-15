@@ -3,9 +3,9 @@
 #include "Ability/Tasks/SetTargetDataInstancedStruct.h"
 #include "Ability/Tasks/WaitForInputKeyRelease.h"
 #include "Components/GMCAbilityComponent.h"
-#include "Core/PEPCoreLogChannels.h"
 #include "GameFramework/Actor.h"
 #include "Interaction/PEPInteractionComponent.h"
+#include "Interaction/PEPInteractionLogChannels.h"
 #include "Interaction/PEPInteractionTags.h"
 
 UPEPInteractAbility::UPEPInteractAbility()
@@ -25,7 +25,7 @@ void UPEPInteractAbility::BeginAbility()
 	InteractionComponent = ResolveInteractionComponent();
 	if (!InteractionComponent)
 	{
-		UE_LOG(LogPEP, Warning, TEXT("%s: no UPEPInteractionComponent on the ability owner."), *GetName());
+		UE_LOG(LogPEPInteraction, Warning, TEXT("%s: no UPEPInteractionComponent on the ability owner."), *GetName());
 		EndAbility();
 		return;
 	}
@@ -90,6 +90,11 @@ FPEPInteractAbilityTargetData UPEPInteractAbility::MakeLocalTargetData() const
 	{
 		Data.Target = InteractionComponent->GetSelectedTarget();
 		Data.InteractionTag = InteractionComponent->GetSelectedInteractionTag();
+		if (Data.Target && Data.InteractionTag.IsValid())
+		{
+			/* Reserved where the request is made: the owning client, or the listen-server host. */
+			Data.InteractionId = InteractionComponent->ReserveInteractionId();
+		}
 	}
 	return Data;
 }
@@ -118,8 +123,9 @@ void UPEPInteractAbility::HandleTargetDataReceived(FInstancedStruct TargetData)
 		return;
 	}
 
-	RequestedTarget = Request->Target;
-	RequestedInteractionTag = Request->InteractionTag;
+	AActor* RequestedTarget = Request->Target;
+	const FGameplayTag RequestedInteractionTag = Request->InteractionTag;
+	RequestedInteractionId = Request->InteractionId;
 	bInteractionRequested = true;
 
 	/*
@@ -145,14 +151,31 @@ void UPEPInteractAbility::HandleTargetDataReceived(FInstancedStruct TargetData)
 
 	/*
 	 * Executes now when the option is instant, otherwise starts the timed interaction. Instant
-	 * executions and rejections report through OnInteractionCompleted, which ends this ability.
+	 * executions and rejections report through OnInteractionCompleted during this call, which
+	 * ends this ability when the component kept the requested id.
 	 */
 	const FPEPInteractionResult Result =
 		InteractionComponent->BeginInteractWithInteractionTag(
 			RequestedTarget,
-			RequestedInteractionTag);
+			RequestedInteractionTag,
+			RequestedInteractionId);
 
-	if (!Result.bSuccess && !AbilityEnded())
+	if (AbilityEnded())
+	{
+		return;
+	}
+
+	/*
+	 * The component may have handled the request under another id (none sent, one it could not
+	 * accept, or a repeat joining the interaction in progress): follow that one from now on.
+	 * Only a timed interaction still running under it keeps the ability alive.
+	 */
+	RequestedInteractionId = Result.InteractionId;
+	const bool bTimedInteractionRunning = Result.bSuccess
+		&& RequestedInteractionId != 0
+		&& InteractionComponent->GetActiveInteractionId() == RequestedInteractionId;
+
+	if (!bTimedInteractionRunning)
 	{
 		EndAbility();
 	}
@@ -174,7 +197,7 @@ void UPEPInteractAbility::HandleInteractionCompleted(const FPEPInteractionResult
 {
 	if (!bInteractionRequested
 		|| AbilityEnded()
-		|| !IsRequestedInteraction(Result.Target, Result.InteractionTag))
+		|| !IsRequestedInteraction(Result.InteractionId))
 	{
 		return;
 	}
@@ -183,13 +206,14 @@ void UPEPInteractAbility::HandleInteractionCompleted(const FPEPInteractionResult
 }
 
 void UPEPInteractAbility::HandleInteractionCancelled(
+	const int32 InteractionId,
 	AActor* CancelledTarget,
 	const FGameplayTag InteractionTag,
 	const FGameplayTag ReasonTag)
 {
 	if (!bInteractionRequested
 		|| AbilityEnded()
-		|| !IsRequestedInteraction(CancelledTarget, InteractionTag))
+		|| !IsRequestedInteraction(InteractionId))
 	{
 		return;
 	}
@@ -204,12 +228,10 @@ bool UPEPInteractAbility::CanRunAuthorityLogic() const
 		&& !OwnerAbilityComponent->IsReplayingForGMASLogic();
 }
 
-bool UPEPInteractAbility::IsRequestedInteraction(
-	const AActor* InTarget,
-	const FGameplayTag InInteractionTag) const
+bool UPEPInteractAbility::IsRequestedInteraction(const int32 InInteractionId) const
 {
-	return InInteractionTag == RequestedInteractionTag
-		&& (!InTarget || !RequestedTarget || InTarget == RequestedTarget.Get());
+	return RequestedInteractionId != 0
+		&& InInteractionId == RequestedInteractionId;
 }
 
 void UPEPInteractAbility::BindInteractionEvents()
@@ -247,10 +269,7 @@ void UPEPInteractAbility::CancelRequestedInteraction(const FGameplayTag ReasonTa
 	if (!bInteractionRequested
 		|| !InteractionComponent
 		|| !CanRunAuthorityLogic()
-		|| !InteractionComponent->IsInteractionInProgress()
-		|| !IsRequestedInteraction(
-			InteractionComponent->GetActiveInteractionTarget(),
-			InteractionComponent->GetActiveInteractionTag()))
+		|| !IsRequestedInteraction(InteractionComponent->GetActiveInteractionId()))
 	{
 		return;
 	}

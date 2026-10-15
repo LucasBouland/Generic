@@ -2,6 +2,7 @@
 
 #include "Components/SceneComponent.h"
 #include "Core/PEPCoreTags.h"
+#include "Interaction/PEPInteractionLibrary.h"
 
 APEPInteractionTestTarget::APEPInteractionTestTarget()
 {
@@ -19,6 +20,7 @@ FPEPInteractionResult APEPInteractionTestTarget::CanInteract_Implementation(
 	AActor* Interactor,
 	const FGameplayTag InteractionTag) const
 {
+	++CanInteractCount;
 	if (!bAllowInteraction)
 	{
 		return FPEPInteractionResult::Failure(
@@ -36,7 +38,14 @@ FPEPInteractionResult APEPInteractionTestTarget::ExecuteInteraction_Implementati
 	const FGameplayTag InteractionTag)
 {
 	++ExecuteCount;
-	return FPEPInteractionResult::Success(this, InteractionTag);
+	if (bReturnBareFailure)
+	{
+		return UPEPInteractionLibrary::MakeInteractionFailure(
+			PEPCoreTags::Reason_BlockedByState,
+			nullptr,
+			FGameplayTag());
+	}
+	return UPEPInteractionLibrary::MakeInteractionSuccess(this, InteractionTag);
 }
 
 float APEPInteractionTestTimedTarget::GetInteractionDuration_Implementation(
@@ -67,6 +76,7 @@ void UPEPInteractionTestListener::Bind(UPEPInteractionComponent* Component)
 	Component->OnInteractionStarted.AddDynamic(this, &ThisClass::HandleStarted);
 	Component->OnInteractionCompleted.AddDynamic(this, &ThisClass::HandleCompleted);
 	Component->OnInteractionCancelled.AddDynamic(this, &ThisClass::HandleCancelled);
+	Component->OnInteractionSelectionChanged.AddDynamic(this, &ThisClass::HandleSelectionChanged);
 }
 
 void UPEPInteractionTestListener::HandleStarted(
@@ -84,10 +94,19 @@ void UPEPInteractionTestListener::HandleCompleted(const FPEPInteractionResult& R
 }
 
 void UPEPInteractionTestListener::HandleCancelled(
+	const int32 InteractionId,
 	AActor* Target,
 	const FGameplayTag InteractionTag,
 	const FGameplayTag ReasonTag)
 {
 	++CancelledCount;
 	LastCancelReason = ReasonTag;
+	LastCancelledInteractionId = InteractionId;
+}
+
+void UPEPInteractionTestListener::HandleSelectionChanged(
+	AActor* Target,
+	const TArray<FGameplayTag>& Options)
+{
+	++SelectionChangedCount;
 }

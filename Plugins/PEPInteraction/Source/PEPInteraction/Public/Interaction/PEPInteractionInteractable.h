@@ -6,14 +6,20 @@
 #include "UObject/Interface.h"
 #include "PEPInteractionInteractable.generated.h"
 
-UINTERFACE()
+UINTERFACE(MinimalAPI)
 class UPEPInteractionInteractable : public UInterface
 {
 	GENERATED_BODY()
 };
 
 /**
- * 
+ * Something an interactor can interact with, through Gameplay Tag options.
+ *
+ * The queries (GetInteractOptionTags, CanInteract, GetInteractionDuration) are callable from
+ * Blueprint: they must stay free of side effects. ExecuteInteraction can be implemented in
+ * Blueprint but not called from it: UPEPInteractionComponent calls it on the authority once the
+ * request is validated, which a direct call would bypass. Blueprint implementations build their
+ * results with UPEPInteractionLibrary.
  */
 class PEPINTERACTION_API IPEPInteractionInteractable
 {
@@ -21,11 +27,11 @@ class PEPINTERACTION_API IPEPInteractionInteractable
 
 public:
 	/*
- * Options potentiellement disponibles.
- *
- * Cela ne remplace pas CanInteract : une option peut être exposée,
- * mais temporairement bloquée.
- */
+	 * Options potentiellement disponibles.
+	 *
+	 * Cela ne remplace pas CanInteract : une option peut être exposée,
+	 * mais temporairement bloquée. Requête pure, appelée sur toutes les machines.
+	 */
 	UFUNCTION(
 		BlueprintCallable,
 		BlueprintNativeEvent,
@@ -34,14 +40,14 @@ public:
 		AActor* Interactor) const;
 
 	/*
- * Validation métier de la cible.
- *
- * Exemple :
- * - objet déjà récupéré ;
- * - porte verrouillée ;
- * - inventaire absent ;
- * - interaction interdite par l'état courant.
- */
+	 * Validation métier de la cible. Requête pure : l'appeler ne doit rien modifier.
+	 *
+	 * Exemple :
+	 * - objet déjà récupéré ;
+	 * - porte verrouillée ;
+	 * - inventaire absent ;
+	 * - interaction interdite par l'état courant.
+	 */
 	UFUNCTION(
 		BlueprintCallable,
 		BlueprintNativeEvent,
@@ -50,8 +56,12 @@ public:
 		AActor* Interactor,
 		FGameplayTag InteractionTag) const;
 
+	/*
+	 * Authority only, called by UPEPInteractionComponent once the request passed its validation
+	 * (range, line of sight, options, CanInteract). Implementable in Blueprint, never callable from
+	 * it, so that Blueprint code cannot skip that validation.
+	 */
 	UFUNCTION(
-		BlueprintCallable,
 		BlueprintNativeEvent,
 		Category="PEP|Interaction")
 	FPEPInteractionResult ExecuteInteraction(

@@ -6,8 +6,11 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "Interaction/PEPInteractionComponent.h"
 #include "Interaction/PEPInteractionInteractable.h"
+#include "Interaction/PEPInteractionLibrary.h"
 #include "Interaction/PEPInteractionTags.h"
 #include "Tests/PEPInteractionTestTypes.h"
 #include "UObject/UnrealType.h"
@@ -305,7 +308,10 @@ bool FPEPInteractionCancelOnRevalidationTest::RunTest(const FString& Parameters)
 
 	Target->bAllowInteraction = false;
 	Fixture.Interaction->TickActiveInteractionForTest(SecondStartTime + 0.5);
-	TestFalse(TEXT("the target refusing mid-way cancels the interaction"),
+	TestTrue(TEXT("a refusal is first tolerated for the grace period"),
+		Fixture.Interaction->IsInteractionInProgress());
+	Fixture.Interaction->TickActiveInteractionForTest(SecondStartTime + 0.8);
+	TestFalse(TEXT("the target still refusing after the grace period cancels the interaction"),
 		Fixture.Interaction->IsInteractionInProgress());
 	TestTrue(TEXT("the cancel carries the target's own reason"),
 		Target->LastCancelReason == PEPCoreTags::Reason_BlockedByState.GetTag());
@@ -318,6 +324,355 @@ bool FPEPInteractionCancelOnRevalidationTest::RunTest(const FString& Parameters)
 		Fixture.Listener->CompletedCount == 1 && !Fixture.Listener->LastResult.bSuccess);
 	TestEqual(TEXT("each started interaction was cancelled once"), Target->CancelledCount, 2);
 	TestEqual(TEXT("and none executed"), Target->ExecuteCount, 0);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInteractionRevalidationGraceTest,
+	"PEP.Interaction.Component.RevalidationGrace",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInteractionRevalidationGraceTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPInteractionTest;
+	FFixture Fixture;
+	Fixture.Interaction->SetValidationTimingForTest(0.1f, 0.25f);
+	APEPInteractionTestTimedTarget* Target = Fixture.SpawnTarget<APEPInteractionTestTimedTarget>();
+	Target->Duration = 2.0f;
+
+	TestTrue(TEXT("a timed option starts"),
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open()).bSuccess);
+	const double StartTime = Fixture.Interaction->GetActiveInteractionStartTimeForTest();
+	TestEqual(TEXT("the request is validated once"), Target->CanInteractCount, 1);
+
+	Target->bAllowInteraction = false;
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.05);
+	TestEqual(TEXT("between two checks only range is validated"), Target->CanInteractCount, 1);
+
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.15);
+	TestEqual(TEXT("the periodic check asks the target"), Target->CanInteractCount, 2);
+	TestTrue(TEXT("a first refusal does not cancel"), Fixture.Interaction->IsInteractionInProgress());
+
+	Target->bAllowInteraction = true;
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.30);
+	TestEqual(TEXT("the next check asks again"), Target->CanInteractCount, 3);
+	TestTrue(TEXT("a recovered interaction keeps running"), Fixture.Interaction->IsInteractionInProgress());
+
+	Target->bAllowInteraction = false;
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.45);
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.50);
+	TestEqual(TEXT("checks keep their rate while failing"), Target->CanInteractCount, 4);
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.60);
+	TestTrue(TEXT("failures are counted from the first one after a success"),
+		Fixture.Interaction->IsInteractionInProgress());
+
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.75);
+	TestFalse(TEXT("failures lasting the grace period cancel"),
+		Fixture.Interaction->IsInteractionInProgress());
+	TestTrue(TEXT("with the target's reason"),
+		Target->LastCancelReason == PEPCoreTags::Reason_BlockedByState.GetTag());
+	TestEqual(TEXT("the target is told once"), Target->CancelledCount, 1);
+	TestEqual(TEXT("nothing executed"), Target->ExecuteCount, 0);
+	TestEqual(TEXT("a cancelled interaction does not complete"), Fixture.Listener->CompletedCount, 0);
+
+	/* Range is not graced: it is checked every tick and cancels at once. */
+	Target->bAllowInteraction = true;
+	TestTrue(TEXT("the option starts again"),
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open()).bSuccess);
+	Target->SetActorLocation(FVector(2000.0f, 0.0f, 0.0f));
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.01);
+	TestFalse(TEXT("leaving the range cancels on the next tick"),
+		Fixture.Interaction->IsInteractionInProgress());
+	TestTrue(TEXT("as out of range"),
+		Target->LastCancelReason == PEPCoreTags::Reason_OutOfRange.GetTag());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInteractionCompletionValidationTest,
+	"PEP.Interaction.Component.CompletionValidation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInteractionCompletionValidationTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPInteractionTest;
+	FFixture Fixture;
+	Fixture.Interaction->SetValidationTimingForTest(0.1f, 0.25f);
+	APEPInteractionTestTimedTarget* Target = Fixture.SpawnTarget<APEPInteractionTestTimedTarget>();
+	Target->Duration = 1.0f;
+
+	TestTrue(TEXT("a timed option starts"),
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open()).bSuccess);
+	const double StartTime = Fixture.Interaction->GetActiveInteractionStartTimeForTest();
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 0.5);
+
+	const int32 ChecksBeforeCompletion = Target->CanInteractCount;
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 1.0);
+	TestEqual(TEXT("the completion tick validates exactly once"),
+		Target->CanInteractCount - ChecksBeforeCompletion, 1);
+	TestEqual(TEXT("and executes"), Target->ExecuteCount, 1);
+	TestEqual(TEXT("completion is reported once"), Fixture.Listener->CompletedCount, 1);
+
+	/* A brief refusal at the end delays completion rather than executing or cancelling. */
+	TestTrue(TEXT("the option starts again"),
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open()).bSuccess);
+	Target->bAllowInteraction = false;
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 1.05);
+	TestEqual(TEXT("a failing interaction never executes"), Target->ExecuteCount, 1);
+	TestTrue(TEXT("but keeps running through the grace period"),
+		Fixture.Interaction->IsInteractionInProgress());
+	Target->bAllowInteraction = true;
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 1.10);
+	TestEqual(TEXT("it executes as soon as a check passes"), Target->ExecuteCount, 2);
+	TestFalse(TEXT("and ends"), Fixture.Interaction->IsInteractionInProgress());
+
+	/* A refusal lasting the grace period at the end cancels: never Completed for a timed start. */
+	TestTrue(TEXT("the option starts a third time"),
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open()).bSuccess);
+	Target->bAllowInteraction = false;
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 1.05);
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 1.20);
+	TestTrue(TEXT("still waiting within the grace period"),
+		Fixture.Interaction->IsInteractionInProgress());
+	Fixture.Interaction->TickActiveInteractionForTest(StartTime + 1.35);
+	TestFalse(TEXT("cancelled once the grace period is over"),
+		Fixture.Interaction->IsInteractionInProgress());
+	TestEqual(TEXT("the target is told it was cancelled"), Target->CancelledCount, 1);
+	TestEqual(TEXT("without executing"), Target->ExecuteCount, 2);
+	TestEqual(TEXT("and without a completion"), Fixture.Listener->CompletedCount, 2);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInteractionIdTest,
+	"PEP.Interaction.Component.InteractionIds",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInteractionIdTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPInteractionTest;
+	FFixture Fixture;
+	APEPInteractionTestTarget* Target = Fixture.SpawnTarget<APEPInteractionTestTarget>();
+	APEPInteractionTestTimedTarget* TimedTarget =
+		Fixture.SpawnTarget<APEPInteractionTestTimedTarget>(FVector(0.0f, 100.0f, 0.0f));
+
+	const int32 Reserved = Fixture.Interaction->ReserveInteractionId();
+	TestTrue(TEXT("the authority reserves positive ids"), Reserved > 0);
+
+	const FPEPInteractionResult Result =
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open(), Reserved);
+	TestEqual(TEXT("the outcome carries the reserved id"), Result.InteractionId, Reserved);
+	TestEqual(TEXT("so does the completion event"), Fixture.Listener->LastResult.InteractionId, Reserved);
+
+	const FPEPInteractionResult Unidentified =
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open());
+	TestTrue(TEXT("a request without id gets a fresh one"), Unidentified.InteractionId > Reserved);
+
+	const FPEPInteractionResult Reused =
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open(), Reserved);
+	TestTrue(TEXT("an id that already ended is never reused"),
+		Reused.InteractionId != Reserved && Reused.InteractionId > 0);
+
+	const FPEPInteractionResult FromClient =
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open(), -7);
+	TestEqual(TEXT("an owning-client id is echoed back"), FromClient.InteractionId, -7);
+
+	const FPEPInteractionResult Started =
+		Fixture.Interaction->BeginInteractWithInteractionTag(TimedTarget, FFixture::Open(), -8);
+	TestEqual(TEXT("a timed interaction runs under the request's id"),
+		Fixture.Interaction->GetActiveInteractionId(), -8);
+	TestEqual(TEXT("which the start result carries"), Started.InteractionId, -8);
+
+	const FPEPInteractionResult Joined =
+		Fixture.Interaction->BeginInteractWithInteractionTag(TimedTarget, FFixture::Open(), -9);
+	TestEqual(TEXT("a repeat joins the interaction in progress and says so"), Joined.InteractionId, -8);
+
+	TestTrue(TEXT("the interaction is cancelled"),
+		Fixture.Interaction->CancelInteraction(PEPInteractionTags::Reason_Interaction_Cancelled));
+	TestEqual(TEXT("the cancel event carries its id"), Fixture.Listener->LastCancelledInteractionId, -8);
+	TestEqual(TEXT("nothing is active any more"), Fixture.Interaction->GetActiveInteractionId(), 0);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInteractionClientRequestRateLimitTest,
+	"PEP.Interaction.Component.ClientRequestRateLimit",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInteractionClientRequestRateLimitTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPInteractionTest;
+	FFixture Fixture;
+	APEPInteractionTestTarget* Target = Fixture.SpawnTarget<APEPInteractionTestTarget>();
+	APEPInteractionTestTimedTarget* TimedTarget =
+		Fixture.SpawnTarget<APEPInteractionTestTimedTarget>(FVector(0.0f, 100.0f, 0.0f));
+
+	/* The test world is never ticked: its real time stands still, so every request is "at once". */
+	Fixture.Interaction->ReceiveClientRequestForTest(Target, FFixture::Open(), -1);
+	TestEqual(TEXT("a first client request executes"), Target->ExecuteCount, 1);
+	TestEqual(TEXT("under the client's id"), Fixture.Listener->LastResult.InteractionId, -1);
+
+	Fixture.Interaction->ReceiveClientRequestForTest(Target, FFixture::Open(), -2);
+	TestEqual(TEXT("a request right after it executes nothing"), Target->ExecuteCount, 1);
+	TestEqual(TEXT("but still gets its outcome"), Fixture.Listener->CompletedCount, 2);
+	TestTrue(TEXT("refused as rate limited"),
+		!Fixture.Listener->LastResult.bSuccess
+		&& Fixture.Listener->LastResult.ReasonTag == PEPInteractionTags::Reason_Interaction_RateLimited.GetTag());
+	TestEqual(TEXT("under the client's id"), Fixture.Listener->LastResult.InteractionId, -2);
+
+	TestTrue(TEXT("a timed interaction starts on the authority"),
+		Fixture.Interaction->BeginInteractWithInteractionTag(TimedTarget, FFixture::Open()).bSuccess);
+	Fixture.Interaction->ReceiveClientRequestForTest(TimedTarget, FFixture::Open(), -3);
+	TestTrue(TEXT("repeating the interaction in progress is never limited"),
+		Fixture.Interaction->IsInteractionInProgress());
+	TestEqual(TEXT("and does not restart it"), TimedTarget->StartedCount, 1);
+	TestEqual(TEXT("nor report anything"), Fixture.Listener->CompletedCount, 2);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInteractionLocalSelectionGatingTest,
+	"PEP.Interaction.Component.LocalSelectionGating",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInteractionLocalSelectionGatingTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPInteractionTest;
+	FFixture Fixture;
+
+	TestFalse(TEXT("an interactor no local player controls does not select"),
+		Fixture.Interaction->ShouldPerformLocalSelectionForTest());
+	TestFalse(TEXT("so the component does not tick"),
+		Fixture.Interaction->IsComponentTickEnabled());
+
+	Fixture.Interaction->ResetTargetSelection();
+	TestEqual(TEXT("a machine that does not select broadcasts no selection"),
+		Fixture.Listener->SelectionChangedCount, 0);
+
+	/* A timed interaction on the authority needs the tick even without local selection. */
+	APEPInteractionTestTimedTarget* Target = Fixture.SpawnTarget<APEPInteractionTestTimedTarget>();
+	TestTrue(TEXT("a timed option starts"),
+		Fixture.Interaction->BeginInteractWithInteractionTag(Target, FFixture::Open()).bSuccess);
+	TestTrue(TEXT("the authority ticks while it runs"), Fixture.Interaction->IsComponentTickEnabled());
+	Fixture.Interaction->CancelInteraction(PEPInteractionTags::Reason_Interaction_Cancelled);
+	TestFalse(TEXT("and stops once it ends"), Fixture.Interaction->IsComponentTickEnabled());
+
+	/* A local player controller in a standalone world. */
+	APlayerController* Player = Fixture.World->SpawnActor<APlayerController>();
+	Fixture.Interactor->SetOwner(Player);
+	Fixture.Interaction->RefreshTickEnabled();
+	TestTrue(TEXT("an interactor owned by a local player controller selects"),
+		Fixture.Interaction->ShouldPerformLocalSelectionForTest());
+	TestTrue(TEXT("and ticks"), Fixture.Interaction->IsComponentTickEnabled());
+	Fixture.Interaction->ResetTargetSelection();
+	TestEqual(TEXT("the local player's machine does broadcast"), Fixture.Listener->SelectionChangedCount, 1);
+
+	Fixture.Interactor->SetOwner(nullptr);
+	Fixture.Interaction->RefreshTickEnabled();
+	TestFalse(TEXT("losing that owner stops the selection"), Fixture.Interaction->IsComponentTickEnabled());
+
+	APawn* Pawn = Fixture.World->SpawnActor<APawn>();
+	UPEPInteractionTestComponent* PawnInteraction = NewObject<UPEPInteractionTestComponent>(Pawn);
+	PawnInteraction->RegisterComponent();
+	PawnInteraction->Init(Pawn);
+	TestFalse(TEXT("a pawn nobody controls does not select"),
+		PawnInteraction->ShouldPerformLocalSelectionForTest());
+	TestFalse(TEXT("nor tick"), PawnInteraction->IsComponentTickEnabled());
+
+	Pawn->PossessedBy(Player);
+	TestTrue(TEXT("a pawn controlled by a local player selects"),
+		PawnInteraction->ShouldPerformLocalSelectionForTest());
+	TestTrue(TEXT("its possession turns the tick on"), PawnInteraction->IsComponentTickEnabled());
+
+	Pawn->UnPossessed();
+	TestFalse(TEXT("an unpossessed pawn stops selecting"),
+		PawnInteraction->ShouldPerformLocalSelectionForTest());
+	TestFalse(TEXT("its unpossession turns the tick off"), PawnInteraction->IsComponentTickEnabled());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInteractionBlueprintResultLibraryTest,
+	"PEP.Interaction.Interactable.BlueprintResultLibrary",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInteractionBlueprintResultLibraryTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPInteractionTest;
+	FFixture Fixture;
+	APEPInteractionTestTarget* Target = Fixture.SpawnTarget<APEPInteractionTestTarget>();
+
+	const FPEPInteractionResult Success =
+		UPEPInteractionLibrary::MakeInteractionSuccess(Target, FFixture::Open());
+	TestTrue(TEXT("a success succeeds"), Success.bSuccess);
+	TestTrue(TEXT("on the given target and option"),
+		Success.Target.Get() == Target && Success.InteractionTag == FFixture::Open());
+	TestFalse(TEXT("without a reason"), Success.ReasonTag.IsValid());
+	TestEqual(TEXT("a built result answers no request yet"), Success.InteractionId, 0);
+
+	const FPEPInteractionResult Failure =
+		UPEPInteractionLibrary::MakeInteractionFailure(
+			PEPCoreTags::Reason_BlockedByState,
+			Target,
+			FFixture::Open());
+	TestFalse(TEXT("a failure fails"), Failure.bSuccess);
+	TestTrue(TEXT("with its reason"), Failure.ReasonTag == PEPCoreTags::Reason_BlockedByState.GetTag());
+	TestTrue(TEXT("on the given target and option"),
+		Failure.Target.Get() == Target && Failure.InteractionTag == FFixture::Open());
+
+	/* A Blueprint interactable may fail without naming itself: the component names it. */
+	Target->bReturnBareFailure = true;
+	const int32 Reserved = Fixture.Interaction->ReserveInteractionId();
+	const FPEPInteractionResult Executed =
+		Fixture.Interaction->ExecuteInteractWithInteractionTag(Target, FFixture::Open(), Reserved);
+	TestFalse(TEXT("the interactable's failure is reported"), Executed.bSuccess);
+	TestTrue(TEXT("with its reason"), Executed.ReasonTag == PEPCoreTags::Reason_BlockedByState.GetTag());
+	TestTrue(TEXT("completed with the request's target and option"),
+		Executed.Target.Get() == Target && Executed.InteractionTag == FFixture::Open());
+	TestEqual(TEXT("and the request's id"), Executed.InteractionId, Reserved);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInteractionBlueprintContractTest,
+	"PEP.Interaction.Interactable.BlueprintContract",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInteractionBlueprintContractTest::RunTest(const FString& Parameters)
+{
+	const UClass* Interface = UPEPInteractionInteractable::StaticClass();
+	const UFunction* Execute = Interface->FindFunctionByName(TEXT("ExecuteInteraction"));
+	const UFunction* CanInteract = Interface->FindFunctionByName(TEXT("CanInteract"));
+	TestTrue(TEXT("ExecuteInteraction can be implemented in Blueprint"),
+		Execute && Execute->HasAnyFunctionFlags(FUNC_BlueprintEvent));
+	TestTrue(TEXT("but not called from Blueprint, which would skip validation"),
+		Execute && !Execute->HasAnyFunctionFlags(FUNC_BlueprintCallable));
+	TestTrue(TEXT("CanInteract stays a callable query"),
+		CanInteract && CanInteract->HasAnyFunctionFlags(FUNC_BlueprintCallable));
+
+	const UClass* Component = UPEPInteractionComponent::StaticClass();
+	const TCHAR* const AuthorityOnlyFunctions[] = {
+		TEXT("ExecuteInteractWithInteractionTag"),
+		TEXT("BeginInteractWithInteractionTag"),
+		TEXT("CancelInteraction")};
+	for (const TCHAR* AuthorityOnly : AuthorityOnlyFunctions)
+	{
+		const UFunction* Function = Component->FindFunctionByName(AuthorityOnly);
+		TestTrue(
+			FString::Printf(TEXT("%s is authority only in Blueprint"), AuthorityOnly),
+			Function && Function->HasAnyFunctionFlags(FUNC_BlueprintAuthorityOnly));
+	}
+
+	const UFunction* AvailableTags = Component->FindFunctionByName(TEXT("GetAvailableInteractionTags"));
+	TestTrue(TEXT("GetAvailableInteractionTags is pure"),
+		AvailableTags && AvailableTags->HasAnyFunctionFlags(FUNC_BlueprintPure));
 
 	return true;
 }

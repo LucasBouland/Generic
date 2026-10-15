@@ -7,35 +7,62 @@
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
 #include "Engine/EngineTypes.h"
-#include "Engine/OverlapResult.h"
 #include "Engine/World.h"
+#include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "Interaction/PEPInteractionInteractable.h"
+#include "Interaction/PEPInteractionLogChannels.h"
 #include "Interaction/PEPInteractionTags.h"
 #include "Interaction/PEPInteractionTargetComponent.h"
 #include "Net/UnrealNetwork.h"
 
 namespace PEPInteractionSelection
 {
-	struct FCandidate
+	/*
+	 * Bounds of the actor's registered primitives, or its location when it has none, so that range
+	 * and scoring never measure against the world origin for a bare actor.
+	 */
+	FBox GetInteractionBounds(const AActor* Actor)
 	{
-		AActor* Actor = nullptr;
-		float Score = -1.0f;
-		float AimAlignment = 0.0f;
-		float Distance = 0.0f;
-	};
+		FBox Bounds(ForceInit);
+		bool bHasBounds = false;
+
+		TInlineComponentArray<UPrimitiveComponent*> PrimitiveComponents(Actor);
+		for (const UPrimitiveComponent* PrimitiveComponent : PrimitiveComponents)
+		{
+			if (IsValid(PrimitiveComponent) && PrimitiveComponent->IsRegistered())
+			{
+				Bounds += PrimitiveComponent->Bounds.GetBox();
+				bHasBounds = true;
+			}
+		}
+
+		if (!bHasBounds)
+		{
+			const FVector Location = Actor->GetActorLocation();
+			Bounds = FBox(Location, Location);
+		}
+		return Bounds;
+	}
 }
 
 namespace PEPInteractionExecution
 {
+	/* Enough for every end whose notification can overtake the replicated state. */
+	constexpr int32 RecentlyEndedInteractionCapacity = 16;
+
 	/*
-	 * Listeners match outcomes to requests by target and tag; an interactable that returns a bare
-	 * Failure(Reason) must not make its outcome unidentifiable.
+	 * Listeners match outcomes to requests by id; an interactable that returns a bare
+	 * Failure(Reason) still gets its target and option filled in, and the id is always the
+	 * component's own, whatever the interactable returned.
 	 */
 	FPEPInteractionResult WithRequestIdentity(
 		FPEPInteractionResult Result,
 		AActor* RequestedTarget,
-		const FGameplayTag InteractionTag)
+		const FGameplayTag InteractionTag,
+		const int32 InteractionId)
 	{
 		if (!Result.Target)
 		{
@@ -45,6 +72,7 @@ namespace PEPInteractionExecution
 		{
 			Result.InteractionTag = InteractionTag;
 		}
+		Result.InteractionId = InteractionId;
 		return Result;
 	}
 }
@@ -52,12 +80,17 @@ namespace PEPInteractionExecution
 UPEPInteractionComponent::UPEPInteractionComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
+	/* Enabled by RefreshTickEnabled once there is local selection or a timed interaction to run. */
+	PrimaryComponentTick.bStartWithTickEnabled = false;
 	SetIsReplicatedByDefault(true);
 }
 
 void UPEPInteractionComponent::BeginPlay()
 {
 	Super::BeginPlay();
+
+	/* Tick functions are registered by now: apply the actual need over the registration default. */
+	RefreshTickEnabled();
 }
 
 void UPEPInteractionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -67,6 +100,7 @@ void UPEPInteractionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		CancelInteraction(PEPInteractionTags::Reason_Interaction_Interrupted);
 	}
+	UnbindInteractorController();
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -80,13 +114,73 @@ void UPEPInteractionComponent::GetLifetimeReplicatedProps(
 
 void UPEPInteractionComponent::Init(AActor* InInteractor)
 {
+	UnbindInteractorController();
+	CachedTraceStartComponent.Reset();
+
 	Interactor = InInteractor;
 	if (!Interactor)
 	{
-		UE_LOG(LogTemp, Error, TEXT("Can't find Interactor"));
+		UE_LOG(LogPEPInteraction, Error, TEXT("%s: Init needs an interactor."), *GetPathName());
+		RefreshTickEnabled();
 		return;
 	}
 	Camera = Interactor->FindComponentByClass<UCameraComponent>();
+
+	BindInteractorController();
+	RefreshTickEnabled();
+}
+
+void UPEPInteractionComponent::BindInteractorController()
+{
+	/* Possession decides IsLocallyControlled, and it often changes after Init (late possession, respawn). */
+	if (APawn* Pawn = Cast<APawn>(Interactor.Get()))
+	{
+		Pawn->ReceiveControllerChangedDelegate.AddUniqueDynamic(
+			this,
+			&ThisClass::HandleInteractorControllerChanged);
+		BoundInteractorPawn = Pawn;
+	}
+}
+
+void UPEPInteractionComponent::UnbindInteractorController()
+{
+	if (APawn* Pawn = BoundInteractorPawn.Get())
+	{
+		Pawn->ReceiveControllerChangedDelegate.RemoveDynamic(
+			this,
+			&ThisClass::HandleInteractorControllerChanged);
+	}
+	BoundInteractorPawn.Reset();
+}
+
+void UPEPInteractionComponent::HandleInteractorControllerChanged(
+	APawn* Pawn,
+	AController* OldController,
+	AController* NewController)
+{
+	RefreshTickEnabled();
+}
+
+void UPEPInteractionComponent::RefreshTickEnabled()
+{
+	const bool bLocalSelection = ShouldPerformLocalSelection();
+	const bool bNeedsTick = bLocalSelection
+		|| (HasInteractionAuthority() && IsInteractionInProgress());
+
+	if (IsComponentTickEnabled() != bNeedsTick)
+	{
+		SetComponentTickEnabled(bNeedsTick);
+	}
+
+	/*
+	 * A selection made while local (before an unpossession, say) must not outlive it. Silent when
+	 * nothing was ever selected here, which is always the case on simulated proxies.
+	 */
+	if (!bLocalSelection)
+	{
+		Target.Reset();
+		NotifySelectionIfChanged();
+	}
 }
 
 void UPEPInteractionComponent::TickComponent(
@@ -162,12 +256,16 @@ UPEPInteractionComponent::RequestInteractWithInteractionTag(
 		return RecordAndReturn(EPEPRequestResult::Failed);
 	}
 
+	const int32 RequestId = ReserveInteractionId();
+	LastRequestedInteractionId = RequestId;
+
 	if (Owner->HasAuthority())
 	{
 		const FPEPInteractionResult Result =
 			BeginInteractWithInteractionTag(
 				RequestedTarget,
-				InteractionTag);
+				InteractionTag,
+				RequestId);
 
 		if (!Result.bSuccess)
 		{
@@ -176,8 +274,7 @@ UPEPInteractionComponent::RequestInteractWithInteractionTag(
 
 		/* A timed interaction accepted but not executed yet is pending, like a client request. */
 		const bool bStartedTimedInteraction = IsInteractionInProgress()
-			&& ActiveInteraction.Target == RequestedTarget
-			&& ActiveInteraction.InteractionTag == InteractionTag;
+			&& ActiveInteraction.InteractionId == Result.InteractionId;
 		return RecordAndReturn(
 			bStartedTimedInteraction
 				? EPEPRequestResult::Submitted
@@ -186,7 +283,8 @@ UPEPInteractionComponent::RequestInteractWithInteractionTag(
 
 	Server_RequestInteractWithInteractionTag(
 		RequestedTarget,
-		InteractionTag);
+		InteractionTag,
+		RequestId);
 
 	return RecordAndReturn(EPEPRequestResult::Submitted);
 }
@@ -194,11 +292,55 @@ UPEPInteractionComponent::RequestInteractWithInteractionTag(
 void UPEPInteractionComponent::
 Server_RequestInteractWithInteractionTag_Implementation(
 	AActor* RequestedTarget,
-	const FGameplayTag InteractionTag)
+	const FGameplayTag InteractionTag,
+	const int32 InteractionId)
 {
+	/* Owning-client ids are negative; anything else is not one that client could have reserved. */
+	const int32 ClientInteractionId = InteractionId < 0 ? InteractionId : 0;
+
+	/* Holding the input may repeat the request in progress: it is absorbed, never limited. */
+	const bool bRepeatsActiveInteraction = IsInteractionInProgress()
+		&& ActiveInteraction.Target == RequestedTarget
+		&& ActiveInteraction.InteractionTag == InteractionTag;
+
+	if (!bRepeatsActiveInteraction && IsClientRequestRateLimited())
+	{
+		NotifyInteractionCompleted(
+			PEPInteractionExecution::WithRequestIdentity(
+				FPEPInteractionResult::Failure(
+					PEPInteractionTags::Reason_Interaction_RateLimited,
+					RequestedTarget,
+					InteractionTag),
+				RequestedTarget,
+				InteractionTag,
+				AcceptInteractionId(ClientInteractionId)));
+		return;
+	}
+
 	BeginInteractWithInteractionTag(
 		RequestedTarget,
-		InteractionTag);
+		InteractionTag,
+		ClientInteractionId);
+}
+
+bool UPEPInteractionComponent::IsClientRequestRateLimited()
+{
+	const UWorld* World = GetWorld();
+	if (MinClientRequestInterval <= 0.0f || !World)
+	{
+		return false;
+	}
+
+	/* Real time: requests keep coming while the game is paused or slowed down. */
+	const double Now = World->GetRealTimeSeconds();
+	if (LastClientRequestRealTime >= 0.0
+		&& Now - LastClientRequestRealTime < MinClientRequestInterval)
+	{
+		return true;
+	}
+
+	LastClientRequestRealTime = Now;
+	return false;
 }
 
 EPEPRequestResult UPEPInteractionComponent::RequestCancelInteraction()
@@ -230,13 +372,11 @@ void UPEPInteractionComponent::Server_RequestCancelInteraction_Implementation()
 }
 
 FPEPInteractionResult
-UPEPInteractionComponent::ValidateInteraction(
+UPEPInteractionComponent::ValidateInteractionReach(
 	AActor* RequestedTarget,
 	const FGameplayTag InteractionTag) const
 {
-	const AActor* Owner = GetOwner();
-
-	if (!Owner || !Owner->HasAuthority())
+	if (!HasInteractionAuthority())
 	{
 		return FPEPInteractionResult::Failure(
 			PEPCoreTags::Reason_NotAuthority,
@@ -247,23 +387,9 @@ UPEPInteractionComponent::ValidateInteraction(
 	if (!Interactor
 		|| !IsValid(RequestedTarget)
 		|| !InteractionTag.IsValid()
-		|| RequestedTarget == Interactor)
-	{
-		return FPEPInteractionResult::Failure(
-			PEPCoreTags::Reason_InvalidTarget,
-			RequestedTarget,
-			InteractionTag);
-	}
-
-	if (RequestedTarget->GetWorld() != Interactor->GetWorld())
-	{
-		return FPEPInteractionResult::Failure(
-			PEPCoreTags::Reason_InvalidTarget,
-			RequestedTarget,
-			InteractionTag);
-	}
-
-	if (!RequestedTarget->GetClass()->ImplementsInterface(
+		|| RequestedTarget == Interactor
+		|| RequestedTarget->GetWorld() != Interactor->GetWorld()
+		|| !RequestedTarget->GetClass()->ImplementsInterface(
 			UPEPInteractionInteractable::StaticClass()))
 	{
 		return FPEPInteractionResult::Failure(
@@ -272,20 +398,47 @@ UPEPInteractionComponent::ValidateInteraction(
 			InteractionTag);
 	}
 
+	/*
+	 * Measured like the local selection is: from the shared view point, to the nearest part of the
+	 * target rather than its origin, so a large target selected by its edge is not refused.
+	 */
+	FVector ViewLocation;
+	FRotator ViewRotation;
+	GetInteractionViewPoint(
+		ViewLocation,
+		ViewRotation);
+
+	const FBox TargetBounds =
+		PEPInteractionSelection::GetInteractionBounds(RequestedTarget);
 	const float MaxDistance =
 		Range + ServerRangeTolerance;
 
-	const float DistanceSquared =
-		FVector::DistSquared(
-			Interactor->GetActorLocation(),
-			RequestedTarget->GetActorLocation());
-
-	if (DistanceSquared > FMath::Square(MaxDistance))
+	if (TargetBounds.ComputeSquaredDistanceToPoint(ViewLocation) > FMath::Square(MaxDistance))
 	{
 		return FPEPInteractionResult::Failure(
 			PEPCoreTags::Reason_OutOfRange,
 			RequestedTarget,
 			InteractionTag);
+	}
+
+	return FPEPInteractionResult::Success(
+		RequestedTarget,
+		InteractionTag);
+}
+
+FPEPInteractionResult
+UPEPInteractionComponent::ValidateInteraction(
+	AActor* RequestedTarget,
+	const FGameplayTag InteractionTag) const
+{
+	const FPEPInteractionResult Reach =
+		ValidateInteractionReach(
+			RequestedTarget,
+			InteractionTag);
+
+	if (!Reach.bSuccess)
+	{
+		return Reach;
 	}
 
 	const TArray<FGameplayTag> Options =
@@ -301,10 +454,11 @@ UPEPInteractionComponent::ValidateInteraction(
 			RequestedTarget,
 			InteractionTag);
 	}
+
 	if (!ValidateLineOfSight(RequestedTarget))
 	{
 		return FPEPInteractionResult::Failure(
-			PEPCoreTags::Reason_InvalidTarget,
+			PEPInteractionTags::Reason_Interaction_NoLineOfSight,
 			RequestedTarget,
 			InteractionTag);
 	}
@@ -324,36 +478,25 @@ bool UPEPInteractionComponent::ValidateLineOfSight(
 		return false;
 	}
 
-	FVector ViewLocation;
-	FRotator ViewRotation;
-	if (TraceStartSocketName.IsNone())
-	{
-		Interactor->GetActorEyesViewPoint(
-			ViewLocation,
-			ViewRotation);
-		ViewLocation += ViewRotation.RotateVector(TraceStartOffset);
-	}
-	else
-	{
-		ViewLocation = GetTraceStartLocation();
-	}
-	return HasLineOfSightToTarget(RequestedTarget, ViewLocation);
+	return HasLineOfSightToTarget(
+		RequestedTarget,
+		GetTraceStartLocation());
 }
 
 bool UPEPInteractionComponent::HasLineOfSightToTarget(
 	AActor* RequestedTarget,
 	const FVector& ViewLocation) const
 {
-	if (!RequestedTarget || !GetWorld())
+	const UWorld* World = GetWorld();
+	if (!RequestedTarget || !World)
 	{
 		return false;
 	}
 
-	TArray<UPrimitiveComponent*> PrimitiveComponents;
-	RequestedTarget->GetComponents<UPrimitiveComponent>(PrimitiveComponents);
+	TInlineComponentArray<UPrimitiveComponent*> PrimitiveComponents(RequestedTarget);
 
 	FCollisionQueryParams QueryParams(
-		SCENE_QUERY_STAT(PEPInteractionServerValidation),
+		SCENE_QUERY_STAT(PEPInteractionLineOfSight),
 		false);
 	QueryParams.AddIgnoredActor(Interactor);
 
@@ -381,7 +524,7 @@ bool UPEPInteractionComponent::HasLineOfSightToTarget(
 		const FVector TraceDirection = (ComponentClosestPoint - ViewLocation).GetSafeNormal();
 		const FVector TraceEnd = ComponentClosestPoint + (TraceDirection * 2.0f);
 		FHitResult Hit;
-		const bool bHit = GetWorld()->LineTraceSingleByChannel(
+		const bool bHit = World->LineTraceSingleByChannel(
 			Hit,
 			ViewLocation,
 			TraceEnd,
@@ -397,55 +540,41 @@ bool UPEPInteractionComponent::HasLineOfSightToTarget(
 	return false;
 }
 
+int32 UPEPInteractionComponent::ReserveInteractionId()
+{
+	/* Two sequences that never meet: the authority counts up, the owning client counts down. */
+	return HasInteractionAuthority()
+		? ++LastAllocatedInteractionId
+		: --LastProposedInteractionId;
+}
+
+int32 UPEPInteractionComponent::AcceptInteractionId(const int32 RequestedId)
+{
+	const bool bReservedByAuthority = RequestedId > 0
+		&& RequestedId <= LastAllocatedInteractionId;
+	const bool bReservedByOwningClient = RequestedId < 0;
+	const bool bAlreadyUsed = RequestedId == ActiveInteraction.InteractionId
+		|| HasInteractionIdEnded(RequestedId);
+
+	if ((bReservedByAuthority || bReservedByOwningClient) && !bAlreadyUsed)
+	{
+		return RequestedId;
+	}
+
+	/* Unidentified or unusable: handled under a fresh id, which the requester will not recognise. */
+	return ++LastAllocatedInteractionId;
+}
+
+int32 UPEPInteractionComponent::GetLastRequestedInteractionId() const
+{
+	return LastRequestedInteractionId;
+}
+
 FPEPInteractionResult
 UPEPInteractionComponent::ExecuteInteractWithInteractionTag(
 	AActor* RequestedTarget,
-	const FGameplayTag InteractionTag)
-{
-	const FPEPInteractionResult Result =
-		ValidateAndExecuteInteraction(
-			RequestedTarget,
-			InteractionTag);
-
-	if (HasInteractionAuthority())
-	{
-		NotifyInteractionCompleted(0, Result);
-	}
-	return Result;
-}
-
-FPEPInteractionResult
-UPEPInteractionComponent::ValidateAndExecuteInteraction(
-	AActor* RequestedTarget,
-	const FGameplayTag InteractionTag)
-{
-	const FPEPInteractionResult Validation =
-		ValidateInteraction(
-			RequestedTarget,
-			InteractionTag);
-
-	if (!Validation.bSuccess)
-	{
-		return PEPInteractionExecution::WithRequestIdentity(
-			Validation,
-			RequestedTarget,
-			InteractionTag);
-	}
-
-	return PEPInteractionExecution::WithRequestIdentity(
-		IPEPInteractionInteractable::
-		Execute_ExecuteInteraction(
-			RequestedTarget,
-			Interactor,
-			InteractionTag),
-		RequestedTarget,
-		InteractionTag);
-}
-
-FPEPInteractionResult
-UPEPInteractionComponent::BeginInteractWithInteractionTag(
-	AActor* RequestedTarget,
-	const FGameplayTag InteractionTag)
+	const FGameplayTag InteractionTag,
+	const int32 InteractionId)
 {
 	if (!HasInteractionAuthority())
 	{
@@ -455,15 +584,75 @@ UPEPInteractionComponent::BeginInteractWithInteractionTag(
 			InteractionTag);
 	}
 
-	/* A repeated request (input repeat, duplicate RPC) must not restart the hold from zero. */
+	const int32 AcceptedId = AcceptInteractionId(InteractionId);
+
+	const FPEPInteractionResult Validation =
+		ValidateInteraction(
+			RequestedTarget,
+			InteractionTag);
+
+	const FPEPInteractionResult Result = Validation.bSuccess
+		? ExecuteValidatedInteraction(
+			RequestedTarget,
+			InteractionTag,
+			AcceptedId)
+		: PEPInteractionExecution::WithRequestIdentity(
+			Validation,
+			RequestedTarget,
+			InteractionTag,
+			AcceptedId);
+
+	NotifyInteractionCompleted(Result);
+	return Result;
+}
+
+FPEPInteractionResult
+UPEPInteractionComponent::ExecuteValidatedInteraction(
+	AActor* RequestedTarget,
+	const FGameplayTag InteractionTag,
+	const int32 InteractionId)
+{
+	return PEPInteractionExecution::WithRequestIdentity(
+		IPEPInteractionInteractable::
+		Execute_ExecuteInteraction(
+			RequestedTarget,
+			Interactor,
+			InteractionTag),
+		RequestedTarget,
+		InteractionTag,
+		InteractionId);
+}
+
+FPEPInteractionResult
+UPEPInteractionComponent::BeginInteractWithInteractionTag(
+	AActor* RequestedTarget,
+	const FGameplayTag InteractionTag,
+	const int32 InteractionId)
+{
+	if (!HasInteractionAuthority())
+	{
+		return FPEPInteractionResult::Failure(
+			PEPCoreTags::Reason_NotAuthority,
+			RequestedTarget,
+			InteractionTag);
+	}
+
+	/*
+	 * A repeated request (input repeat, duplicate RPC) must not restart the hold from zero. It
+	 * joins the interaction in progress, whose id the result carries.
+	 */
 	if (IsInteractionInProgress()
 		&& ActiveInteraction.Target == RequestedTarget
 		&& ActiveInteraction.InteractionTag == InteractionTag)
 	{
-		return FPEPInteractionResult::Success(
+		FPEPInteractionResult Joined = FPEPInteractionResult::Success(
 			RequestedTarget,
 			InteractionTag);
+		Joined.InteractionId = ActiveInteraction.InteractionId;
+		return Joined;
 	}
+
+	const int32 AcceptedId = AcceptInteractionId(InteractionId);
 
 	const FPEPInteractionResult Validation =
 		ValidateInteraction(
@@ -476,8 +665,9 @@ UPEPInteractionComponent::BeginInteractWithInteractionTag(
 			PEPInteractionExecution::WithRequestIdentity(
 				Validation,
 				RequestedTarget,
-				InteractionTag);
-		NotifyInteractionCompleted(0, Failure);
+				InteractionTag,
+				AcceptedId);
+		NotifyInteractionCompleted(Failure);
 		return Failure;
 	}
 
@@ -489,15 +679,11 @@ UPEPInteractionComponent::BeginInteractWithInteractionTag(
 	if (Duration <= 0.0f)
 	{
 		const FPEPInteractionResult Result =
-			PEPInteractionExecution::WithRequestIdentity(
-				IPEPInteractionInteractable::
-				Execute_ExecuteInteraction(
-					RequestedTarget,
-					Interactor,
-					InteractionTag),
+			ExecuteValidatedInteraction(
 				RequestedTarget,
-				InteractionTag);
-		NotifyInteractionCompleted(0, Result);
+				InteractionTag,
+				AcceptedId);
+		NotifyInteractionCompleted(Result);
 		return Result;
 	}
 
@@ -507,11 +693,14 @@ UPEPInteractionComponent::BeginInteractWithInteractionTag(
 	StartActiveInteraction(
 		RequestedTarget,
 		InteractionTag,
-		Duration);
+		Duration,
+		AcceptedId);
 
-	return FPEPInteractionResult::Success(
+	FPEPInteractionResult Started = FPEPInteractionResult::Success(
 		RequestedTarget,
 		InteractionTag);
+	Started.InteractionId = AcceptedId;
+	return Started;
 }
 
 bool UPEPInteractionComponent::CancelInteraction(const FGameplayTag ReasonTag)
@@ -572,16 +761,23 @@ float UPEPInteractionComponent::ResolveInteractionDuration(
 void UPEPInteractionComponent::StartActiveInteraction(
 	AActor* RequestedTarget,
 	const FGameplayTag InteractionTag,
-	const float Duration)
+	const float Duration,
+	const int32 InteractionId)
 {
-	++LastAllocatedInteractionId;
-
-	ActiveInteraction.InteractionId = LastAllocatedInteractionId;
+	ActiveInteraction.InteractionId = InteractionId;
 	ActiveInteraction.Target = RequestedTarget;
 	ActiveInteraction.InteractionTag = InteractionTag;
 	ActiveInteraction.StartServerTime = GetInteractionClockSeconds();
 	ActiveInteraction.Duration = Duration;
-	LastStartedInteractionId = LastAllocatedInteractionId;
+	LastStartedInteractionId = InteractionId;
+
+	/* The request has just been fully validated: the next full check is one interval away. */
+	NextActiveInteractionValidationTime =
+		ActiveInteraction.StartServerTime + ActiveInteractionValidationInterval;
+	ActiveInteractionFailingSince = -1.0;
+
+	/* The authority now has an interaction to drive, even for a remote pawn it does not select for. */
+	RefreshTickEnabled();
 
 	IPEPInteractionInteractable::
 		Execute_OnInteractionStarted(
@@ -602,23 +798,67 @@ void UPEPInteractionComponent::TickActiveInteraction(const double ServerTimeSeco
 		return;
 	}
 
+	AActor* ActiveTarget = ActiveInteraction.Target;
+	const FGameplayTag ActiveTag = ActiveInteraction.InteractionTag;
+
+	/* Every tick: losing the target or walking out of range cancels at once. */
+	const FPEPInteractionResult Reach =
+		ValidateInteractionReach(
+			ActiveTarget,
+			ActiveTag);
+
+	if (!Reach.bSuccess)
+	{
+		CancelInteraction(
+			Reach.ReasonTag.IsValid()
+				? Reach.ReasonTag
+				: PEPInteractionTags::Reason_Interaction_Interrupted.GetTag());
+		return;
+	}
+
+	const bool bDurationElapsed =
+		ServerTimeSeconds - ActiveInteraction.StartServerTime >= ActiveInteraction.Duration;
+
+	/* The full check (options, line of sight, CanInteract) is rate limited, except before executing. */
+	if (!bDurationElapsed && ServerTimeSeconds < NextActiveInteractionValidationTime)
+	{
+		return;
+	}
+
+	NextActiveInteractionValidationTime =
+		ServerTimeSeconds + ActiveInteractionValidationInterval;
+
 	const FPEPInteractionResult Validation =
 		ValidateInteraction(
-			ActiveInteraction.Target,
-			ActiveInteraction.InteractionTag);
+			ActiveTarget,
+			ActiveTag);
 
-	if (!Validation.bSuccess)
+	if (Validation.bSuccess)
+	{
+		ActiveInteractionFailingSince = -1.0;
+		if (bDurationElapsed)
+		{
+			/* Validated just above: executes without validating a second time. */
+			CompleteActiveInteraction();
+		}
+		return;
+	}
+
+	/*
+	 * A brief failure (someone walking through the line of sight) is tolerated for the grace
+	 * period. Completion waits meanwhile: a failing interaction never executes.
+	 */
+	if (ActiveInteractionFailingSince < 0.0)
+	{
+		ActiveInteractionFailingSince = ServerTimeSeconds;
+	}
+
+	if (ServerTimeSeconds - ActiveInteractionFailingSince >= ActiveInteractionValidationGracePeriod)
 	{
 		CancelInteraction(
 			Validation.ReasonTag.IsValid()
 				? Validation.ReasonTag
 				: PEPInteractionTags::Reason_Interaction_Interrupted.GetTag());
-		return;
-	}
-
-	if (ServerTimeSeconds - ActiveInteraction.StartServerTime >= ActiveInteraction.Duration)
-	{
-		CompleteActiveInteraction();
 	}
 }
 
@@ -629,34 +869,52 @@ void UPEPInteractionComponent::CompleteActiveInteraction()
 	/* Cleared first, so whatever the execution triggers sees no interaction in progress. */
 	ClearActiveInteraction();
 
-	const FPEPInteractionResult Result =
-		ValidateAndExecuteInteraction(
-			Completed.Target,
-			Completed.InteractionTag);
-
 	NotifyInteractionCompleted(
-		Completed.InteractionId,
-		Result);
+		ExecuteValidatedInteraction(
+			Completed.Target,
+			Completed.InteractionTag,
+			Completed.InteractionId));
 }
 
 void UPEPInteractionComponent::ClearActiveInteraction()
 {
-	LastEndedInteractionId = FMath::Max(
-		LastEndedInteractionId,
-		ActiveInteraction.InteractionId);
+	MarkInteractionIdEnded(ActiveInteraction.InteractionId);
 	ActiveInteraction = FPEPActiveInteraction();
+	ActiveInteractionFailingSince = -1.0;
+
+	/* Nothing left to drive on the authority unless this machine also selects. */
+	RefreshTickEnabled();
+}
+
+bool UPEPInteractionComponent::HasInteractionIdEnded(const int32 InteractionId) const
+{
+	return InteractionId != 0
+		&& RecentlyEndedInteractionIds.Contains(InteractionId);
+}
+
+void UPEPInteractionComponent::MarkInteractionIdEnded(const int32 InteractionId)
+{
+	if (InteractionId == 0)
+	{
+		return;
+	}
+
+	RecentlyEndedInteractionIds.Remove(InteractionId);
+	if (RecentlyEndedInteractionIds.Num() >= PEPInteractionExecution::RecentlyEndedInteractionCapacity)
+	{
+		RecentlyEndedInteractionIds.RemoveAt(0);
+	}
+	RecentlyEndedInteractionIds.Add(InteractionId);
 }
 
 void UPEPInteractionComponent::NotifyInteractionCompleted(
-	const int32 InteractionId,
 	const FPEPInteractionResult& Result)
 {
+	MarkInteractionIdEnded(Result.InteractionId);
 	OnInteractionCompleted.Broadcast(Result);
 
 	/* Runs locally, and is then ignored, when the owner is not a remote client. */
-	Client_NotifyInteractionCompleted(
-		InteractionId,
-		Result);
+	Client_NotifyInteractionCompleted(Result);
 }
 
 void UPEPInteractionComponent::NotifyInteractionCancelled(
@@ -665,7 +923,9 @@ void UPEPInteractionComponent::NotifyInteractionCancelled(
 	const FGameplayTag InteractionTag,
 	const FGameplayTag ReasonTag)
 {
+	MarkInteractionIdEnded(InteractionId);
 	OnInteractionCancelled.Broadcast(
+		InteractionId,
 		CancelledTarget,
 		InteractionTag,
 		ReasonTag);
@@ -678,7 +938,6 @@ void UPEPInteractionComponent::NotifyInteractionCancelled(
 }
 
 void UPEPInteractionComponent::Client_NotifyInteractionCompleted_Implementation(
-	const int32 InteractionId,
 	const FPEPInteractionResult& Result)
 {
 	/* The authority broadcast when it happened (listen server host, standalone, unowned actor). */
@@ -687,9 +946,7 @@ void UPEPInteractionComponent::Client_NotifyInteractionCompleted_Implementation(
 		return;
 	}
 
-	LastEndedInteractionId = FMath::Max(
-		LastEndedInteractionId,
-		InteractionId);
+	MarkInteractionIdEnded(Result.InteractionId);
 	OnInteractionCompleted.Broadcast(Result);
 }
 
@@ -704,10 +961,9 @@ void UPEPInteractionComponent::Client_NotifyInteractionCancelled_Implementation(
 		return;
 	}
 
-	LastEndedInteractionId = FMath::Max(
-		LastEndedInteractionId,
-		InteractionId);
+	MarkInteractionIdEnded(InteractionId);
 	OnInteractionCancelled.Broadcast(
+		InteractionId,
 		CancelledTarget,
 		InteractionTag,
 		ReasonTag);
@@ -735,7 +991,12 @@ void UPEPInteractionComponent::OnRep_ActiveInteraction()
 bool UPEPInteractionComponent::IsInteractionInProgress() const
 {
 	return ActiveInteraction.IsActive()
-		&& ActiveInteraction.InteractionId > LastEndedInteractionId;
+		&& !HasInteractionIdEnded(ActiveInteraction.InteractionId);
+}
+
+int32 UPEPInteractionComponent::GetActiveInteractionId() const
+{
+	return IsInteractionInProgress() ? ActiveInteraction.InteractionId : 0;
 }
 
 AActor* UPEPInteractionComponent::GetActiveInteractionTarget() const
@@ -797,21 +1058,37 @@ bool UPEPInteractionComponent::HasInteractionAuthority() const
 	return Owner && Owner->HasAuthority();
 }
 
+bool UPEPInteractionComponent::IsSelectionCandidateVisible(
+	FPEPInteractionSelectionCandidate& Candidate,
+	const FVector& Start) const
+{
+	if (!Candidate.bVisibilityKnown)
+	{
+		Candidate.bVisible = HasLineOfSightToTarget(Candidate.Actor, Start);
+		Candidate.bVisibilityKnown = true;
+	}
+	return Candidate.bVisible;
+}
+
 void UPEPInteractionComponent::RefreshTarget()
 {
 	AActor* PreviousTarget = Target.Get();
 	Target.Reset();
 	TargetSelectionScore = 0.0f;
+	SelectionCandidates.Reset();
+
 	if (!Camera && Interactor)
 	{
 		Camera = Interactor->FindComponentByClass<UCameraComponent>();
 	}
 
-	if (!Interactor || !Camera || !GetWorld())
+	UWorld* World = GetWorld();
+	if (!Interactor || !Camera || !World)
 	{
 		return;
 	}
 
+	/* The same view point the authority validates from, so a selected target is not refused there. */
 	const FVector Start = GetTraceStartLocation();
 	const FVector ViewForward = Camera->GetForwardVector().GetSafeNormal();
 	const FVector SelectionAxis = GetSelectionAxis();
@@ -823,13 +1100,12 @@ void UPEPInteractionComponent::RefreshTarget()
 
 	QueryParams.AddIgnoredActor(Interactor);
 
-	TArray<PEPInteractionSelection::FCandidate> Candidates;
 	const bool bUseLineSelection = SelectionShape == EPEPInteractionSelectionShape::Line
 		|| SelectionRadius <= KINDA_SMALL_NUMBER;
 	if (bUseLineSelection)
 	{
 		FHitResult Hit;
-		if (GetWorld()->LineTraceSingleByChannel(
+		if (World->LineTraceSingleByChannel(
 			Hit,
 			Start,
 			End,
@@ -841,15 +1117,18 @@ void UPEPInteractionComponent::RefreshTarget()
 				&& HitActor->GetClass()->ImplementsInterface(
 					UPEPInteractionInteractable::StaticClass()))
 			{
-				float AimAlignment = 0.0f;
-				float Distance = 0.0f;
-				const float Score = CalculateCandidateScore(
+				FPEPInteractionSelectionCandidate& Candidate = SelectionCandidates.AddDefaulted_GetRef();
+				Candidate.Actor = HitActor;
+				Candidate.Score = CalculateCandidateScore(
 					HitActor,
+					PEPInteractionSelection::GetInteractionBounds(HitActor),
 					Start,
 					ViewForward,
-					AimAlignment,
-					Distance);
-				Candidates.Add({HitActor, Score, AimAlignment, Distance});
+					Candidate.AimAlignment,
+					Candidate.Distance);
+				/* The trace itself reached it. */
+				Candidate.bVisibilityKnown = true;
+				Candidate.bVisible = true;
 			}
 		}
 	}
@@ -863,89 +1142,120 @@ void UPEPInteractionComponent::RefreshTarget()
 			? FCollisionShape::MakeCapsule(SelectionRadius, (Range * 0.5f) + SelectionRadius)
 			: FCollisionShape::MakeBox(FVector(SelectionRadius, SelectionRadius, Range * 0.5f));
 
-		TArray<FOverlapResult> Overlaps;
-		GetWorld()->OverlapMultiByChannel(
-			Overlaps,
+		SelectionOverlaps.Reset();
+		World->OverlapMultiByChannel(
+			SelectionOverlaps,
 			Center,
 			ShapeRotation,
 			TraceChannel,
 			CollisionShape,
 			QueryParams);
 
-		TSet<TWeakObjectPtr<AActor>> SeenActors;
-		for (const FOverlapResult& Overlap : Overlaps)
+		SelectionSeenActors.Reset();
+		for (const FOverlapResult& Overlap : SelectionOverlaps)
 		{
-			AActor* Candidate = Overlap.GetActor();
-			if (!IsValid(Candidate)
-				|| Candidate == Interactor
-				|| !Candidate->GetClass()->ImplementsInterface(
-					UPEPInteractionInteractable::StaticClass())
-				|| SeenActors.Contains(Candidate))
-			{
-				continue;
-			}
-			SeenActors.Add(Candidate);
-
-			if (!IsWithinSelectionVolume(Candidate, Start, SelectionAxis)
-				|| !HasLineOfSightToTarget(Candidate, Start))
+			AActor* CandidateActor = Overlap.GetActor();
+			if (!IsValid(CandidateActor)
+				|| CandidateActor == Interactor
+				|| !CandidateActor->GetClass()->ImplementsInterface(
+					UPEPInteractionInteractable::StaticClass()))
 			{
 				continue;
 			}
 
-			float AimAlignment = 0.0f;
-			float Distance = 0.0f;
-			const float Score = CalculateCandidateScore(
-				Candidate,
+			bool bAlreadySeen = false;
+			SelectionSeenActors.Add(CandidateActor, &bAlreadySeen);
+			if (bAlreadySeen)
+			{
+				continue;
+			}
+
+			/* Bounds read once per candidate, for both the volume test and the score. */
+			const FBox CandidateBounds = PEPInteractionSelection::GetInteractionBounds(CandidateActor);
+			if (!IsWithinSelectionVolume(CandidateActor, CandidateBounds, Start, SelectionAxis))
+			{
+				continue;
+			}
+
+			FPEPInteractionSelectionCandidate& Candidate = SelectionCandidates.AddDefaulted_GetRef();
+			Candidate.Actor = CandidateActor;
+			Candidate.Score = CalculateCandidateScore(
+				CandidateActor,
+				CandidateBounds,
 				Start,
 				ViewForward,
-				AimAlignment,
-				Distance);
-			Candidates.Add({Candidate, Score, AimAlignment, Distance});
+				Candidate.AimAlignment,
+				Candidate.Distance);
 		}
+		SelectionOverlaps.Reset();
+		SelectionSeenActors.Reset();
 	}
 
-	PEPInteractionSelection::FCandidate BestCandidate;
-	PEPInteractionSelection::FCandidate PreviousCandidate;
-	for (const PEPInteractionSelection::FCandidate& Candidate : Candidates)
-	{
-		if (Candidate.Score > BestCandidate.Score
-			|| (FMath::IsNearlyEqual(Candidate.Score, BestCandidate.Score)
-				&& Candidate.Distance < BestCandidate.Distance))
+	/*
+	 * Best first: highest score, then nearest. The selection is the best visible candidate, unless
+	 * the previous target is still visible and within SelectionHysteresis of it. Line of sight is
+	 * traced lazily, so usually only the winner is traced instead of every candidate.
+	 */
+	SelectionCandidates.Sort(
+		[](const FPEPInteractionSelectionCandidate& A, const FPEPInteractionSelectionCandidate& B)
 		{
-			BestCandidate = Candidate;
-		}
+			if (A.Score != B.Score)
+			{
+				return A.Score > B.Score;
+			}
+			return A.Distance < B.Distance;
+		});
 
-		if (Candidate.Actor == PreviousTarget)
+	int32 SelectedIndex = INDEX_NONE;
+	for (int32 Index = 0; Index < SelectionCandidates.Num(); ++Index)
+	{
+		if (IsSelectionCandidateVisible(SelectionCandidates[Index], Start))
 		{
-			PreviousCandidate = Candidate;
+			SelectedIndex = Index;
+			break;
 		}
 	}
 
-	if (PreviousCandidate.Actor
-		&& BestCandidate.Actor != PreviousCandidate.Actor
-		&& PreviousCandidate.Score + SelectionHysteresis >= BestCandidate.Score)
+	if (SelectedIndex != INDEX_NONE && PreviousTarget)
 	{
-		BestCandidate = PreviousCandidate;
+		const float BestScore = SelectionCandidates[SelectedIndex].Score;
+		for (int32 Index = SelectedIndex + 1; Index < SelectionCandidates.Num(); ++Index)
+		{
+			FPEPInteractionSelectionCandidate& Candidate = SelectionCandidates[Index];
+			if (Candidate.Actor != PreviousTarget)
+			{
+				continue;
+			}
+
+			/* Ranked before the winner, it was traced already and is not visible. */
+			if (Candidate.Score + SelectionHysteresis >= BestScore
+				&& IsSelectionCandidateVisible(Candidate, Start))
+			{
+				SelectedIndex = Index;
+			}
+			break;
+		}
 	}
 
-	if (BestCandidate.Actor)
+	if (SelectedIndex != INDEX_NONE)
 	{
-		Target = BestCandidate.Actor;
-		TargetSelectionScore = BestCandidate.Score;
+		Target = SelectionCandidates[SelectedIndex].Actor;
+		TargetSelectionScore = SelectionCandidates[SelectedIndex].Score;
 	}
+	SelectionCandidates.Reset();
 
 #if ENABLE_DRAW_DEBUG
 	if (bDebugDrawInteraction)
 	{
-		const FColor SelectionColor = BestCandidate.Actor ? FColor::Green : FColor::Red;
+		const FColor SelectionColor = Target.IsValid() ? FColor::Green : FColor::Red;
 		if (bUseLineSelection)
 		{
-			DrawDebugLine(GetWorld(), Start, End, SelectionColor, false, -1.0f, 0, 1.5f);
+			DrawDebugLine(World, Start, End, SelectionColor, false, -1.0f, 0, 1.5f);
 		}
 		else if (SelectionShape == EPEPInteractionSelectionShape::SphereSweep)
 		{
 			DrawDebugCapsule(
-				GetWorld(),
+				World,
 				Start + SelectionAxis * (Range * 0.5f),
 				(Range * 0.5f) + SelectionRadius,
 				SelectionRadius,
@@ -959,7 +1269,7 @@ void UPEPInteractionComponent::RefreshTarget()
 		else
 		{
 			DrawDebugCylinder(
-				GetWorld(),
+				World,
 				Start,
 				End,
 				SelectionRadius,
@@ -974,41 +1284,76 @@ void UPEPInteractionComponent::RefreshTarget()
 #endif
 }
 
-FVector UPEPInteractionComponent::GetTraceStartLocation() const
+const USceneComponent* UPEPInteractionComponent::ResolveTraceStartComponent() const
 {
-	FTransform StartTransform = Camera
-		? Camera->GetComponentTransform()
-		: FTransform::Identity;
-
-	if (!Camera && Interactor)
+	if (!Interactor || TraceStartSocketName.IsNone())
 	{
-		FVector ViewLocation;
-		FRotator ViewRotation;
-		Interactor->GetActorEyesViewPoint(
-			ViewLocation,
-			ViewRotation);
-		StartTransform = FTransform(ViewRotation, ViewLocation);
+		return nullptr;
 	}
 
-	if (Interactor && !TraceStartSocketName.IsNone())
+	const USceneComponent* Cached = CachedTraceStartComponent.Get();
+	if (Cached
+		&& Cached->GetOwner() == Interactor
+		&& Cached->DoesSocketExist(TraceStartSocketName))
 	{
-		TArray<USceneComponent*> SceneComponents;
-		Interactor->GetComponents<USceneComponent>(SceneComponents);
+		return Cached;
+	}
 
-		for (const USceneComponent* SceneComponent : SceneComponents)
+	CachedTraceStartComponent.Reset();
+	TInlineComponentArray<USceneComponent*> SceneComponents(Interactor.Get());
+	for (const USceneComponent* SceneComponent : SceneComponents)
+	{
+		if (IsValid(SceneComponent)
+			&& SceneComponent->DoesSocketExist(TraceStartSocketName))
 		{
-			if (IsValid(SceneComponent)
-				&& SceneComponent->DoesSocketExist(TraceStartSocketName))
-			{
-				StartTransform = SceneComponent->GetSocketTransform(
-					TraceStartSocketName,
-					RTS_World);
-				break;
-			}
+			CachedTraceStartComponent = SceneComponent;
+			return SceneComponent;
 		}
 	}
+	return nullptr;
+}
 
-	return StartTransform.TransformPosition(TraceStartOffset);
+void UPEPInteractionComponent::GetInteractionViewPoint(
+	FVector& OutLocation,
+	FRotator& OutRotation) const
+{
+	OutLocation = FVector::ZeroVector;
+	OutRotation = FRotator::ZeroRotator;
+	if (!Interactor)
+	{
+		return;
+	}
+
+	FTransform ViewTransform;
+	if (const USceneComponent* SocketComponent = ResolveTraceStartComponent())
+	{
+		ViewTransform = SocketComponent->GetSocketTransform(
+			TraceStartSocketName,
+			RTS_World);
+	}
+	else
+	{
+		/* Replicated state only (location, eye height, view rotation): the authority computes the same. */
+		FVector EyesLocation;
+		FRotator EyesRotation;
+		Interactor->GetActorEyesViewPoint(
+			EyesLocation,
+			EyesRotation);
+		ViewTransform = FTransform(EyesRotation, EyesLocation);
+	}
+
+	OutLocation = ViewTransform.TransformPosition(TraceStartOffset);
+	OutRotation = ViewTransform.Rotator();
+}
+
+FVector UPEPInteractionComponent::GetTraceStartLocation() const
+{
+	FVector ViewLocation;
+	FRotator ViewRotation;
+	GetInteractionViewPoint(
+		ViewLocation,
+		ViewRotation);
+	return ViewLocation;
 }
 
 FVector UPEPInteractionComponent::GetSelectionAxis() const
@@ -1020,11 +1365,22 @@ FVector UPEPInteractionComponent::GetSelectionAxis() const
 		return Interactor->GetActorForwardVector().GetSafeNormal();
 	}
 
-	return Camera ? Camera->GetForwardVector().GetSafeNormal() : FVector::ForwardVector;
+	if (Camera)
+	{
+		return Camera->GetForwardVector().GetSafeNormal();
+	}
+
+	FVector ViewLocation;
+	FRotator ViewRotation;
+	GetInteractionViewPoint(
+		ViewLocation,
+		ViewRotation);
+	return ViewRotation.Vector();
 }
 
 bool UPEPInteractionComponent::IsWithinSelectionVolume(
 	AActor* Candidate,
+	const FBox& CandidateBounds,
 	const FVector& Start,
 	const FVector& Axis) const
 {
@@ -1033,10 +1389,8 @@ bool UPEPInteractionComponent::IsWithinSelectionVolume(
 		return false;
 	}
 
-	FVector BoundsOrigin;
-	FVector BoundsExtent;
-	Candidate->GetActorBounds(false, BoundsOrigin, BoundsExtent);
-	const float BoundsRadius = BoundsExtent.Size();
+	const FVector BoundsOrigin = CandidateBounds.GetCenter();
+	const float BoundsRadius = CandidateBounds.GetExtent().Size();
 	const FVector ToBounds = BoundsOrigin - Start;
 	const float AxialDistance = FVector::DotProduct(ToBounds, Axis);
 	const FVector RadialOffset = ToBounds - Axis * AxialDistance;
@@ -1057,16 +1411,13 @@ bool UPEPInteractionComponent::IsWithinSelectionVolume(
 
 float UPEPInteractionComponent::CalculateCandidateScore(
 	AActor* Candidate,
+	const FBox& CandidateBounds,
 	const FVector& Start,
 	const FVector& ViewForward,
 	float& OutAimAlignment,
 	float& OutDistance) const
 {
-	FVector BoundsOrigin;
-	FVector BoundsExtent;
-	Candidate->GetActorBounds(false, BoundsOrigin, BoundsExtent);
-
-	const FVector ToCandidate = BoundsOrigin - Start;
+	const FVector ToCandidate = CandidateBounds.GetCenter() - Start;
 	OutDistance = ToCandidate.Size();
 	OutAimAlignment = OutDistance > KINDA_SMALL_NUMBER
 		? FMath::Clamp(FVector::DotProduct(ViewForward, ToCandidate / OutDistance), 0.0f, 1.0f)
@@ -1074,7 +1425,7 @@ float UPEPInteractionComponent::CalculateCandidateScore(
 
 	float SelectionPriority = 0.0f;
 	if (const UPEPInteractionTargetComponent* TargetSettings =
-		Candidate->FindComponentByClass<UPEPInteractionTargetComponent>())
+		Candidate ? Candidate->FindComponentByClass<UPEPInteractionTargetComponent>() : nullptr)
 	{
 		SelectionPriority = FMath::Clamp(TargetSettings->SelectionPriority, 0.0f, 1.0f);
 	}
@@ -1097,7 +1448,27 @@ float UPEPInteractionComponent::CalculateCandidateScore(
 
 bool UPEPInteractionComponent::ShouldPerformLocalSelection() const
 {
-	return true;
+	const AActor* SelectingActor = Interactor.Get();
+	if (!SelectingActor)
+	{
+		return false;
+	}
+
+	/* False on a server for a remote player's pawn, and on every simulated proxy. */
+	if (const APawn* Pawn = Cast<APawn>(SelectingActor))
+	{
+		return Pawn->IsLocallyControlled();
+	}
+
+	/* Any other interactor selects for the player controller owning it, directly or up the chain. */
+	for (const AActor* Candidate = SelectingActor; Candidate; Candidate = Candidate->GetOwner())
+	{
+		if (const APlayerController* PlayerController = Cast<APlayerController>(Candidate))
+		{
+			return PlayerController->IsLocalController();
+		}
+	}
+	return false;
 }
 
 void UPEPInteractionComponent::NotifySelectionIfChanged()
@@ -1198,10 +1569,20 @@ void UPEPInteractionComponent::CycleSelectedOption(const int32 Delta)
 
 void UPEPInteractionComponent::ResetTargetSelection()
 {
+	const bool bHadSelection = bSelectionNotificationHadTarget
+		|| !LastNotifiedOptions.IsEmpty()
+		|| SelectedOptionTag.IsValid();
+
 	Target.Reset();
 	LastNotifiedTarget.Reset();
 	bSelectionNotificationHadTarget = false;
 	LastNotifiedOptions.Reset();
+
+	/* Machines that do not select (servers for remote pawns, simulated proxies) stay silent. */
+	if (!bHadSelection && !ShouldPerformLocalSelection())
+	{
+		return;
+	}
 
 	OnInteractionSelectionChanged.Broadcast(
 		nullptr,

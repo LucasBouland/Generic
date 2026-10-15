@@ -10,7 +10,6 @@ public class PEPInteraction : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
-			"DeveloperSettings",
 			"Engine",
 			"GameplayTags",
 			"PEPCore"
