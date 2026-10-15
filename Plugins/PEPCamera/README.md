@@ -6,23 +6,31 @@ Le plugin ne dépend que du moteur et d'Enhanced Input. Il ne touche ni à GMC n
 
 ## Principe
 
-- `UPEPCameraComponent` (dérivé de `UCameraComponent`) se place sur l'acteur utilisé comme cible de vue, en général le pawn. À chaque mise à jour caméra, il évalue le mode courant et se déplace sur la vue obtenue.
+- `UPEPCameraComponent` (dérivé de `UCameraComponent`) se place sur l'acteur utilisé comme cible de vue, en général le pawn. À chaque mise à jour caméra, il évalue le mode courant, se place sur la vue obtenue, puis laisse `UCameraComponent::GetCameraView` construire la vue finale : projection, ratio, post-process, offsets additifs et XR restent gérés par le moteur. Hors monde de jeu (aperçu dans l'éditeur), il se comporte comme une caméra ordinaire et ne déplace pas son transform.
 - Un mode (`UPEPCameraMode`) calcule une vue (position, rotation, FOV) à partir d'un contexte : cible de vue, contrôleur local, position et rotation de la cible, rotation de contrôle.
 - Le composant garde **une instance par classe de mode**, ce qui conserve l'état de chaque mode (zoom, point visé, épaule) d'une utilisation à l'autre. Pour régler un mode à l'exécution (FOV de visée, longueur de perche), passer par `GetCameraModeInstance`.
 - Les modes passent par une pile de fondu (`UPEPCameraModeStack`) :
   - changer de mode fait un fondu de `BlendTime` secondes, avec une courbe `Linear`, `EaseIn`, `EaseOut` ou `EaseInOut` ;
   - revenir à un mode en cours de fondu sortant ne provoque pas de saut ;
-  - un mode masqué par un mode entièrement fondu est retiré de la pile.
+  - un mode masqué par un mode entièrement fondu est retiré de la pile ;
+  - au retour vers un mode en cours de fondu, son poids de départ passe par l'inverse de sa courbe, ce qui garde l'image continue quelles que soient les courbes (exact avec deux modes dans la pile).
+- La FOV produite est toujours bornée entre 5 et 170 degrés, même si un Blueprint écrit une valeur hors limites.
+- `EndPlay` vide la pile : chaque mode reçoit `On Deactivated`.
+- L'interpolation (retard du pivot, collision, zoom) est réinitialisée automatiquement après une téléportation de la cible (`ResetInterpolationTeleportDistance`) ou une absence d'évaluation (`ResetInterpolationAfterGap`, par exemple après une caméra de mort). `ResetCameraInterpolation` le fait à la demande.
 
 ## Modes fournis
 
 | Mode | Usage | Points clés |
 | --- | --- | --- |
 | `UPEPCameraMode_FirstPerson` | FPS | L'œil est un socket d'un mesh squelettique de la cible (`ViewSocketName`), sinon la position de vue du pawn (`BaseEyeHeight`). Il regarde selon la rotation de contrôle. `ViewOffset` s'exprime dans le repère du lacet (yaw) de contrôle. |
-| `UPEPCameraMode_ThirdPerson` | TPS | Une perche derrière un pivot (acteur ou socket, plus `PivotOffset`), avec retard optionnel, zoom borné (`MinArmLength` / `MaxArmLength`) et décalage d'épaule permutable (`SwapShoulder`). Une sonde sphérique avance la caméra immédiatement devant un obstacle, puis la laisse revenir en douceur. |
-| `UPEPCameraMode_Strategy` | RTS / top-down | Orbite autour d'un point visé au sol. Le tangage (pitch) passe de `PitchAtMinDistance` à `PitchAtMaxDistance` selon le zoom. Le zoom est proportionnel à la distance courante. En mode `Free` : déplacement du point visé selon le lacet de la caméra, défilement par bord d'écran optionnel, suivi du relief, limites (`FocusBounds`). En mode `FollowViewTarget` : le point visé suit la cible (jeu d'action en vue de dessus). |
+| `UPEPCameraMode_ThirdPerson` | TPS | Une perche derrière un pivot (acteur ou socket mis en cache, plus `PivotOffset`), avec retard optionnel, zoom borné (`MinArmLength` / `MaxArmLength`) et décalage d'épaule permutable (`SwapShoulder`). Une sonde sphérique avance la caméra immédiatement devant un obstacle, puis la laisse revenir en douceur ; le retour est calculé en fraction de la perche, pour qu'un zoom arrière ne soit pas lissé deux fois. |
+| `UPEPCameraMode_Strategy` | RTS / top-down | Orbite autour d'un point visé au sol. Le tangage (pitch) passe de `PitchAtMinDistance` à `PitchAtMaxDistance` selon le zoom. Le zoom est proportionnel à la distance courante. En mode `Free` : déplacement du point visé selon le lacet de la caméra, défilement par bord d'écran optionnel, suivi du relief (requête par type d'objet, `WorldStatic` par défaut, pour que les unités ne soulèvent pas le point visé). En mode `FollowViewTarget` : le point visé suit la cible (jeu d'action en vue de dessus). Les limites XY (`FocusBounds`, un `FBox2D`) s'appliquent dans tous les cas, y compris à `SetFocusLocation`. |
 
-Un projet ajoute ses propres modes en dérivant `UPEPCameraMode` (en C++ ou en Blueprint) et en surchargeant `ComputeView`. Les événements `On Activated` / `On Deactivated` servent par exemple à masquer la tête du personnage en première personne.
+Un projet ajoute ses propres modes en dérivant `UPEPCameraMode` :
+- en C++, surcharger le virtuel `ComputeView` (et `ResetInterpolation` si le mode lisse quelque chose) ;
+- en Blueprint, implémenter l'événement `Compute View`. Il n'est appelé que s'il est implémenté, donc les modes natifs ne paient aucun appel Blueprint par frame. `Get Native View` renvoie la vue C++ du mode parent pour la retoucher.
+
+Les événements `On Activated` / `On Deactivated` servent par exemple à masquer la tête du personnage en première personne. Les instances de mode persistent : une valeur modifiée à l'exécution (FOV de visée) reste jusqu'à ce qu'on la rétablisse ; les valeurs par défaut restent lisibles sur le CDO.
 
 ## Changer de mode
 
@@ -55,9 +63,16 @@ Si le pawn a d'autres composants caméra, seul le premier actif est utilisé par
 **RTS**
 1. Faire posséder au joueur un `APEPStrategyCameraPawn`, ou un Blueprint dérivé. Son composant caméra utilise le mode stratégie par défaut.
 2. Renseigner `InputConfig` (Pan sur WASD avec un modificateur Swizzle pour l'axe Y, Zoom sur la molette, Orbit sur Q/E ou sur le déplacement de la souris avec bouton maintenu) et `InputMappingContext`.
-3. Afficher le curseur depuis le contrôleur si le défilement par bord d'écran est activé.
+3. Le défilement par bord d'écran ne tourne que si le contrôleur affiche le curseur (`ShouldShowMouseCursor`) et que le viewport a le focus. Avec PEPPlayer, activer `bShowMouseCursorInGameplay` sur le contrôleur. Pour le couper quand un menu est ouvert, surcharger `CanEdgeScroll` dans une sous-classe du mode.
 
-Le pawn se place sur le point visé : la pertinence réseau, l'audio et le streaming suivent ce que regarde le joueur. Le client propriétaire envoie ce point au serveur (RPC non fiable, au plus tous les `SyncInterval`, s'il a bougé de plus de `SyncDistance`). C'est une indication de pertinence réseau, jamais une autorité de jeu ; ne pas l'utiliser comme brouillard de guerre côté serveur.
+Le pawn se place sur le point visé : ce qui lit la position du pawn (audio, streaming, pertinence quand elle se base sur le pawn) suit ce que regarde le joueur. Le pawn ne tick que sur la machine qui le contrôle localement.
+
+Synchronisation avec le serveur :
+- pendant le mouvement, le client envoie le point visé en RPC non fiable, au plus tous les `SyncInterval`, s'il a bougé de plus de `SyncDistance` ;
+- une fois la caméra immobile depuis `SyncKeepAliveInterval`, il envoie une dernière fois la position exacte en RPC fiable, ce qui répare un paquet perdu ou un petit déplacement non transmis ;
+- le serveur borne la position reçue aux `FocusBounds` du mode stratégie.
+
+C'est une indication, jamais une autorité de jeu ; ne pas l'utiliser comme brouillard de guerre côté serveur.
 
 **Vue de dessus qui suit un personnage**
 Utiliser une sous-classe du mode stratégie avec `FocusMode = FollowViewTarget` sur le composant caméra du personnage.
@@ -65,9 +80,9 @@ Utiliser une sous-classe du mode stratégie avec `FocusMode = FollowViewTarget` 
 ## Limites actuelles
 
 - Pas de panoramique par glisser-déposer de la souris : seules les entrées de vitesse et le bord d'écran déplacent le point visé.
-- Pas de gestion de la réalité virtuelle (XR) ni de caméra orthographique dédiée : les réglages de projection du `UCameraComponent` sont recopiés tels quels.
+- Pas de mode XR ni de mode orthographique dédiés : ces réglages viennent du `UCameraComponent` de base.
 - La sonde de collision TPS ignore uniquement la cible de vue. Les acteurs attachés (armes) doivent ignorer le canal `Camera`.
 
 ## Tests
 
-`PEP.Camera.*` : fondu et retrait dans la pile, retour en cours de fondu sans saut, œil FPS, perche/épaule/zoom TPS, déplacement/zoom/tangage/suivi du mode stratégie, cycle de modes et routage des entrées par le composant. Ces tests tournent sans monde : les sondes de collision et de relief n'y sont pas exercées.
+`PEP.Camera.*` : fondu et retrait dans la pile, retour en cours de fondu sans saut (linéaire et courbes différentes), inverse des courbes de fondu, FOV bornée, œil FPS, perche/épaule/zoom TPS, réinitialisation du retard TPS après téléportation, déplacement/zoom/tangage/suivi et limites du mode stratégie, cycle de modes et routage des entrées par le composant. Ces tests tournent sans monde : les sondes de collision et de relief n'y sont pas exercées.

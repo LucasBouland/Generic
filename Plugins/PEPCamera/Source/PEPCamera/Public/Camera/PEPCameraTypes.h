@@ -30,7 +30,7 @@ struct PEPCAMERA_API FPEPCameraView
 	FRotator Rotation = FRotator::ZeroRotator;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Camera",
-		meta=(UIMin="5.0", UIMax="170.0", ClampMin="0.001", ClampMax="360.0", Units="deg"))
+		meta=(UIMin="5.0", UIMax="170.0", ClampMin="5.0", ClampMax="170.0", Units="deg"))
 	float FieldOfView = 90.0f;
 
 	/** Moves this view towards Other by Alpha (0 keeps this view, 1 becomes Other), along the shortest rotation. */

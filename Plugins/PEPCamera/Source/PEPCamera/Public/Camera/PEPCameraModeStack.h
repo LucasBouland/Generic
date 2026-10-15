@@ -26,7 +26,8 @@ struct FPEPCameraModeStackEntry
  * Each frame every mode computes its view, then the result is the bottom view blended towards each
  * entry above it by that entry's alpha. Once an entry is fully blended in, everything below it is
  * removed and deactivated. Pushing a mode already in the stack moves it to the top and starts it
- * from the weight that keeps the result continuous, so switching back mid-blend does not pop.
+ * from the weight that keeps the result continuous (through the inverse of its blend curve), so
+ * switching back mid-blend does not pop.
  */
 UCLASS()
 class PEPCAMERA_API UPEPCameraModeStack : public UObject

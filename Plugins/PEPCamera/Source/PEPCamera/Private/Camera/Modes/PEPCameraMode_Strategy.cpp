@@ -1,8 +1,11 @@
 #include "Camera/Modes/PEPCameraMode_Strategy.h"
 
 #include "CollisionQueryParams.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/LocalPlayer.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
+#include "UnrealClient.h"
 
 UPEPCameraMode_Strategy::UPEPCameraMode_Strategy()
 {
@@ -29,10 +32,29 @@ void UPEPCameraMode_Strategy::AddOrbitInput_Implementation(const FVector2D Value
 	}
 }
 
+void UPEPCameraMode_Strategy::ResetInterpolation_Implementation()
+{
+	if (TargetDistance >= 0.0f)
+	{
+		CurrentDistance = TargetDistance;
+	}
+	PendingPanInput = FVector2D::ZeroVector;
+}
+
 void UPEPCameraMode_Strategy::SetFocusLocation(const FVector NewFocusLocation)
 {
-	FocusLocation = NewFocusLocation;
+	FocusLocation = ConstrainFocusLocation(NewFocusLocation);
 	bFocusInitialized = true;
+}
+
+FVector UPEPCameraMode_Strategy::ConstrainFocusLocation(FVector Location) const
+{
+	if (bConstrainFocus && FocusBounds.bIsValid)
+	{
+		Location.X = FMath::Clamp(Location.X, FocusBounds.Min.X, FocusBounds.Max.X);
+		Location.Y = FMath::Clamp(Location.Y, FocusBounds.Min.Y, FocusBounds.Max.Y);
+	}
+	return Location;
 }
 
 void UPEPCameraMode_Strategy::SetYaw(const float NewYaw)
@@ -86,13 +108,28 @@ void UPEPCameraMode_Strategy::EnsureInitialized(const FPEPCameraModeContext& Con
 	}
 }
 
-FVector2D UPEPCameraMode_Strategy::ComputeEdgeScrollInput(const FPEPCameraModeContext& Context) const
+bool UPEPCameraMode_Strategy::CanEdgeScroll(const FPEPCameraModeContext& Context) const
 {
 	const APlayerController* PlayerController = Context.PlayerController;
-	if (!bEdgeScrolling || !PlayerController || !PlayerController->IsLocalController())
+	if (!bEdgeScrolling || !PlayerController || !PlayerController->IsLocalController()
+		|| !PlayerController->ShouldShowMouseCursor())
+	{
+		return false;
+	}
+
+	/* A window in the background keeps reporting the last cursor position, often on an edge. */
+	const ULocalPlayer* LocalPlayer = PlayerController->GetLocalPlayer();
+	const UGameViewportClient* ViewportClient = LocalPlayer ? LocalPlayer->ViewportClient.Get() : nullptr;
+	return ViewportClient && ViewportClient->Viewport && ViewportClient->Viewport->HasFocus();
+}
+
+FVector2D UPEPCameraMode_Strategy::ComputeEdgeScrollInput(const FPEPCameraModeContext& Context) const
+{
+	if (!CanEdgeScroll(Context))
 	{
 		return FVector2D::ZeroVector;
 	}
+	const APlayerController* PlayerController = Context.PlayerController;
 
 	float MouseX = 0.0f;
 	float MouseY = 0.0f;
@@ -143,7 +180,12 @@ void UPEPCameraMode_Strategy::FollowTerrain(const FPEPCameraModeContext& Context
 
 	const FVector Up(0.0f, 0.0f, TerrainProbeHalfHeight);
 	FHitResult Hit;
-	if (World->LineTraceSingleByChannel(Hit, FocusLocation + Up, FocusLocation - Up, TerrainChannel, Params))
+	if (World->LineTraceSingleByObjectType(
+		Hit,
+		FocusLocation + Up,
+		FocusLocation - Up,
+		FCollisionObjectQueryParams(TerrainObjectType),
+		Params))
 	{
 		FocusLocation.Z = TerrainInterpSpeed > 0.0f
 			? FMath::FInterpTo(FocusLocation.Z, Hit.ImpactPoint.Z, Context.DeltaTime, TerrainInterpSpeed)
@@ -151,7 +193,7 @@ void UPEPCameraMode_Strategy::FollowTerrain(const FPEPCameraModeContext& Context
 	}
 }
 
-FPEPCameraView UPEPCameraMode_Strategy::ComputeView_Implementation(const FPEPCameraModeContext& Context)
+FPEPCameraView UPEPCameraMode_Strategy::ComputeView(const FPEPCameraModeContext& Context)
 {
 	EnsureInitialized(Context);
 	const float DeltaTime = Context.DeltaTime;
@@ -162,8 +204,8 @@ FPEPCameraView UPEPCameraMode_Strategy::ComputeView_Implementation(const FPEPCam
 
 	if (FocusMode == EPEPStrategyFocusMode::FollowViewTarget)
 	{
-		FocusLocation = (Context.ViewTarget ? Context.ViewTarget->GetActorLocation() : Context.PivotLocation)
-			+ FollowOffset;
+		FocusLocation = ConstrainFocusLocation(
+			(Context.ViewTarget ? Context.ViewTarget->GetActorLocation() : Context.PivotLocation) + FollowOffset);
 	}
 	else
 	{
@@ -180,11 +222,7 @@ FPEPCameraView UPEPCameraMode_Strategy::ComputeView_Implementation(const FPEPCam
 		const FVector Right = FRotator(0.0f, Yaw + 90.0f, 0.0f).Vector();
 		FocusLocation += (Forward * PanInput.Y + Right * PanInput.X) * PanSpeed * DistanceScale * DeltaTime;
 
-		if (bConstrainFocus && FocusBounds.IsValid)
-		{
-			FocusLocation.X = FMath::Clamp(FocusLocation.X, FocusBounds.Min.X, FocusBounds.Max.X);
-			FocusLocation.Y = FMath::Clamp(FocusLocation.Y, FocusBounds.Min.Y, FocusBounds.Max.Y);
-		}
+		FocusLocation = ConstrainFocusLocation(FocusLocation);
 		FollowTerrain(Context);
 	}
 	/* Input is per frame: what was not consumed now must not move the camera later. */

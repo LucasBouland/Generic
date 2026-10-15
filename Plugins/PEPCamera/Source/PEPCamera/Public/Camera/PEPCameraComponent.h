@@ -28,7 +28,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
  * the current mode; BindCameraInput wires them from an Enhanced Input component.
  *
  * Local presentation only: nothing here replicates or touches movement, so it never runs inside
- * GMC prediction or replay.
+ * GMC prediction or replay. Outside game worlds (editor preview) it behaves as a plain camera
+ * component and leaves its transform alone.
  */
 UCLASS(Blueprintable, ClassGroup=(PEP), meta=(BlueprintSpawnableComponent, DisplayName="PEP Camera Component"))
 class PEPCAMERA_API UPEPCameraComponent : public UCameraComponent
@@ -39,6 +40,8 @@ public:
 	UPEPCameraComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
 	virtual void GetCameraView(float DeltaTime, FMinimalViewInfo& DesiredView) override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void OnUnregister() override;
 
 	/** Requests a mode. The change blends in from the next camera update. Null returns to DefaultCameraMode. */
 	UFUNCTION(BlueprintCallable, Category="PEP|Camera")
@@ -90,6 +93,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category="PEP|Camera|Input")
 	void SwapShoulder();
 
+	/** Resets lag and smoothing of every mode, for example right after a respawn or a teleport. */
+	UFUNCTION(BlueprintCallable, Category="PEP|Camera")
+	void ResetCameraInterpolation();
+
 	/**
 	 * Binds the actions of InputConfig on InputComponent. Call it from the pawn's
 	 * SetupPlayerInputComponent. Calling it again replaces the previous bindings.
@@ -109,6 +116,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Camera")
 	TArray<TSubclassOf<UPEPCameraMode>> CycleCameraModes;
 
+	/**
+	 * Interpolation is reset when the camera was not evaluated for longer than this (seconds), for
+	 * example after spectating another target or a death camera. 0 disables the check.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Camera", meta=(ClampMin="0.0", Units="s"))
+	float ResetInterpolationAfterGap = 0.5f;
+
+	/** Interpolation is reset when the view target moves more than this in one frame (teleport). 0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Camera", meta=(ClampMin="0.0", Units="cm"))
+	float ResetInterpolationTeleportDistance = 1000.0f;
+
 protected:
 	/** Mode to use this frame. Override to choose from gameplay state (aiming, vehicle, ...). */
 	virtual TSubclassOf<UPEPCameraMode> DetermineCameraMode() const;
@@ -118,6 +136,7 @@ protected:
 private:
 	UPEPCameraModeStack* GetOrCreateModeStack();
 	void UpdateCameraModes(const FPEPCameraModeContext& Context);
+	void ResetInterpolationIfDiscontinuous(const FPEPCameraModeContext& Context);
 
 	void HandlePanAction(const FInputActionValue& Value);
 	void HandleZoomAction(const FInputActionValue& Value);
@@ -137,7 +156,13 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UPEPCameraMode> LastPushedMode;
 
+	/* Last lookup of GetCameraModeInstance, which is asked several times per frame for the same class. */
+	UPROPERTY(Transient)
+	TObjectPtr<UPEPCameraMode> CachedModeInstance;
+
 	FPEPCameraView LastCameraView;
+	FVector LastPivotLocation = FVector::ZeroVector;
+	double LastEvaluationTime = -1.0;
 
 	TWeakObjectPtr<UEnhancedInputComponent> BoundInputComponent;
 	TArray<uint32> BoundInputHandles;

@@ -38,6 +38,7 @@ public:
 	virtual void AddPanInput_Implementation(FVector2D Value) override;
 	virtual void AddZoomInput_Implementation(float Value) override;
 	virtual void AddOrbitInput_Implementation(FVector2D Value) override;
+	virtual void ResetInterpolation_Implementation() override;
 
 	/** Moves the focus immediately, for example to jump to a selected unit or an alert. */
 	UFUNCTION(BlueprintCallable, Category="PEP|Camera|Strategy")
@@ -72,6 +73,10 @@ public:
 	UFUNCTION(BlueprintPure, Category="PEP|Camera|Strategy")
 	float GetCurrentDistance() const;
 
+	/** Location clamped to FocusBounds when bConstrainFocus is set; unchanged otherwise. */
+	UFUNCTION(BlueprintPure, Category="PEP|Camera|Strategy")
+	FVector ConstrainFocusLocation(FVector Location) const;
+
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Focus")
 	EPEPStrategyFocusMode FocusMode = EPEPStrategyFocusMode::Free;
 
@@ -87,7 +92,10 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Pan")
 	bool bScalePanWithDistance = true;
 
-	/** Pans when the mouse cursor is near the viewport edge. Needs a visible cursor. */
+	/**
+	 * Pans when the mouse cursor is near the viewport edge. Only while the player controller shows the
+	 * cursor and the viewport has focus (see CanEdgeScroll).
+	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Pan")
 	bool bEdgeScrolling = false;
 
@@ -100,8 +108,12 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Terrain")
 	bool bFollowTerrain = true;
 
+	/**
+	 * Object type the terrain probe hits. Queried by object type, not by trace channel, so units and
+	 * other dynamic objects under the focus do not lift it.
+	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Terrain", meta=(EditCondition="bFollowTerrain"))
-	TEnumAsByte<ECollisionChannel> TerrainChannel = ECC_Visibility;
+	TEnumAsByte<ECollisionChannel> TerrainObjectType = ECC_WorldStatic;
 
 	/** Half height of the vertical terrain probe around the focus. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Terrain",
@@ -113,12 +125,13 @@ public:
 		meta=(ClampMin="0.0", EditCondition="bFollowTerrain"))
 	float TerrainInterpSpeed = 10.0f;
 
-	/** Keeps the focus inside FocusBounds (X and Y only). */
+	/** Keeps the focus inside FocusBounds, in every focus mode and for SetFocusLocation. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Focus")
 	bool bConstrainFocus = false;
 
+	/** World X/Y bounds of the focus. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Focus", meta=(EditCondition="bConstrainFocus"))
-	FBox FocusBounds = FBox(FVector(-100000.0f), FVector(100000.0f));
+	FBox2D FocusBounds = FBox2D(FVector2D(-100000.0f, -100000.0f), FVector2D(100000.0f, 100000.0f));
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Strategy|Zoom", meta=(ClampMin="0.0", Units="cm"))
 	float DefaultDistance = 2500.0f;
@@ -160,7 +173,13 @@ public:
 	bool bInheritControlYaw = false;
 
 protected:
-	virtual FPEPCameraView ComputeView_Implementation(const FPEPCameraModeContext& Context) override;
+	virtual FPEPCameraView ComputeView(const FPEPCameraModeContext& Context) override;
+
+	/**
+	 * Whether edge scrolling may run this frame. Default: a local player controller that shows the
+	 * mouse cursor and whose viewport has focus. Override to also stop it while a menu is open.
+	 */
+	virtual bool CanEdgeScroll(const FPEPCameraModeContext& Context) const;
 
 	/** Screen-edge pan direction from the mouse position, X right and Y forward. */
 	virtual FVector2D ComputeEdgeScrollInput(const FPEPCameraModeContext& Context) const;

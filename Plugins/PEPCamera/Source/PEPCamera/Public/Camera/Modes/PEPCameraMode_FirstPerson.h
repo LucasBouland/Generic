@@ -29,15 +29,18 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|First Person")
 	FVector ViewOffset = FVector::ZeroVector;
 
+	virtual void ResetInterpolation_Implementation() override;
+
 protected:
-	virtual FPEPCameraView ComputeView_Implementation(const FPEPCameraModeContext& Context) override;
+	virtual FPEPCameraView ComputeView(const FPEPCameraModeContext& Context) override;
 	virtual void OnActivated(const FPEPCameraModeContext& Context) override;
 
 	/** World location of the eye before ViewOffset. */
-	virtual FVector ResolveEyeLocation(const FPEPCameraModeContext& Context);
+	virtual FVector ResolveEyeLocation(const FPEPCameraModeContext& Context) const;
 
 private:
-	USkeletalMeshComponent* FindSocketMesh(AActor* ViewTarget);
+	const USkeletalMeshComponent* FindSocketMesh(const AActor* ViewTarget) const;
 
-	TWeakObjectPtr<USkeletalMeshComponent> CachedSocketMesh;
+	/* Socket lookups walk the target's components; the mesh is cached until the target changes. */
+	mutable TWeakObjectPtr<const USkeletalMeshComponent> CachedSocketMesh;
 };

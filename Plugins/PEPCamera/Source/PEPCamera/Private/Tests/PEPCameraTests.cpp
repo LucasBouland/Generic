@@ -238,4 +238,130 @@ bool FPEPCameraComponentCycleTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPCameraStackEasedReturnTest,
+	"PEP.Camera.Stack.ReturningMidEasedBlendIsContinuous",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPCameraStackEasedReturnTest::RunTest(const FString& Parameters)
+{
+	UPEPCameraModeStack* Stack = NewObject<UPEPCameraModeStack>(GetTransientPackage());
+	UPEPCameraMode_FirstPerson* A = PEPCameraTests::MakeFixedMode(Stack, 0.0f, 1.0f);
+	UPEPCameraMode_FirstPerson* B = PEPCameraTests::MakeFixedMode(Stack, 100.0f, 1.0f);
+	A->BlendFunction = EPEPCameraBlendFunction::EaseInOut;
+	B->BlendFunction = EPEPCameraBlendFunction::EaseOut;
+
+	Stack->PushCameraMode(A, PEPCameraTests::MakeContext(0.0f));
+	Stack->EvaluateStack(PEPCameraTests::MakeContext(0.0f));
+	Stack->PushCameraMode(B, PEPCameraTests::MakeContext(0.0f));
+	const double MidBlend = Stack->EvaluateStack(PEPCameraTests::MakeContext(0.3f)).Location.X;
+	TestTrue(TEXT("the eased blend is under way"), MidBlend > 0.0 && MidBlend < 100.0);
+
+	Stack->PushCameraMode(A, PEPCameraTests::MakeContext(0.0f));
+	TestEqual(TEXT("switching back between different eased curves does not jump"),
+		Stack->EvaluateStack(PEPCameraTests::MakeContext(0.0f)).Location.X, MidBlend, 0.01);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPCameraBlendInverseTest,
+	"PEP.Camera.Mode.BlendCurveInverseRoundTrips",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPCameraBlendInverseTest::RunTest(const FString& Parameters)
+{
+	UPEPCameraMode_FirstPerson* Mode = NewObject<UPEPCameraMode_FirstPerson>(GetTransientPackage());
+	const EPEPCameraBlendFunction Functions[] = {
+		EPEPCameraBlendFunction::Linear,
+		EPEPCameraBlendFunction::EaseIn,
+		EPEPCameraBlendFunction::EaseOut,
+		EPEPCameraBlendFunction::EaseInOut};
+	for (const EPEPCameraBlendFunction Function : Functions)
+	{
+		Mode->BlendFunction = Function;
+		for (const float Exponent : {1.5f, 2.0f, 3.0f})
+		{
+			Mode->BlendExponent = Exponent;
+			for (int32 Step = 0; Step <= 10; ++Step)
+			{
+				const float Weight = Step / 10.0f;
+				TestEqual(TEXT("inverse(alpha(w)) == w"),
+					Mode->InverseBlendAlpha(Mode->EvaluateBlendAlpha(Weight)), Weight, 0.001f);
+			}
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPCameraFieldOfViewClampTest,
+	"PEP.Camera.Mode.FieldOfViewIsClamped",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPCameraFieldOfViewClampTest::RunTest(const FString& Parameters)
+{
+	UPEPCameraMode_FirstPerson* Mode = NewObject<UPEPCameraMode_FirstPerson>(GetTransientPackage());
+	Mode->FieldOfView = 0.0f;
+	TestEqual(TEXT("a zero FOV is raised to the minimum"),
+		Mode->UpdateView(PEPCameraTests::MakeContext(0.0f)).FieldOfView, UPEPCameraMode::MinFieldOfView);
+	Mode->FieldOfView = 200.0f;
+	TestEqual(TEXT("an oversized FOV is lowered to the maximum"),
+		Mode->UpdateView(PEPCameraTests::MakeContext(0.0f)).FieldOfView, UPEPCameraMode::MaxFieldOfView);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPCameraStrategyBoundsTest,
+	"PEP.Camera.Strategy.FocusStaysInBounds",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPCameraStrategyBoundsTest::RunTest(const FString& Parameters)
+{
+	UPEPCameraMode_Strategy* Mode = NewObject<UPEPCameraMode_Strategy>(GetTransientPackage());
+	Mode->bConstrainFocus = true;
+	Mode->FocusBounds = FBox2D(FVector2D(-1000.0f, -1000.0f), FVector2D(1000.0f, 1000.0f));
+	Mode->bScalePanWithDistance = false;
+	Mode->PanSpeed = 5000.0f;
+
+	Mode->SetFocusLocation(FVector(5000.0f, 0.0f, 0.0f));
+	TestTrue(TEXT("SetFocusLocation is clamped"), Mode->GetFocusLocation().Equals(FVector(1000.0f, 0.0f, 0.0f), 0.01));
+
+	Mode->AddPanInput(FVector2D(0.0f, -1.0f));
+	Mode->UpdateView(PEPCameraTests::MakeContext(1.0f));
+	TestTrue(TEXT("panning is clamped"), Mode->GetFocusLocation().Equals(FVector(-1000.0f, 0.0f, 0.0f), 0.01));
+
+	Mode->FocusMode = EPEPStrategyFocusMode::FollowViewTarget;
+	FPEPCameraModeContext Follow = PEPCameraTests::MakeContext(0.0f);
+	Follow.PivotLocation = FVector(0.0f, 9000.0f, 0.0f);
+	Mode->UpdateView(Follow);
+	TestTrue(TEXT("following is clamped"), Mode->GetFocusLocation().Equals(FVector(0.0f, 1000.0f, 0.0f), 0.01));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPCameraThirdPersonResetTest,
+	"PEP.Camera.ThirdPerson.ResetInterpolationDropsLag",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPCameraThirdPersonResetTest::RunTest(const FString& Parameters)
+{
+	UPEPCameraMode_ThirdPerson* Mode = NewObject<UPEPCameraMode_ThirdPerson>(GetTransientPackage());
+	Mode->PivotOffset = FVector::ZeroVector;
+	Mode->ShoulderOffset = FVector::ZeroVector;
+	Mode->ArmLength = 300.0f;
+	Mode->PivotLagSpeed = 1.0f;
+	Mode->bDoCollisionTest = false;
+
+	FPEPCameraModeContext Context = PEPCameraTests::MakeContext(0.016f);
+	Mode->UpdateView(Context);
+	Context.PivotLocation = FVector(100000.0f, 0.0f, 0.0f);
+	TestTrue(TEXT("a lagged pivot trails a teleported target"),
+		Mode->UpdateView(Context).Location.X < 90000.0);
+
+	Mode->ResetInterpolation();
+	TestTrue(TEXT("after a reset the camera is back behind the target"),
+		Mode->UpdateView(Context).Location.Equals(FVector(100000.0f - 300.0f, 0.0f, 0.0f), 0.01));
+	return true;
+}
+
 #endif

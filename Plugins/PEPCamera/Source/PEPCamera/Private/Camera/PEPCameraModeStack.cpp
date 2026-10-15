@@ -20,11 +20,14 @@ void UPEPCameraModeStack::PushCameraMode(UPEPCameraMode* Mode, const FPEPCameraM
 	{
 		/*
 		 * Coming back to a mode that is still being blended out. The current top contributes its
-		 * alpha over everything below; starting the returning mode at the complement keeps the result
-		 * continuous (exactly for linear blends, closely for eased ones) instead of jumping.
+		 * alpha over everything below, so the returning mode must start at the complement of that
+		 * alpha. Its own curve shapes weights into alphas, hence the inverse: the returning mode's
+		 * alpha equals 1 - TopAlpha on the first frame whatever either blend function is. Exact with
+		 * two modes in the stack; with more, removing the returning mode from the middle can still
+		 * shift the result slightly.
 		 */
 		const FPEPCameraModeStackEntry& Top = Entries.Last();
-		StartWeight = 1.0f - Top.Mode->EvaluateBlendAlpha(Top.Weight);
+		StartWeight = Mode->InverseBlendAlpha(1.0f - Top.Mode->EvaluateBlendAlpha(Top.Weight));
 		Entries.RemoveAt(ExistingIndex);
 	}
 	else

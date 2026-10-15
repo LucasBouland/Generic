@@ -48,8 +48,19 @@ void UPEPCameraMode_ThirdPerson::AddZoomInput_Implementation(const float Value)
 void UPEPCameraMode_ThirdPerson::OnActivated(const FPEPCameraModeContext& Context)
 {
 	/* Lag and obstruction state from a previous use would drag the camera from a stale place. */
+	ResetInterpolation_Implementation();
+}
+
+void UPEPCameraMode_ThirdPerson::ResetInterpolation_Implementation()
+{
 	bHasSmoothedPivot = false;
-	CurrentCollisionLength = -1.0f;
+	CurrentFreeFraction = -1.0f;
+	bShoulderInitialized = false;
+	CachedPivotMesh.Reset();
+	if (TargetArmLength >= 0.0f)
+	{
+		CurrentArmLength = TargetArmLength;
+	}
 }
 
 void UPEPCameraMode_ThirdPerson::EnsureArmInitialized()
@@ -63,15 +74,26 @@ void UPEPCameraMode_ThirdPerson::EnsureArmInitialized()
 
 FVector UPEPCameraMode_ThirdPerson::ResolvePivotLocation(const FPEPCameraModeContext& Context) const
 {
-	if (!PivotSocketName.IsNone() && Context.ViewTarget)
+	const AActor* ViewTarget = Context.ViewTarget.Get();
+	if (PivotSocketName.IsNone() || !ViewTarget)
 	{
-		TInlineComponentArray<USkeletalMeshComponent*> Meshes(Context.ViewTarget.Get());
-		for (const USkeletalMeshComponent* Mesh : Meshes)
+		return Context.PivotLocation;
+	}
+
+	const USkeletalMeshComponent* Cached = CachedPivotMesh.Get();
+	if (Cached && Cached->GetOwner() == ViewTarget && Cached->DoesSocketExist(PivotSocketName))
+	{
+		return Cached->GetSocketLocation(PivotSocketName);
+	}
+
+	CachedPivotMesh.Reset();
+	TInlineComponentArray<USkeletalMeshComponent*> Meshes(ViewTarget);
+	for (const USkeletalMeshComponent* Mesh : Meshes)
+	{
+		if (Mesh && Mesh->DoesSocketExist(PivotSocketName))
 		{
-			if (Mesh && Mesh->DoesSocketExist(PivotSocketName))
-			{
-				return Mesh->GetSocketLocation(PivotSocketName);
-			}
+			CachedPivotMesh = Mesh;
+			return Mesh->GetSocketLocation(PivotSocketName);
 		}
 	}
 	return Context.PivotLocation;
@@ -110,7 +132,7 @@ float UPEPCameraMode_ThirdPerson::ProbeBoomLength(
 	return FullLength;
 }
 
-FPEPCameraView UPEPCameraMode_ThirdPerson::ComputeView_Implementation(const FPEPCameraModeContext& Context)
+FPEPCameraView UPEPCameraMode_ThirdPerson::ComputeView(const FPEPCameraModeContext& Context)
 {
 	EnsureArmInitialized();
 	const float DeltaTime = Context.DeltaTime;
@@ -140,18 +162,22 @@ FPEPCameraView UPEPCameraMode_ThirdPerson::ComputeView_Implementation(const FPEP
 		SmoothedPivot - Rotation.Vector() * CurrentArmLength + Rotation.RotateVector(Shoulder);
 
 	/* Obstructions pull the camera in at once; clearing them lets it glide back out. */
-	const float FreeLength = ProbeBoomLength(Context, SmoothedPivot, DesiredLocation);
-	if (CurrentCollisionLength < 0.0f || FreeLength < CurrentCollisionLength)
+	const FVector Boom = DesiredLocation - SmoothedPivot;
+	const float FullLength = Boom.Size();
+	const float FreeFraction = FullLength > KINDA_SMALL_NUMBER
+		? FMath::Clamp(ProbeBoomLength(Context, SmoothedPivot, DesiredLocation) / FullLength, 0.0f, 1.0f)
+		: 1.0f;
+	if (CurrentFreeFraction < 0.0f || FreeFraction < CurrentFreeFraction)
 	{
-		CurrentCollisionLength = FreeLength;
+		CurrentFreeFraction = FreeFraction;
 	}
 	else
 	{
-		CurrentCollisionLength = InterpOrSnap(CurrentCollisionLength, FreeLength, DeltaTime, CollisionRecoverySpeed);
+		CurrentFreeFraction = InterpOrSnap(CurrentFreeFraction, FreeFraction, DeltaTime, CollisionRecoverySpeed);
 	}
 
 	FPEPCameraView View;
-	View.Location = SmoothedPivot + (DesiredLocation - SmoothedPivot).GetSafeNormal() * CurrentCollisionLength;
+	View.Location = SmoothedPivot + Boom * CurrentFreeFraction;
 	View.Rotation = Rotation;
 	View.FieldOfView = FieldOfView;
 	return View;

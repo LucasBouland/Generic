@@ -6,6 +6,8 @@
 
 #include "PEPCameraMode_ThirdPerson.generated.h"
 
+class USkeletalMeshComponent;
+
 /**
  * Third-person camera on a boom behind a pivot, looking along the control rotation.
  *
@@ -39,6 +41,7 @@ public:
 	float GetTargetArmLength() const;
 
 	virtual void AddZoomInput_Implementation(float Value) override;
+	virtual void ResetInterpolation_Implementation() override;
 
 	/** Optional socket on the view target's skeletal mesh used as pivot instead of the actor location. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Third Person|Pivot")
@@ -90,12 +93,15 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Third Person|Collision")
 	TEnumAsByte<ECollisionChannel> ProbeChannel = ECC_Camera;
 
-	/** Speed at which the camera returns after an obstruction clears. 0 returns instantly. */
+	/**
+	 * Speed at which the camera returns after an obstruction clears. 0 returns instantly.
+	 * Only the view target is ignored by the probe: attached actors (weapons) should ignore the probe channel.
+	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="PEP|Camera|Third Person|Collision", meta=(ClampMin="0.0"))
 	float CollisionRecoverySpeed = 8.0f;
 
 protected:
-	virtual FPEPCameraView ComputeView_Implementation(const FPEPCameraModeContext& Context) override;
+	virtual FPEPCameraView ComputeView(const FPEPCameraModeContext& Context) override;
 	virtual void OnActivated(const FPEPCameraModeContext& Context) override;
 
 	/** World location of the pivot before PivotOffset. */
@@ -113,5 +119,13 @@ private:
 	bool bShoulderInitialized = false;
 	FVector SmoothedPivot = FVector::ZeroVector;
 	bool bHasSmoothedPivot = false;
-	float CurrentCollisionLength = -1.0f;
+
+	/*
+	 * Free fraction of the boom, in [0, 1]. Kept as a fraction rather than a length so that zooming
+	 * the boom out is smoothed once (by ZoomInterpSpeed), not a second time by collision recovery.
+	 */
+	float CurrentFreeFraction = -1.0f;
+
+	/* The pivot socket lookup walks the target's components; the mesh is cached per target. */
+	mutable TWeakObjectPtr<const USkeletalMeshComponent> CachedPivotMesh;
 };

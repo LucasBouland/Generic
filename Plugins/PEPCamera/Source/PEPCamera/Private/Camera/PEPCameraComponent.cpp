@@ -5,6 +5,7 @@
 #include "Camera/PEPCameraMode.h"
 #include "Camera/PEPCameraModeStack.h"
 #include "EnhancedInputComponent.h"
+#include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "InputActionValue.h"
@@ -19,31 +20,83 @@ UPEPCameraComponent::UPEPCameraComponent(const FObjectInitializer& ObjectInitial
 
 void UPEPCameraComponent::GetCameraView(const float DeltaTime, FMinimalViewInfo& DesiredView)
 {
+	/*
+	 * Editor previews call this too. Moving the component there would dirty the level instance it
+	 * belongs to, so outside game worlds the component is a plain camera. A component with no world
+	 * at all (automation tests) still evaluates its modes.
+	 */
+	const UWorld* World = GetWorld();
+	if (World && !World->IsGameWorld())
+	{
+		Super::GetCameraView(DeltaTime, DesiredView);
+		return;
+	}
+
 	const FPEPCameraModeContext Context = BuildModeContext(DeltaTime);
+	ResetInterpolationIfDiscontinuous(Context);
 	UpdateCameraModes(Context);
 
 	LastCameraView = GetOrCreateModeStack()->EvaluateStack(Context);
 
-	/* Keep the component where the view is, so attached effects and audio follow the camera. */
+	/*
+	 * Place the component on the view, then let the base class build the view info from it. That
+	 * keeps every engine-side setting (projection, aspect ratio, post process, additive offsets, XR)
+	 * consistent with UCameraComponent instead of copying a subset of its fields here.
+	 */
 	SetWorldLocationAndRotation(LastCameraView.Location, LastCameraView.Rotation);
-	SetFieldOfView(LastCameraView.FieldOfView);
+	SetFieldOfView(FMath::Clamp(LastCameraView.FieldOfView, UPEPCameraMode::MinFieldOfView, UPEPCameraMode::MaxFieldOfView));
+	Super::GetCameraView(DeltaTime, DesiredView);
+}
 
-	DesiredView.Location = LastCameraView.Location;
-	DesiredView.Rotation = LastCameraView.Rotation;
-	DesiredView.FOV = LastCameraView.FieldOfView;
-	DesiredView.OrthoWidth = OrthoWidth;
-	DesiredView.OrthoNearClipPlane = OrthoNearClipPlane;
-	DesiredView.OrthoFarClipPlane = OrthoFarClipPlane;
-	DesiredView.AspectRatio = AspectRatio;
-	DesiredView.bConstrainAspectRatio = bConstrainAspectRatio;
-	DesiredView.bUseFieldOfViewForLOD = bUseFieldOfViewForLOD;
-	DesiredView.ProjectionMode = ProjectionMode;
-
-	DesiredView.PostProcessBlendWeight = PostProcessBlendWeight;
-	if (PostProcessBlendWeight > 0.0f)
+void UPEPCameraComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	/* Modes get their On Deactivated (for example to show the head mesh again). */
+	if (ModeStack)
 	{
-		DesiredView.PostProcessSettings = PostProcessSettings;
+		ModeStack->Reset();
 	}
+	LastPushedMode = nullptr;
+	Super::EndPlay(EndPlayReason);
+}
+
+void UPEPCameraComponent::OnUnregister()
+{
+	if (ModeStack)
+	{
+		ModeStack->Reset();
+	}
+	LastPushedMode = nullptr;
+	Super::OnUnregister();
+}
+
+void UPEPCameraComponent::ResetCameraInterpolation()
+{
+	for (UPEPCameraMode* Instance : ModeInstances)
+	{
+		if (Instance)
+		{
+			Instance->ResetInterpolation();
+		}
+	}
+}
+
+void UPEPCameraComponent::ResetInterpolationIfDiscontinuous(const FPEPCameraModeContext& Context)
+{
+	const UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : -1.0;
+
+	const bool bLongGap = World && LastEvaluationTime >= 0.0 && ResetInterpolationAfterGap > 0.0f
+		&& Now - LastEvaluationTime > ResetInterpolationAfterGap;
+	const bool bTeleported = LastEvaluationTime >= 0.0 && ResetInterpolationTeleportDistance > 0.0f
+		&& FVector::DistSquared(Context.PivotLocation, LastPivotLocation)
+			> FMath::Square(ResetInterpolationTeleportDistance);
+	if (bLongGap || bTeleported)
+	{
+		ResetCameraInterpolation();
+	}
+
+	LastEvaluationTime = World ? Now : 0.0;
+	LastPivotLocation = Context.PivotLocation;
 }
 
 void UPEPCameraComponent::SetCameraMode(const TSubclassOf<UPEPCameraMode> ModeClass)
@@ -68,16 +121,23 @@ UPEPCameraMode* UPEPCameraComponent::GetCameraModeInstance(const TSubclassOf<UPE
 		return nullptr;
 	}
 
+	if (CachedModeInstance && CachedModeInstance->GetClass() == ModeClass)
+	{
+		return CachedModeInstance;
+	}
+
 	for (UPEPCameraMode* Instance : ModeInstances)
 	{
 		if (Instance && Instance->GetClass() == ModeClass)
 		{
+			CachedModeInstance = Instance;
 			return Instance;
 		}
 	}
 
 	UPEPCameraMode* Instance = NewObject<UPEPCameraMode>(this, ModeClass);
 	ModeInstances.Add(Instance);
+	CachedModeInstance = Instance;
 	return Instance;
 }
 
