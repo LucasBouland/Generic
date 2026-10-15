@@ -2,8 +2,12 @@
 
 #include "Misc/AutomationTest.h"
 #include "Item/PEPItemMutation.h"
+#include "Item/Internal/PEPItemMutableAccess.h"
 #include "Item/PEPItemQuery.h"
 #include "PEPInventoryTestFixture.h"
+#include "Serialization/MemoryReader.h"
+#include "Serialization/MemoryWriter.h"
+#include "Serialization/ObjectAndNameAsStringProxyArchive.h"
 
 /*
  * The save format is the forest AddItemTrees already accepts. What a save must not lose is the
@@ -135,6 +139,123 @@ bool FPEPInventorySaveExportRoundTripsTest::RunTest(const FString&)
 	/* The same forest again is a different save, not a merge: every id is already taken. */
 	TestFalse(TEXT("restoring twice is refused"),
 		Restored.Inventory->CanAddItemTrees(Placements, FPEPItemAccessContext::System()).bSuccess);
+
+	return true;
+}
+
+namespace
+{
+	/* Writes and reads the forest the way a USaveGame-style archive does: SaveGame properties only. */
+	TArray<FPEPInventoryTreePlacement> RoundTripSaveGame(TArray<FPEPInventoryTreePlacement>& Placements)
+	{
+		UScriptStruct* PlacementStruct = FPEPInventoryTreePlacement::StaticStruct();
+
+		TArray<uint8> Bytes;
+		FMemoryWriter Writer(Bytes, true);
+		FObjectAndNameAsStringProxyArchive WriterProxy(Writer, true);
+		WriterProxy.ArIsSaveGame = true;
+		int32 Count = Placements.Num();
+		WriterProxy << Count;
+		for (FPEPInventoryTreePlacement& Placement : Placements)
+		{
+			PlacementStruct->SerializeItem(WriterProxy, &Placement, nullptr);
+		}
+
+		TArray<FPEPInventoryTreePlacement> Loaded;
+		FMemoryReader Reader(Bytes, true);
+		FObjectAndNameAsStringProxyArchive ReaderProxy(Reader, true);
+		ReaderProxy.ArIsSaveGame = true;
+		int32 LoadedCount = 0;
+		ReaderProxy << LoadedCount;
+		Loaded.SetNum(LoadedCount);
+		for (FPEPInventoryTreePlacement& Placement : Loaded)
+		{
+			PlacementStruct->SerializeItem(ReaderProxy, &Placement, nullptr);
+		}
+		return Loaded;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPInventorySaveGameArchiveRoundTripsTest,
+	"PEP.Inventory.Save.SaveGameArchiveRoundTrips",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInventorySaveGameArchiveRoundTripsTest::RunTest(const FString&)
+{
+	FFixture Source;
+	UPEPItemDefinition* RigDef = MakeRigDefinition(Source);
+	UPEPItemDefinition* AmmoDef = Source.MakeStackableDefinition(TEXT("ArchiveAmmoDef"), 60);
+	UPEPItemDefinition* ToolDef = Source.MakeShapedDefinition(TEXT("ArchiveToolDef"), FIntPoint(2, 1));
+
+	const FPEPItemInstance Rig = FFixture::MakeItem(RigDef);
+	const FPEPItemId RigId = Rig.ItemId;
+	if (!TestTrue(TEXT("the rig is equipped"), Source.AddToRootSlot(Rig).bSuccess))
+	{
+		return false;
+	}
+
+	FPEPItemInstance Ammo = FFixture::MakeItem(AmmoDef);
+	TestTrue(TEXT("the ammo stack holds seven"), PEPItemMutation::SetStackCount(Ammo, 7).bSuccess);
+	const FPEPItemInstance Tool = FFixture::MakeItem(ToolDef);
+	const FPEPItemLocation AmmoAt = FPEPItemLocation::MakeItemContainer(RigId, GridName, FIntPoint(0, 0));
+	const FPEPItemLocation ToolAt = FPEPItemLocation::MakeItemContainer(RigId, GridName, FIntPoint(1, 1), true);
+	if (!TestTrue(TEXT("the ammo is stored"),
+			Source.Inventory->AddItem(Ammo, AmmoAt, FPEPItemAccessContext::System()).bSuccess)
+		|| !TestTrue(TEXT("the tool is stored rotated"),
+			Source.Inventory->AddItem(Tool, ToolAt, FPEPItemAccessContext::System()).bSuccess))
+	{
+		return false;
+	}
+
+	TArray<FPEPInventoryTreePlacement> Placements;
+	Source.Inventory->ExportItemTrees(Placements);
+	if (!TestEqual(TEXT("one tree per root entry"), Placements.Num(), 1))
+	{
+		return false;
+	}
+
+	/* Container runtime state lives on the instance; it must cross the archive like any other state. */
+	FPEPItemMutableAccess::FindOrAddState<FPEPItemState_ContainerRuntime>(Placements[0].Tree.RootItem).bLocked = true;
+
+	TArray<FPEPInventoryTreePlacement> Loaded = RoundTripSaveGame(Placements);
+	if (!TestEqual(TEXT("the archive keeps every tree"), Loaded.Num(), 1))
+	{
+		return false;
+	}
+	TestTrue(TEXT("the root location survives"), Loaded[0].RootLocation == Placements[0].RootLocation);
+	TestTrue(TEXT("the root item survives"), Loaded[0].Tree.RootItem.ItemId == RigId);
+	TestTrue(TEXT("the root definition survives"),
+		Loaded[0].Tree.RootItem.DefinitionId == Placements[0].Tree.RootItem.DefinitionId);
+	TestEqual(TEXT("every descendant survives"), Loaded[0].Tree.Children.Num(), Placements[0].Tree.Children.Num());
+	const FPEPItemState_ContainerRuntime* LoadedLock =
+		Loaded[0].Tree.RootItem.GetState<FPEPItemState_ContainerRuntime>();
+	TestTrue(TEXT("the container lock survives"), LoadedLock && LoadedLock->bLocked);
+	for (int32 Index = 0; Index < Loaded[0].Tree.Children.Num() && Index < Placements[0].Tree.Children.Num(); ++Index)
+	{
+		TestTrue(TEXT("a child keeps its id"),
+			Loaded[0].Tree.Children[Index].Item.ItemId == Placements[0].Tree.Children[Index].Item.ItemId);
+		TestTrue(TEXT("a child keeps its location, rotation included"),
+			Loaded[0].Tree.Children[Index].Location == Placements[0].Tree.Children[Index].Location);
+	}
+
+	/* Unlock again so the restore exercises the ordinary path rather than the lock policy. */
+	FPEPItemMutableAccess::FindOrAddState<FPEPItemState_ContainerRuntime>(Loaded[0].Tree.RootItem).bLocked = false;
+
+	FFixture Restored;
+	if (!TestTrue(TEXT("the archived forest restores into an empty store"),
+		Restored.Inventory->AddItemTrees(Loaded, FPEPItemAccessContext::System()).bSuccess))
+	{
+		return false;
+	}
+
+	FPEPItemStackData StackData;
+	const FPEPItemInstance* RestoredAmmo = Restored.Inventory->FindItem(Ammo.ItemId);
+	if (TestNotNull(TEXT("the ammo came back"), RestoredAmmo))
+	{
+		PEPItemQuery::GetStackData(*RestoredAmmo, StackData);
+		TestEqual(TEXT("the stack count survived the archive"), StackData.Count, 7);
+	}
 
 	return true;
 }

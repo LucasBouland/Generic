@@ -16,11 +16,11 @@ struct PEPITEMCORE_API FPEPWorldMaterialOverride
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
 		meta=(ClampMin="0"))
 	int32 MaterialIndex = 0;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	TSoftObjectPtr<UMaterialInterface> Material;
 
 	bool operator==(const FPEPWorldMaterialOverride& Other) const
@@ -35,13 +35,13 @@ struct PEPITEMCORE_API FPEPWorldScalarParameter
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	FName ParameterName;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	float Value = 0.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
 		meta=(ClampMin="-1"))
 	int32 MaterialIndex = INDEX_NONE;
 
@@ -59,13 +59,13 @@ struct PEPITEMCORE_API FPEPWorldVectorParameter
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	FName ParameterName;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	FLinearColor Value = FLinearColor::White;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
 		meta=(ClampMin="-1"))
 	int32 MaterialIndex = INDEX_NONE;
 
@@ -83,13 +83,13 @@ struct PEPITEMCORE_API FPEPWorldTextureParameter
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	FName ParameterName;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	TSoftObjectPtr<UTexture> Value;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
 		meta=(ClampMin="-1"))
 	int32 MaterialIndex = INDEX_NONE;
 
@@ -110,23 +110,23 @@ struct PEPITEMCORE_API FPEPWorldPresentationCosmetics
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	FName VariantName;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation",
 		meta=(Categories="Item.Presentation"))
 	FGameplayTagContainer VisualStateTags;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	TArray<FPEPWorldMaterialOverride> MaterialOverrides;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	TArray<FPEPWorldScalarParameter> ScalarParameters;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	TArray<FPEPWorldVectorParameter> VectorParameters;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	TArray<FPEPWorldTextureParameter> TextureParameters;
 
 	bool operator==(const FPEPWorldPresentationCosmetics& Other) const

@@ -11,7 +11,7 @@ struct PEPINVENTORY_API FPEPItemState_ContainerRuntime : public FPEPItemStateFra
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|Container")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|Container")
 	bool bLocked = false;
 };
 

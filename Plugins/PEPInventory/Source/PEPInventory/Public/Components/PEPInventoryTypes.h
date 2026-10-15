@@ -41,10 +41,10 @@ struct PEPINVENTORY_API FPEPInventoryTreePlacement
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Inventory|Tree")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Inventory|Tree")
 	FPEPItemLocation RootLocation;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Inventory|Tree")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Inventory|Tree")
 	FPEPItemInstanceTree Tree;
 };
 

@@ -90,7 +90,7 @@ public:
 
 	static constexpr int32 CurrentSchemaVersion = 1;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item")
+	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item")
 	int32 SchemaVersion = CurrentSchemaVersion;
 
 	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item")
@@ -132,6 +132,9 @@ public:
 	bool ValidateInstance(FPEPItemInstanceValidationResult& OutResult) const;
 	bool MigrateInstanceFromVersion(int32 LoadedSchemaVersion);
 	bool RepairLoadedInstance();
+
+	/** Upgrades records loaded from an archive written by an older schema. See TStructOpsTypeTraits below. */
+	void PostSerialize(const FArchive& Ar);
 
 	template <typename TState>
 	bool HasState() const
@@ -212,4 +215,13 @@ private:
 		NewEntry.InitializeAs(TState::StaticStruct());
 		return *NewEntry.GetMutablePtr<TState>();
 	}
+};
+
+template <>
+struct TStructOpsTypeTraits<FPEPItemInstance> : public TStructOpsTypeTraitsBase2<FPEPItemInstance>
+{
+	enum
+	{
+		WithPostSerialize = true
+	};
 };

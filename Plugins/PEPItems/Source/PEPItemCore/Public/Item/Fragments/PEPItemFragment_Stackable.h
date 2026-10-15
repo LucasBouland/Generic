@@ -9,7 +9,7 @@ struct PEPITEMCORE_API FPEPItemState_Stack : public FPEPItemStateFragment
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item", meta=(ClampMin="1"))
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item", meta=(ClampMin="1"))
 	int32 Count = 1;
 	virtual EPEPStateStackability GetStackability() const override;
 	virtual bool IsDepleted() const override;

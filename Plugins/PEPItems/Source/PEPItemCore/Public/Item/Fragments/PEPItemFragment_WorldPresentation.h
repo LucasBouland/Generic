@@ -29,10 +29,10 @@ struct PEPITEMCORE_API FPEPItemState_WorldPresentation : public FPEPItemStateFra
 	GENERATED_BODY()
 
 	/** Optional full-mesh skin. Null keeps the definition's base world mesh. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	TSoftObjectPtr<UStaticMesh> MeshOverride;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|World Presentation")
 	FPEPWorldPresentationCosmetics Cosmetics;
 
 	virtual EPEPStateStackability GetStackability() const override

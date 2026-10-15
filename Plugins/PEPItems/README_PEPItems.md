@@ -45,7 +45,15 @@ La validation et l’aperçu des assets dans l’éditeur utilisent des fonction
 
 ## Sauvegarde
 
-PEPItems et PEPInventory n’écrivent aucun fichier : le projet sérialise lui-même, avec son propre système de sauvegarde, le résultat de `UPEPInventoryComponent::ExportItemTrees` (un `FPEPInventoryTreePlacement[]`, un arbre par entrée racine avec sa `RootLocation`) et l’état de l’allocateur d’IDs, `UPEPIdAllocatorSubsystem::GetSaveState()`. Les champs persistants de `FPEPItemInstance` (`ItemId`, `DefinitionId`, `StateFragments`) et de `FPEPItemLocation` portent le flag `SaveGame`, ce qui permet un archivage `ArIsSaveGame` sans copie manuelle.
+PEPItems et PEPInventory n’écrivent aucun fichier : le projet sérialise lui-même, avec son propre système de sauvegarde, le résultat de `UPEPInventoryComponent::ExportItemTrees` (un `FPEPInventoryTreePlacement[]`, un arbre par entrée racine avec sa `RootLocation`) et l’état de l’allocateur d’IDs, `UPEPIdAllocatorSubsystem::GetSaveState()`. Tout ce qui doit survivre à une sauvegarde porte le flag `SaveGame`, jusqu’aux champs des structs imbriquées, car une archive `ArIsSaveGame` ignore tout champ non marqué, même à l’intérieur d’une struct ou d’un `FInstancedStruct` :
+
+- `FPEPItemInstance` (`SchemaVersion`, `ItemId`, `DefinitionId`, `StateFragments`) et `FPEPItemLocation` ;
+- les états d’item (`FPEPItemState_Stack::Count`, `FPEPItemState_Durability::Durability`, `FPEPItemState_Resource::Current`, `FPEPItemState_WorldPresentation` et ses cosmétiques, `FPEPItemState_ContainerRuntime::bLocked` côté Inventory) ;
+- les enveloppes d’export Inventory (`FPEPInventoryTreePlacement`, `FPEPItemInstanceTree`, `FPEPItemInstanceTreeEntry`).
+
+Un nouvel état d’item doit marquer `SaveGame` chacun de ses champs persistants. Les tests `PEP.Items.Save.*` et `PEP.Inventory.Save.SaveGameArchiveRoundTrips` font un vrai aller-retour par archive `ArIsSaveGame`.
+
+`FPEPItemInstance` est versionné par `SchemaVersion`. Au chargement depuis une archive, `PostSerialize` appelle `MigrateInstanceFromVersion` lorsque la version lue est plus ancienne que `CurrentSchemaVersion`; une version plus récente que le build est laissée telle quelle et `ValidateInstance` la rejette. Pour passer à une version 2, incrémenter `CurrentSchemaVersion` et ajouter l’étape de migration dans `MigrateInstanceFromVersion`. Les sauvegardes écrites avant que `SchemaVersion` soit persisté sont relues comme la version courante (1) : c’est exact tant que la version 1 est la seule ayant existé. `RepairLoadedInstance` reste un appel explicite du projet : il corrige les valeurs hors bornes au lieu de laisser `AddItemTrees` refuser l’arbre.
 
 À la restauration, appeler d’abord `RestoreFromSaveState` sur l’allocateur (serveur uniquement), puis `AddItemTrees(Placements)` sur l’inventaire vide, une fois les slots nommés enregistrés par les composants de domaine. L’export est l’inverse exact de `AddItemTrees` : ids, locations et état des items reviennent identiques. `PruneMissingDefinitions` (PEPLoadoutMutation) retire au préalable les arbres dont la définition a disparu.
 

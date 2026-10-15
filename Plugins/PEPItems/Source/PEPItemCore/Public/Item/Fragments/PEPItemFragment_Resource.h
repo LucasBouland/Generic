@@ -13,7 +13,7 @@ struct PEPITEMCORE_API FPEPItemState_Resource : public FPEPItemStateFragment
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Item", meta=(ClampMin="0"))
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item", meta=(ClampMin="0"))
 	int32 Current = 0;
 
 	virtual bool IsDepleted() const override;

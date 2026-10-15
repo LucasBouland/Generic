@@ -38,10 +38,10 @@ struct PEPINVENTORY_API FPEPItemInstanceTreeEntry
 {
 	GENERATED_BODY()
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
+	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
 	FPEPItemInstance Item;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
+	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
 	FPEPItemLocation Location;
 };
 
@@ -55,10 +55,10 @@ struct PEPINVENTORY_API FPEPItemInstanceTree
 {
 	GENERATED_BODY()
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
+	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
 	FPEPItemInstance RootItem;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
+	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Preset")
 	TArray<FPEPItemInstanceTreeEntry> Children;
 
 	void Reset();

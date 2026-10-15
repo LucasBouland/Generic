@@ -496,6 +496,20 @@ bool FPEPItemInstance::MigrateInstanceFromVersion(const int32 LoadedSchemaVersio
 	return true;
 }
 
+void FPEPItemInstance::PostSerialize(const FArchive& Ar)
+{
+	/*
+	 * Archive loads (save games, object duplication) are where a record written by an older build
+	 * enters the game, so the upgrade happens here once instead of in every importer. A version
+	 * newer than this build is left untouched: ValidateInstance then rejects it rather than the data
+	 * being silently relabelled as current.
+	 */
+	if (Ar.IsLoading() && SchemaVersion < CurrentSchemaVersion)
+	{
+		MigrateInstanceFromVersion(SchemaVersion);
+	}
+}
+
 bool FPEPItemInstance::RepairLoadedInstance()
 {
 	NormalizeStateFragments();
