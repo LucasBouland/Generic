@@ -65,6 +65,6 @@ FPEPItemResult IPEPItemStore::RemoveItemTree(
 	}
 
 	return FPEPItemResult::Success(
-		ItemId,
-		PEPCoreTags::Reason_None);
+		PEPCoreTags::Reason_None,
+		ItemId);
 }

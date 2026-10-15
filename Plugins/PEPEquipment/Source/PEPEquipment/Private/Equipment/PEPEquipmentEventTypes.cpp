@@ -132,12 +132,12 @@ void PEPEquipmentEvents::DiffPublicProjection(
 	{
 		return A.Depth != B.Depth
 			? A.Depth > B.Depth
-			: A.Node.ItemId.Value < B.Node.ItemId.Value;
+			: A.Node.ItemId.GetValue() < B.Node.ItemId.GetValue();
 	});
 	Algo::Sort(OutEquipped, [](const FPEPEquipmentChange& A, const FPEPEquipmentChange& B)
 	{
 		return A.Depth != B.Depth
 			? A.Depth < B.Depth
-			: A.Node.ItemId.Value < B.Node.ItemId.Value;
+			: A.Node.ItemId.GetValue() < B.Node.ItemId.GetValue();
 	});
 }

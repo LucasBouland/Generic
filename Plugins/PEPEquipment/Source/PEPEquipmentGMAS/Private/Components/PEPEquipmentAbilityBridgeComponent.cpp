@@ -438,7 +438,7 @@ void UPEPEquipmentAbilityBridgeComponent::RevokeAll()
 	AppliedItems.GetKeys(ItemIds);
 	ItemIds.Sort([](const FPEPItemId& A, const FPEPItemId& B)
 	{
-		return A.Value < B.Value;
+		return A.GetValue() < B.GetValue();
 	});
 	for (const FPEPItemId ItemId : ItemIds)
 	{

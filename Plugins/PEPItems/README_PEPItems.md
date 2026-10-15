@@ -48,7 +48,7 @@ Ne sont plus natifs dans ItemCore : `Item.Type.Weapon`, `Ammo`, `Magazine`, `Med
 
 `PEPItemCore` possède `FPEPItemResult` pour les règles et mutations liées à la validité d’un item, aux stacks et à son état. Les modules de domaine convertissent ce résultat à leur propre frontière publique : `FPEPInventoryResult`, `FPEPEquipmentResult`, `FPEPWeaponResult` et `FPEPInteractionResult`.
 
-`FPEPItemResult` est le `FPEPOperationResult` de PEPCore augmenté de l’`ItemId` concerné : `bSuccess` et `ReasonTag` ont le même sens et utilisent les mêmes raisons canoniques `PEPCoreTags`. `ToOperationResult()` produit le résultat générique sans l’identité de l’item. L’ordre des arguments des fabriques reste asymétrique (`Success(ItemId, Reason)`, `Failure(Reason, ItemId)`) pour ne pas inverser silencieusement les nombreux appels existants.
+`FPEPItemResult` est le `FPEPOperationResult` de PEPCore augmenté de l’`ItemId` concerné : `bSuccess` et `ReasonTag` ont le même sens et utilisent les mêmes raisons canoniques `PEPCoreTags`. `ToOperationResult()` produit le résultat générique sans l’identité de l’item. Les deux fabriques prennent la raison en premier, comme `FPEPOperationResult` : `Success(Reason, ItemId)` et `Failure(Reason, ItemId)`; `Success(ItemId)` reste disponible pour un succès sans raison. Les deux types de paramètres ne se convertissent pas l’un en l’autre : un appel écrit dans l’ancien ordre ne compile plus au lieu d’inverser silencieusement ses arguments.
 
 ## Requêtes, règles et mutations
 

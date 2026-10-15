@@ -5,7 +5,7 @@
 ## In scope
 
 - `EPEPRequestResult` and `FPEPOperationResult` for generic request and infrastructure outcomes. Operations with domain-specific context use their owning domain's result type.
-- `FPEPItemId` as a stable value contract shared by item, inventory, equipment and pickup APIs. It contains identity only; ID allocation is private to `PEPItemCore`'s item-instance creation path.
+- `FPEPItemId` as a stable value contract shared by item, inventory, equipment and pickup APIs. It contains identity only; ID allocation is private to `PEPItemCore`'s item-instance creation path. The raw `int32` is private: `GetValue()` reads it (logs, deterministic ordering) and `FromRawValue()` wraps one for allocators, save restoration and tests. Blueprint still reads `Value` through the break node, and the saved property name is unchanged.
 - Canonical cross-domain reason tags in `PEPCoreTags`, `LogPEP`, and the global PEP debug setting.
 - Small contracts that genuinely have no owning gameplay/UI domain and are consumed by multiple PEP plugins.
 

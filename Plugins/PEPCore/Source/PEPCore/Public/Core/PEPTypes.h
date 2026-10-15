@@ -15,13 +15,28 @@ enum class EPEPRequestResult : uint8
 /**
  * Stable identity contract shared by item, inventory, equipment and pickup domains.
  * Creation and persistence are owned by PEPItemCore; PEPCore only defines the shared value type.
+ *
+ * The raw value is private: gameplay code receives ids and compares them, it does not make them.
+ * GetValue() reads it (logs, deterministic ordering); FromRawValue() is for id allocators, save
+ * restoration and tests. Blueprint still reads Value through the struct's break node.
  */
 USTRUCT(BlueprintType)
 struct PEPCORE_API FPEPItemId
 {
 	GENERATED_BODY()
-	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item")
-	int32 Value = INDEX_NONE;
+
+	/** Wraps a raw value. Only id allocators, save restoration and tests should need this. */
+	static FPEPItemId FromRawValue(const int32 InValue)
+	{
+		FPEPItemId Id;
+		Id.Value = InValue;
+		return Id;
+	}
+
+	int32 GetValue() const
+	{
+		return Value;
+	}
 
 	bool IsValid() const
 	{
@@ -47,11 +62,15 @@ struct PEPCORE_API FPEPItemId
 	{
 		return !(A == B);
 	}
+
+private:
+	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item", meta=(AllowPrivateAccess="true"))
+	int32 Value = INDEX_NONE;
 };
 
 FORCEINLINE uint32 GetTypeHash(const FPEPItemId& Id)
 {
-	return GetTypeHash(Id.Value);
+	return GetTypeHash(Id.GetValue());
 }
 
 /**

@@ -15,8 +15,10 @@
  * ToOperationResult() is lossless apart from ItemId. The two types stay separate (rather than one
  * deriving from the other) because both are reflected and widely used by value.
  *
- * Note the factory argument order differs: Success(ItemId, Reason) but Failure(Reason, ItemId).
- * It is kept as is: changing it would silently swap arguments at many call sites.
+ * Both factories take the reason first, like FPEPOperationResult: Success(Reason, ItemId) and
+ * Failure(Reason, ItemId). Success(ItemId) is the short form for a success without a reason.
+ * The two parameter types do not convert into each other, so a call written in the old
+ * Success(ItemId, Reason) order fails to compile instead of swapping silently.
  */
 USTRUCT(BlueprintType)
 struct PEPITEMCORE_API FPEPItemResult
@@ -34,14 +36,19 @@ public:
 	FPEPItemId ItemId;
 
 	static FPEPItemResult Success(
-		const FPEPItemId InItemId = FPEPItemId(),
-		const FGameplayTag InReasonTag = FGameplayTag())
+		const FGameplayTag InReasonTag = FGameplayTag(),
+		const FPEPItemId InItemId = FPEPItemId())
 	{
 		FPEPItemResult Result;
 		Result.bSuccess = true;
 		Result.ItemId = InItemId;
 		Result.ReasonTag = InReasonTag;
 		return Result;
+	}
+
+	static FPEPItemResult Success(const FPEPItemId InItemId)
+	{
+		return Success(FGameplayTag(), InItemId);
 	}
 
 	static FPEPItemResult Failure(

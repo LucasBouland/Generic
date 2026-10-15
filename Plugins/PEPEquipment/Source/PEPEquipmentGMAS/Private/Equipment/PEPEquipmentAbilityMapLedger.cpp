@@ -86,7 +86,7 @@ const FPEPEquipmentAbilityMapLedger::FContribution* FPEPEquipmentAbilityMapLedge
 		if (!Winner
 			|| Candidate.Priority > Winner->Priority
 			|| (Candidate.Priority == Winner->Priority
-				&& Candidate.ItemId.Value < Winner->ItemId.Value))
+				&& Candidate.ItemId.GetValue() < Winner->ItemId.GetValue()))
 		{
 			Winner = &Candidate;
 		}

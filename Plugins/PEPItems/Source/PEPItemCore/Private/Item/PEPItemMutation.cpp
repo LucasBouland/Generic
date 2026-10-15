@@ -44,7 +44,7 @@ namespace PEPItemMutation
 		// overflow its maximum and the source cannot go negative.
 		SourceStack->Count -= OutTransferCount;
 		TargetStack->Count += OutTransferCount;
-		return FPEPItemResult::Success(TargetItem.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, TargetItem.ItemId);
 	}
 
 	namespace Private
@@ -69,7 +69,7 @@ namespace PEPItemMutation
 
 			SourceState->Count -= SplitCount;
 			SplitState->Count = SplitCount;
-			return FPEPItemResult::Success(SplitItem.ItemId, PEPCoreTags::Reason_None);
+			return FPEPItemResult::Success(PEPCoreTags::Reason_None, SplitItem.ItemId);
 		}
 	}
 

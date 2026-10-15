@@ -106,9 +106,9 @@ namespace PEPEquipmentEventTest
 		const FName ParentSlotName = NAME_None)
 	{
 		FPEPEquippedItemInfo Node;
-		Node.ItemId.Value = ItemValue;
+		Node.ItemId = FPEPItemId::FromRawValue(ItemValue);
 		Node.SlotTag = SlotTag;
-		Node.ParentItemId.Value = ParentValue;
+		Node.ParentItemId = FPEPItemId::FromRawValue(ParentValue);
 		Node.ParentSlotName = ParentSlotName;
 		return Node;
 	}
@@ -158,22 +158,22 @@ bool FPEPEquipmentEventDiffOrderTest::RunTest(const FString& Parameters)
 	if (Unequipped.Num() == 2 && Equipped.Num() == 2)
 	{
 		TestTrue(TEXT("the attachment leaves before its root"),
-			Unequipped[0].Node.ItemId.Value == 11 && Unequipped[0].Depth == 1
+			Unequipped[0].Node.ItemId.GetValue() == 11 && Unequipped[0].Depth == 1
 			&& Unequipped[0].RootSlotTag == Hand);
 		TestTrue(TEXT("the root leaves from its old slot"),
-			Unequipped[1].Node.ItemId.Value == 10 && Unequipped[1].Node.SlotTag == Hand);
+			Unequipped[1].Node.ItemId.GetValue() == 10 && Unequipped[1].Node.SlotTag == Hand);
 		TestTrue(TEXT("the root enters its new slot first"),
-			Equipped[0].Node.ItemId.Value == 10 && Equipped[0].Node.SlotTag == Back);
+			Equipped[0].Node.ItemId.GetValue() == 10 && Equipped[0].Node.SlotTag == Back);
 		TestTrue(TEXT("the unchanged attachment is re-announced under the new root slot"),
-			Equipped[1].Node.ItemId.Value == 11 && Equipped[1].RootSlotTag == Back);
+			Equipped[1].Node.ItemId.GetValue() == 11 && Equipped[1].RootSlotTag == Back);
 	}
 	TestFalse(TEXT("an untouched helmet is never announced"),
 		Unequipped.ContainsByPredicate([](const FPEPEquipmentChange& Change)
 		{
-			return Change.Node.ItemId.Value == 5;
+			return Change.Node.ItemId.GetValue() == 5;
 		}) || Equipped.ContainsByPredicate([](const FPEPEquipmentChange& Change)
 		{
-			return Change.Node.ItemId.Value == 5;
+			return Change.Node.ItemId.GetValue() == 5;
 		}));
 
 	TArray<FPEPEquippedItemInfo> Reordered = Current;
@@ -441,7 +441,7 @@ bool FPEPEquipmentStoreWritesFoldTest::RunTest(const FString& Parameters)
 	Fixture.Flush();
 	TArray<FPEPEquipmentChange>& Changes = Fixture.Listener->Changes;
 	TestEqual(TEXT("one rebuild announces both"), Changes.Num(), 2);
-	const FPEPItemId FirstId = RifleId.Value < HelmetId.Value ? RifleId : HelmetId;
+	const FPEPItemId FirstId = RifleId.GetValue() < HelmetId.GetValue() ? RifleId : HelmetId;
 	TestTrue(TEXT("in ItemId order, whatever the write order"),
 		Changes.Num() == 2
 		&& Changes[0].ChangeType == EPEPEquipmentChangeType::Equipped

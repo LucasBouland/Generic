@@ -164,7 +164,7 @@ namespace PEPItemRules
 		}
 
 		OutTransferCount = TransferCount;
-		return FPEPItemResult::Success(TargetItem.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, TargetItem.ItemId);
 	}
 
 	FPEPItemResult CanSplitStack(
@@ -193,7 +193,7 @@ namespace PEPItemRules
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, SourceItem.ItemId);
 		}
 
-		return FPEPItemResult::Success(SourceItem.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, SourceItem.ItemId);
 	}
 
 	FPEPItemResult CanSetDurability(
@@ -229,7 +229,7 @@ namespace PEPItemRules
 
 		const float SignedAmount = bIsRepair ? Amount : -Amount;
 		OutTargetDurability = FMath::Clamp(DurabilityData.Durability + SignedAmount, 0.0f, 1.0f);
-		return FPEPItemResult::Success(Item.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, Item.ItemId);
 	}
 
 	namespace Private

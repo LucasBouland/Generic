@@ -40,9 +40,7 @@ namespace PEPItemMutation
 	 */
 	inline FPEPItemId GetPreviewItemId()
 	{
-		FPEPItemId PreviewId;
-		PreviewId.Value = MAX_int32;
-		return PreviewId;
+		return FPEPItemId::FromRawValue(MAX_int32);
 	}
 
 	/**

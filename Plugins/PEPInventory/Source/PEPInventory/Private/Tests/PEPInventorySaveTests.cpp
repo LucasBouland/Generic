@@ -118,13 +118,13 @@ bool FPEPInventorySaveExportRoundTripsTest::RunTest(const FString&)
 	{
 		const FPEPItemId Id = Entry.Item.ItemId;
 		const FPEPInventoryEntry* Twin = Restored.Inventory->FindEntry(Id);
-		if (!TestNotNull(*FString::Printf(TEXT("item %d kept its id"), Id.Value), Twin))
+		if (!TestNotNull(*FString::Printf(TEXT("item %d kept its id"), Id.GetValue()), Twin))
 		{
 			continue;
 		}
-		TestTrue(*FString::Printf(TEXT("item %d kept its location"), Id.Value),
+		TestTrue(*FString::Printf(TEXT("item %d kept its location"), Id.GetValue()),
 			Twin->Location == Entry.Location);
-		TestTrue(*FString::Printf(TEXT("item %d kept its definition"), Id.Value),
+		TestTrue(*FString::Printf(TEXT("item %d kept its definition"), Id.GetValue()),
 			Twin->Item.DefinitionId == Entry.Item.DefinitionId);
 	}
 

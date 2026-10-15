@@ -233,7 +233,7 @@ bool FPEPItemPreviewSplitTest::RunTest(const FString& Parameters)
 		PEPItemInstanceValidationTests::PeekNextAllocatedId(), NextIdBefore);
 	TestTrue(TEXT("the preview split carries the preview id"),
 		PreviewSplit.ItemId == PEPItemMutation::GetPreviewItemId());
-	TestTrue(TEXT("the preview id is MAX_int32"), PEPItemMutation::GetPreviewItemId().Value == MAX_int32);
+	TestTrue(TEXT("the preview id is MAX_int32"), PEPItemMutation::GetPreviewItemId().GetValue() == MAX_int32);
 
 	const FPEPItemState_Stack* AfterState = SourceAfter.GetState<FPEPItemState_Stack>();
 	const FPEPItemState_Stack* PreviewState = PreviewSplit.GetState<FPEPItemState_Stack>();

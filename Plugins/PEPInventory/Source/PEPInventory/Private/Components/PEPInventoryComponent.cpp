@@ -812,8 +812,8 @@ UPEPInventoryComponent::ValidateCanTakeFromLocation(
         EPEPItemLocationType::ItemContainer)
     {
         return FPEPItemResult::Success(
-            Entry.Item.ItemId,
-            PEPCoreTags::Reason_None);
+            PEPCoreTags::Reason_None,
+            Entry.Item.ItemId);
     }
 
     bool bLocked = false;
@@ -848,8 +848,8 @@ FPEPItemResult UPEPInventoryComponent::ValidateExternalReach(
     if (Role != EPEPAccessRole::External)
     {
         return FPEPItemResult::Success(
-            Entry.Item.ItemId,
-            PEPCoreTags::Reason_None);
+            PEPCoreTags::Reason_None,
+            Entry.Item.ItemId);
     }
 
     /*
@@ -867,7 +867,7 @@ FPEPItemResult UPEPInventoryComponent::ValidateExternalReach(
             /* A named slot carries no visibility vocabulary; what a body wears is on show. */
             return bBehindLock
                 ? FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Entry.Item.ItemId)
-                : FPEPItemResult::Success(Entry.Item.ItemId, PEPCoreTags::Reason_None);
+                : FPEPItemResult::Success(PEPCoreTags::Reason_None, Entry.Item.ItemId);
         }
 
         if (Current->Location.Type != EPEPItemLocationType::ItemContainer)
@@ -1006,8 +1006,8 @@ FPEPItemResult UPEPInventoryComponent::AddItem(
     EmitAdded(ItemId, Location);
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 // ---- Indices --------------------------------------------------------------------------------
@@ -1911,8 +1911,8 @@ FPEPItemResult UPEPInventoryComponent::CommitValidatedMove(
     EmitMoved(ItemId, PreviousLocation, Destination, nullptr, &PreviousRoot);
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::MutateItem(
@@ -1989,8 +1989,8 @@ FPEPItemResult UPEPInventoryComponent::MutateItem(
         CommitExtractItemTree(ItemId, Discarded);
 
         return FPEPItemResult::Success(
-            ItemId,
-            PEPCoreTags::Reason_None);
+            PEPCoreTags::Reason_None,
+            ItemId);
     }
 
     // A state-only change leaves identity and location untouched, but the entry still has to be
@@ -2000,8 +2000,8 @@ FPEPItemResult UPEPInventoryComponent::MutateItem(
     EmitStateChanged(ItemId, Entry->Location);
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 // ---- Extract / delete -----------------------------------------------------------------------
@@ -2040,8 +2040,8 @@ FPEPItemResult UPEPInventoryComponent::CanExtractItem(
     }
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::ExtractItem(
@@ -2075,8 +2075,8 @@ FPEPItemResult UPEPInventoryComponent::ExtractItem(
     EmitRemoved(OutEntry.Item, OutEntry.Location);
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::CanExtractItemTree(
@@ -2126,8 +2126,8 @@ FPEPItemResult UPEPInventoryComponent::ExtractItemTree(
     }
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::RemoveItemTree(
@@ -2191,8 +2191,8 @@ FPEPItemResult UPEPInventoryComponent::DestroyItem(
     EmitRemoved(DiscardedEntry.Item, DiscardedEntry.Location);
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 // ---- Stacks ---------------------------------------------------------------------------------
@@ -2247,7 +2247,7 @@ FPEPItemResult UPEPInventoryComponent::BuildSplitStackPlan(
 		bInternalContainerMove);
 
 	return Placement.bSuccess
-		? FPEPItemResult::Success(SourceItemId, PEPCoreTags::Reason_None)
+		? FPEPItemResult::Success(PEPCoreTags::Reason_None, SourceItemId)
 		: FPEPItemResult::Failure(Placement.ReasonTag, SourceItemId);
 }
 
@@ -2332,7 +2332,7 @@ FPEPItemResult UPEPInventoryComponent::SplitStack(
 
 	EmitStateChanged(SourceItemId, SourceLocation);
 	EmitAdded(SplitItemId, Destination);
-	return FPEPItemResult::Success(SplitItemId, PEPCoreTags::Reason_None);
+	return FPEPItemResult::Success(PEPCoreTags::Reason_None, SplitItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::BuildMergeStacksPlan(
@@ -2485,7 +2485,7 @@ FPEPItemResult UPEPInventoryComponent::MergeStacks(
 		EmitStateChanged(SourceItemId, SourceLocation);
 	}
 	EmitStateChanged(TargetItemId, TargetLocation);
-	return FPEPItemResult::Success(TargetItemId, PEPCoreTags::Reason_None);
+	return FPEPItemResult::Success(PEPCoreTags::Reason_None, TargetItemId);
 }
 
 // ---- Swap -----------------------------------------------------------------------------------
@@ -2630,7 +2630,7 @@ FPEPItemResult UPEPInventoryComponent::SwapItems(
 
 	EmitMoved(FirstItemId, FirstLocation, SecondLocation, nullptr, &FirstRoot);
 	EmitMoved(SecondItemId, SecondLocation, FirstLocation, nullptr, &SecondRoot);
-	return FPEPItemResult::Success(FirstItemId, PEPCoreTags::Reason_None);
+	return FPEPItemResult::Success(PEPCoreTags::Reason_None, FirstItemId);
 }
 
 // ---- Blueprint reads ------------------------------------------------------------------------
@@ -2699,7 +2699,7 @@ void UPEPInventoryComponent::GetEntriesInContainerSlot(
                 return CellOrder < 0;
             }
 
-            return First.Item.ItemId.Value < Second.Item.ItemId.Value;
+            return First.Item.ItemId.GetValue() < Second.Item.ItemId.GetValue();
         });
 
     OutEntries.Reserve(Ordered.Num());
@@ -2926,8 +2926,8 @@ FPEPItemResult UPEPInventoryComponent::CommitValidatedTransfer(
     }
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 // ---- Placement ------------------------------------------------------------------------------
@@ -3062,8 +3062,8 @@ UPEPInventoryComponent::ValidateLocationForItem(
 			}
 
 			return FPEPItemResult::Success(
-				Item.ItemId,
-				PEPCoreTags::Reason_None);
+				PEPCoreTags::Reason_None,
+				Item.ItemId);
 		}
 
 		FPEPItemInventoryShapeData ShapeData;
@@ -3118,7 +3118,7 @@ UPEPInventoryComponent::ValidateLocationForItem(
 				ItemSize,
 				Item.ItemId,
 				AlsoIgnoredItemId)
-				? FPEPItemResult::Success(Item.ItemId, PEPCoreTags::Reason_None)
+				? FPEPItemResult::Success(PEPCoreTags::Reason_None, Item.ItemId)
 				: FPEPItemResult::Failure(PEPCoreTags::Reason_NoFreeSlot, Item.ItemId);
 		}
 
@@ -3175,8 +3175,8 @@ UPEPInventoryComponent::ValidateLocationForItem(
 		}
 
 		return FPEPItemResult::Success(
-			Item.ItemId,
-			PEPCoreTags::Reason_None);
+			PEPCoreTags::Reason_None,
+			Item.ItemId);
 	}
 
 	case EPEPItemLocationType::NamedSlot:
@@ -3276,7 +3276,7 @@ void UPEPInventoryComponent::AppendOrderedNamedSlotItems(
 					Second.Location.LocationTag.GetTagName());
 			}
 
-			return First.Item.ItemId.Value < Second.Item.ItemId.Value;
+			return First.Item.ItemId.GetValue() < Second.Item.ItemId.GetValue();
 		});
 
 	OutItemIds.Reserve(OutItemIds.Num() + NamedSlotEntries.Num());
@@ -3314,7 +3314,7 @@ void UPEPInventoryComponent::AppendOrderedChildItems(
 				return CellOrder < 0;
 			}
 
-			return First.Item.ItemId.Value < Second.Item.ItemId.Value;
+			return First.Item.ItemId.GetValue() < Second.Item.ItemId.GetValue();
 		});
 
 	OutItemIds.Reserve(OutItemIds.Num() + Children.Num());
@@ -3673,7 +3673,7 @@ void UPEPInventoryComponent::PlanPickupStackMerges(
 	Candidates.Sort(
 		[](const FPEPInventoryEntry& First, const FPEPInventoryEntry& Second)
 		{
-			return First.Item.ItemId.Value < Second.Item.ItemId.Value;
+			return First.Item.ItemId.GetValue() < Second.Item.ItemId.GetValue();
 		});
 
 	for (const FPEPInventoryEntry* Entry : Candidates)
@@ -3757,8 +3757,8 @@ FPEPItemResult UPEPInventoryComponent::PlanPickupItem(
 	{
 		bOutAddRemainder = true;
 		return FPEPItemResult::Success(
-			Item.ItemId,
-			PEPCoreTags::Reason_None);
+			PEPCoreTags::Reason_None,
+			Item.ItemId);
 	}
 
 	/*
@@ -3771,8 +3771,8 @@ FPEPItemResult UPEPInventoryComponent::PlanPickupItem(
 	if (OutRemainder.IsDepleted())
 	{
 		return FPEPItemResult::Success(
-			Item.ItemId,
-			PEPCoreTags::Reason_None);
+			PEPCoreTags::Reason_None,
+			Item.ItemId);
 	}
 
 	if (!TryResolveAutoPlacement(
@@ -3788,8 +3788,8 @@ FPEPItemResult UPEPInventoryComponent::PlanPickupItem(
 
 	bOutAddRemainder = true;
 	return FPEPItemResult::Success(
-		Item.ItemId,
-		PEPCoreTags::Reason_None);
+		PEPCoreTags::Reason_None,
+		Item.ItemId);
 }
 
 FPEPItemResult
@@ -3919,7 +3919,7 @@ UPEPInventoryComponent::AddPickupItem(
 		EmitAdded(PickedUpItemId, Destination);
 	}
 
-	return FPEPItemResult::Success(PickedUpItemId, PEPCoreTags::Reason_None);
+	return FPEPItemResult::Success(PEPCoreTags::Reason_None, PickedUpItemId);
 }
 
 FPEPItemResult
@@ -3963,8 +3963,8 @@ UPEPInventoryComponent::AddPickupItemTree(
     EmitAddedEntries(AddedEntries);
 
     return FPEPItemResult::Success(
-        RootItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        RootItemId);
 }
 
 void UPEPInventoryComponent::CommitAddItemTree(
@@ -3989,7 +3989,7 @@ void UPEPInventoryComponent::CommitAddItemTree(
             LogPEPItems,
             Error,
             TEXT("CommitAddItemTree: root %d could not be stored; its %d descendant(s) were dropped with it."),
-            RootItemId.Value,
+            RootItemId.GetValue(),
             ItemTree.Num() - 1);
         return;
     }
@@ -4278,7 +4278,7 @@ FPEPItemResult UPEPInventoryComponent::DropItemTree(
 
     OutSpawnedActor = Carrier;
 
-    return FPEPItemResult::Success(ItemId, PEPCoreTags::Reason_None);
+    return FPEPItemResult::Success(PEPCoreTags::Reason_None, ItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::DropItemTreeForOwner(
@@ -4364,8 +4364,8 @@ FPEPItemResult UPEPInventoryComponent::CanAddItemTrees(
 
         return Validation.bSuccess
             ? FPEPItemResult::Success(
-                PEPInventoryComponentPrivate::SingleTreeItemId(Placements),
-                PEPCoreTags::Reason_None)
+                PEPCoreTags::Reason_None,
+                PEPInventoryComponentPrivate::SingleTreeItemId(Placements))
             : Validation;
     }
 
@@ -4395,8 +4395,8 @@ FPEPItemResult UPEPInventoryComponent::CanAddItemTrees(
     }
 
     return FPEPItemResult::Success(
-        PEPInventoryComponentPrivate::SingleTreeItemId(Placements),
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        PEPInventoryComponentPrivate::SingleTreeItemId(Placements));
 }
 
 FPEPItemResult UPEPInventoryComponent::AddItemTrees(
@@ -4722,8 +4722,8 @@ FPEPItemResult UPEPInventoryComponent::ValidateIncomingItem(
     }
 
     return FPEPItemResult::Success(
-        ItemId,
-        PEPCoreTags::Reason_None);
+        PEPCoreTags::Reason_None,
+        ItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
@@ -4969,7 +4969,7 @@ bool UPEPInventoryComponent::CommitAddItem(
             && Location.IsStructurallyValid()
             && !ContainsItem(ItemId),
         TEXT("CommitAddItem: item %d reached the store without the validation its caller owed it; refused."),
-        ItemId.Value))
+        ItemId.GetValue()))
     {
         return false;
     }
@@ -4992,7 +4992,7 @@ bool UPEPInventoryComponent::CommitMoveItem(
     if (!ensureMsgf(
         Entry && Destination.IsStructurallyValid(),
         TEXT("CommitMoveItem: item %d cannot be moved there; refused."),
-        ItemId.Value))
+        ItemId.GetValue()))
     {
         return false;
     }
@@ -5015,7 +5015,7 @@ bool UPEPInventoryComponent::CommitExtractItem(
     if (!ensureMsgf(
         InventoryView.Entries.IsValidIndex(Index),
         TEXT("CommitExtractItem: item %d is not in the store; nothing removed."),
-        ItemId.Value))
+        ItemId.GetValue()))
     {
         return false;
     }

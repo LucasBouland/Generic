@@ -754,8 +754,7 @@ bool FPEPEquipmentTemporaryPresentationGuardTest::RunTest(const FString& Paramet
 	AccessTags->AddTag(PEPEquipmentTest::Access_Reach);
 	TestFalse(TEXT("an item out of reach for every configured access is refused"),
 		Show(Pocketed[0], TEXT("K6")));
-	FPEPItemId Foreign;
-	Foreign.Value = 987654;
+	const FPEPItemId Foreign = FPEPItemId::FromRawValue(987654);
 	TestFalse(TEXT("an item outside the store is refused"), Show(Foreign, TEXT("K6")));
 	TestFalse(TEXT("a key is required"),
 		Fixture.Equipment->RequestShowTemporaryItemPresentation(Pocketed[1], NAME_None, Socket));

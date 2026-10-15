@@ -19,7 +19,7 @@ namespace PEPItemContainerMutation
 			}
 
 			State->bLocked = bLocked;
-			return FPEPItemResult::Success(ContainerItem.ItemId, PEPCoreTags::Reason_None);
+			return FPEPItemResult::Success(PEPCoreTags::Reason_None, ContainerItem.ItemId);
 		}
 	}
 

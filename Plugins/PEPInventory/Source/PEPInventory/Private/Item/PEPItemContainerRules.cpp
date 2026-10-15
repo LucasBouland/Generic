@@ -50,7 +50,7 @@ namespace PEPItemContainerRules
 			}
 		}
 
-		return FPEPItemResult::Success(ContainerItem.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, ContainerItem.ItemId);
 	}
 
 	bool DoesSlotRevealOccupants(
@@ -135,7 +135,7 @@ namespace PEPItemContainerRules
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, ContainerItem.ItemId);
 		}
 
-		return FPEPItemResult::Success(ContainerItem.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, ContainerItem.ItemId);
 	}
 
 	TConstArrayView<FPEPContainerSlotDefinition> FindContainerSlots(

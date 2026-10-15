@@ -219,15 +219,15 @@ bool FPEPItemSaveGameArchiveObservedIdTest::RunTest(const FString& Parameters)
 {
 	UPEPItemDefinition* Definition = PEPItemSaveGameArchiveTests::MakeStackDefinition();
 	FPEPItemInstance Item = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
-	TestTrue(TEXT("the allocator produced an id"), Item.ItemId.IsValid() && Item.ItemId.Value >= 0);
+	TestTrue(TEXT("the allocator produced an id"), Item.ItemId.IsValid() && Item.ItemId.GetValue() >= 0);
 
 	// A save from a later session holds ids this process has not reached yet.
-	Item.ItemId.Value += 100;
+	Item.ItemId = FPEPItemId::FromRawValue(Item.ItemId.GetValue() + 100);
 	const FPEPItemInstance Loaded = PEPItemSaveGameArchiveTests::RoundTrip(Item);
 	TestTrue(TEXT("the loaded id survives"), Loaded.ItemId == Item.ItemId);
 
 	const FPEPItemInstance Next = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
-	TestTrue(TEXT("the next allocation lands past every loaded id"), Next.ItemId.Value > Item.ItemId.Value);
+	TestTrue(TEXT("the next allocation lands past every loaded id"), Next.ItemId.GetValue() > Item.ItemId.GetValue());
 
 	// Restoring an older allocator snapshot never pulls the counter back below loaded ids. The
 	// subsystem needs a GameInstance outer; this one has no world, so it counts as the authority.
@@ -236,7 +236,7 @@ bool FPEPItemSaveGameArchiveObservedIdTest::RunTest(const FString& Parameters)
 	FPEPItemIdAllocatorSaveState OldState;
 	OldState.NextId = 0;
 	Allocator->RestoreFromSaveState(OldState);
-	TestTrue(TEXT("restore is monotonic"), Allocator->GetSaveState().NextId > Next.ItemId.Value);
+	TestTrue(TEXT("restore is monotonic"), Allocator->GetSaveState().NextId > Next.ItemId.GetValue());
 
 	PEPItemAutomationTestSupport::UnregisterTransientDefinitionForTests(Definition->GetPrimaryAssetId());
 	return true;

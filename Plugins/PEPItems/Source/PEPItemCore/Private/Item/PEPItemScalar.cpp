@@ -303,8 +303,8 @@ namespace PEPItemScalarPrivate
 		}
 
 		return FPEPItemResult::Success(
-			Item.ItemId,
-			PEPCoreTags::Reason_None);
+			PEPCoreTags::Reason_None,
+			Item.ItemId);
 	}
 
 	template <typename T>
@@ -341,8 +341,8 @@ namespace PEPItemScalarPrivate
 		}
 
 		return FPEPItemResult::Success(
-			Item.ItemId,
-			PEPCoreTags::Reason_None);
+			PEPCoreTags::Reason_None,
+			Item.ItemId);
 	}
 
 	/**
@@ -392,7 +392,7 @@ namespace PEPItemScalarPrivate
 		}
 
 		OutRemaining = Remaining;
-		return FPEPItemResult::Success(Item.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, Item.ItemId);
 	}
 }
 
@@ -514,7 +514,7 @@ namespace PEPItemScalarMutation
 		}
 
 		OutRemaining = Remaining;
-		return FPEPItemResult::Success(Item.ItemId, PEPCoreTags::Reason_None);
+		return FPEPItemResult::Success(PEPCoreTags::Reason_None, Item.ItemId);
 	}
 }
 

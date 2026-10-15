@@ -54,9 +54,7 @@ namespace PEPItemAutomationTestSupport
 
 	FPEPItemId MakeItemIdForTests()
 	{
-		FPEPItemId Id;
-		Id.Value = NextTestItemId--;
-		return Id;
+		return FPEPItemId::FromRawValue(NextTestItemId--);
 	}
 
 	void RegisterTransientDefinitionForTests(const UPEPItemDefinition* Definition)
@@ -112,7 +110,7 @@ FPEPItemInstance FPEPItemInstance::DuplicateWithNewId() const
 		return Duplicate;
 	}
 	Duplicate = *this;
-	Duplicate.ItemId.Value = UPEPIdAllocatorSubsystem::AllocateNext();
+	Duplicate.ItemId = FPEPItemId::FromRawValue(UPEPIdAllocatorSubsystem::AllocateNext());
 	// A record created by this build carries this build's layout: an older source's data is
 	// upgraded with it (migration also normalizes). A newer one is copied as is and stays invalid.
 	if (Duplicate.SchemaVersion >= UnversionedSchemaVersion && Duplicate.SchemaVersion < CurrentSchemaVersion)
@@ -149,7 +147,7 @@ void FPEPItemInstance::InitializeNew(const UPEPItemDefinition* Definition)
 	}
 	// Built by this build, so it is current by construction; only archives carry older layouts.
 	SchemaVersion = CurrentSchemaVersion;
-	ItemId.Value = UPEPIdAllocatorSubsystem::AllocateNext();
+	ItemId = FPEPItemId::FromRawValue(UPEPIdAllocatorSubsystem::AllocateNext());
 	DefinitionId = Definition->GetPrimaryAssetId();
 	Definition->BuildDefaultStateFragments(StateFragments);
 	NormalizeStateFragments();
@@ -570,7 +568,7 @@ void FPEPItemInstance::PostSerialize(const FArchive& Ar)
 	 */
 	if (ItemId.IsValid())
 	{
-		UPEPIdAllocatorSubsystem::ObserveLoadedId(ItemId.Value);
+		UPEPIdAllocatorSubsystem::ObserveLoadedId(ItemId.GetValue());
 	}
 }
 

@@ -22,9 +22,7 @@ namespace PEPEquipmentGMASTest
 {
 	FPEPItemId MakeId(const int32 Value)
 	{
-		FPEPItemId Id;
-		Id.Value = Value;
-		return Id;
+		return FPEPItemId::FromRawValue(Value);
 	}
 
 	FAbilityMapData MakeEntry(const FGameplayTag InputTag, const bool bGrantedByDefault = true)
