@@ -54,7 +54,7 @@ Pour activer cette configuration dans un projet hôte :
 
 Le plugin ne modifie pas automatiquement la classe `WorldSettings` du projet hôte. `WBP_PEPDropTarget` garde la couleur prévue par sa structure par défaut tant que le monde n'utilise pas `APEPUIWorldSettings` ou une classe dérivée.
 
-Les widgets de domaine sont prévus dans leurs modules UI : `PEPItemUI` pour les entrées/infobulles d'items et le payload source, `PEPInventoryUI` pour la grille, les fenêtres de conteneur et leurs cibles, et un futur `PEPEquipmentUI` pour les cibles de slots d'équipement. Le domaine destinataire valide l'opération; CoreUI ne fournit que des briques visuelles sans sémantique métier.
+Les widgets de domaine sont prévus dans leurs modules UI : `PEPItemUI` pour les entrées/infobulles d'items et le payload source, `PEPInventoryUI` pour la grille, les fenêtres de conteneur et leurs cibles, et `PEPEquipmentUI` pour les slots d'équipement (`UPEPEquipmentSlotWidget`). Le domaine destinataire valide l'opération; CoreUI ne fournit que des briques visuelles sans sémantique métier.
 
 ## WBP fournis par les plugins de domaine
 
@@ -67,12 +67,12 @@ Exemples de bons points de départ :
 - **Equipment** : un slot d'équipement lié aux métadonnées de slots, plus éventuellement un panneau d'exemple. Éviter d'imposer un papier-poupée ou un arrangement de slots particulier.
 - **Interaction** : un prompt contextuel écran qui compose le libellé d'action avec le widget d'action CommonUI pour afficher la touche/manette pertinente. Pour un prompt porté par un `WidgetComponent` dans le monde, préférer UMG standard : le routage CommonUI est conçu pour les interfaces écran et Epic déconseille son usage sur les widgets monde.
 
-Ils ont surtout de la valeur s'ils rendent un plugin immédiatement visible et fonctionnel dans un projet vierge. Ils doivent rester optionnels et ne pas obliger le module gameplay à dépendre de UMG/CommonUI. Aucun WBP métier Item/Inventory/Equipment/Interaction n'existe actuellement dans le dépôt; le code de `PEPItemUI`, `PEPInventoryUI` et `PEPPlayerUI` existe, mais pas leurs assets WBP.
+Ils ont surtout de la valeur s'ils rendent un plugin immédiatement visible et fonctionnel dans un projet vierge. Ils doivent rester optionnels et ne pas obliger le module gameplay à dépendre de UMG/CommonUI. Aucun WBP métier Item/Inventory/Equipment/Interaction n'existe actuellement dans le dépôt; le code de `PEPItemUI`, `PEPInventoryUI`, `PEPEquipmentUI` et `PEPPlayerUI` existe, mais pas leurs assets WBP.
 
 ## Fenêtres et drag & drop : frontière de responsabilité
 
 - `PEPItemUI` peut fournir la représentation visuelle de l'item et son payload générique de drag. Il ne décide pas si une destination accepte l'item.
-- Le widget et le module UI de destination possèdent la cible et la règle de drop : grille/conteneur dans `PEPInventoryUI`, slot d'équipement dans un futur `PEPEquipmentUI`.
+- Le widget et le module UI de destination possèdent la cible et la règle de drop : grille/conteneur dans `PEPInventoryUI`, slot d'équipement dans `PEPEquipmentUI` (`UPEPEquipmentSlotWidget::CanAcceptItem`/`AcceptItem`).
 - `PEPCoreUI` peut fournir un feedback visuel de drop (survol, valide, invalide) sans connaître les items, stores, slots ou contextes. Ce composant n'a de valeur que s'il est réellement partagé.
 - La fenêtre d'un conteneur d'inventaire reste dans `PEPInventoryUI`. Un shell flottant générique (barre de titre, déplacement, fermeture, slots de contenu) pourrait aller dans `PEPCoreUI` s'il est réutilisé par plusieurs domaines; il ne doit pas posséder le contexte ou la logique de la fenêtre.
 

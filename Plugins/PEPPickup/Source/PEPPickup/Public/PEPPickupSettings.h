@@ -74,7 +74,8 @@ public:
 
 	/**
 	 * An item's final option list is the union of every row whose ItemTag it owns (hierarchy-aware:
-	 * an item tagged Item.Type.Weapon.Rifle matches a row keyed Item.Type.Weapon). Pickup is never
+	 * an item tagged Item.Type.Weapon.Rifle matches a row keyed Item.Type.Weapon — project tags under
+	 * ItemCore's Item.Type root, which declares no children of its own). Pickup is never
 	 * read from here: the pickup actors offer it exactly when CanPickupDefinition allows it (the
 	 * Pickup category above), and ignore a Pickup entry in this table.
 	 */

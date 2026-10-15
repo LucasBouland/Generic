@@ -2,30 +2,14 @@
 
 #include "NativeGameplayTags.h"
 
+/**
+ * ItemCore's native vocabulary is a single convention root. What kinds of items exist — weapons,
+ * ammunition, keys, currencies — is game vocabulary: each project declares its own children of
+ * Item.Type (Item.Type.Weapon.Rifle, ...) in its own module or tag tables. Editor tooling such as
+ * the PEP item browser groups definitions by the path after "Item.Type.".
+ */
 namespace PEPItemTags
 {
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Weapon);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Ammo);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Magazine);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Medical);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Consumable);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Armor);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Backpack);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Container);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Key);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Quest);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Currency);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type_Misc);
-	// Objet monde non ramassable (décor, conteneur fixe, ...).
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Static);
-	// Objet ouvrable (expose une interaction "Open").
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Container);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Slot_Content_Main);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Slot_Content_QuickAccess);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Slot_Content_Secure);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(GameplayAccess_Equip);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(GameplayAccess_Reload);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(GameplayAccess_Use);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(UseContext_Menu);
-	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(UseContext_World);
+	/** Root of item kinds. Projects extend it; ItemCore defines no children. */
+	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Item_Type);
 }

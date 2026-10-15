@@ -139,15 +139,23 @@ struct PEPEQUIPMENT_API FPEPEquipmentSlotDefinition
 	bool bAllowAutoEquipOnPickup = true;
 
 	/**
-	 * Whether the slot's occupant (and its visible attachments) enters the public projection.
+	 * Whether the slot's occupant (and its visible attachments) enters the public projection, the
+	 * replicated view every machine sees: local visuals and OnItemEquipped / OnItemUnequipped.
 	 *
-	 * Everything downstream of equipment follows that projection: local visuals, OnItemEquipped /
-	 * OnItemUnequipped, and therefore anything built on those events such as the PEPEquipmentGMAS
-	 * ability bridge. A slot with this off still accepts and holds items, but an item there is
-	 * invisible to all of it: no visual, no event, no ability or effect granted.
+	 * Off, the slot still accepts and holds items and is still equipment: the owner view kept on
+	 * the authority and the owning client (GetOwnerEquipmentNodes, OnOwnerItemEquipped /
+	 * OnOwnerItemUnequipped) includes it, and so the PEPEquipmentGMAS ability bridge grants from
+	 * it. Other players simply never learn it is there: no visual, no public event.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
 	bool bShowPublicly = true;
+
+	/**
+	 * Label an equipment UI shows for this slot. Empty: PEPEquipmentUI derives one from the last
+	 * part of SlotTag. Presentation only; never replicated.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	FText DisplayName;
 
 	bool IsValid() const
 	{

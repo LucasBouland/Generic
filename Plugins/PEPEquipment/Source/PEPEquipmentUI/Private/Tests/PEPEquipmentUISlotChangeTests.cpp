@@ -1,8 +1,15 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Misc/AutomationTest.h"
+#include "NativeGameplayTags.h"
 #include "PEPEquipmentUILibrary.h"
-#include "Item/PEPItemTags.h"
+
+/* Test-only slot vocabulary: the filter compares tags and gives them no meaning. */
+namespace PEPEquipmentUISlotChangeTestTags
+{
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(Slot_A, "Test.Equipment.UI.SlotChange.A");
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(Slot_B, "Test.Equipment.UI.SlotChange.B");
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPEPEquipmentUISlotChangeTest,
 	"PEP.Equipment.UI.SlotChangeFilter",
@@ -10,8 +17,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPEPEquipmentUISlotChangeTest,
 
 bool FPEPEquipmentUISlotChangeTest::RunTest(const FString&)
 {
-	const FGameplayTag Slot = PEPItemTags::Item_Slot_Content_Main;
-	const FGameplayTag OtherSlot = PEPItemTags::Item_Slot_Content_QuickAccess;
+	const FGameplayTag Slot = PEPEquipmentUISlotChangeTestTags::Slot_A;
+	const FGameplayTag OtherSlot = PEPEquipmentUISlotChangeTestTags::Slot_B;
 	const EPEPItemStoreChangeType Types[] = { EPEPItemStoreChangeType::Added,
 		EPEPItemStoreChangeType::Removed, EPEPItemStoreChangeType::Moved,
 		EPEPItemStoreChangeType::StateChanged };

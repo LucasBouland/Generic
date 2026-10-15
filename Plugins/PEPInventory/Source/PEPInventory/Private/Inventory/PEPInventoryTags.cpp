@@ -16,5 +16,10 @@ namespace PEPInventoryTags
 
 	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Inventory_Location_WorldItem, "Inventory.Location.WorldItem", "Root slot of the item a world container actor carries.");
 
+	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Inventory_Slot_Main, "Inventory.Slot.Main", "Generic root slot for a store's main storage.");
+
+	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Inventory_GameplayAccess_Equip, "Inventory.GameplayAccess.Equip", "A container lets what it holds be equipped.");
+	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Inventory_GameplayAccess_Use, "Inventory.GameplayAccess.Use", "A container lets what it holds be used.");
+
 	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Inventory_State_TransferSession_Active, "Inventory.State.TransferSession.Active", "A transfer session is currently active.");
 }

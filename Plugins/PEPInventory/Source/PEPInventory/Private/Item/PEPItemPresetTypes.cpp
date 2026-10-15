@@ -1,6 +1,7 @@
 #include "Item/PEPItemPresetTypes.h"
 
 #include "Item/PEPItemContainerRules.h"
+#include "Inventory/PEPInventoryGrid.h"
 #include "Inventory/PEPInventorySettings.h"
 #include "Item/Fragments/PEPItemFragment_Container.h"
 #include "Item/Fragments/PEPItemFragment_InventoryShape.h"
@@ -28,7 +29,8 @@ bool FPEPItemInstanceTree::IsStructurallyValid() const
 			|| Entry.Item.ItemId == RootItem.ItemId
 			|| IndexById.Contains(Entry.Item.ItemId)
 			|| !Entry.Location.IsStructurallyValid()
-			|| Entry.Location.Type != EPEPItemLocationType::ItemContainer)
+			|| Entry.Location.Type != EPEPItemLocationType::ItemContainer
+			|| !PEPInventoryGrid::IsPlacementWellFormed(Entry.Location))
 		{
 			return false;
 		}
@@ -255,10 +257,10 @@ bool FPEPItemInstanceTree::ValidateDetailed(FPEPItemInstanceTreeValidationResult
 			FSlotKey(Entry.Location.ParentItemId, Entry.Location.ContainerSlotName));
 		if (Slot->Mode == EPEPContainerSlotMode::Single)
 		{
-			if (Entry.Location.GridPosition != FIntPoint::ZeroValue || Entry.Location.bRotated)
+			if (Entry.Location.Placement.IsValid())
 			{
 				AddItemError(Entry.Item, FText::FromString(
-					TEXT("Single slots require position (0, 0) and no rotation.")));
+					TEXT("Single slots take no placement: no grid position and no rotation.")));
 			}
 			if (!SlotPlacements.IsEmpty())
 			{
@@ -270,15 +272,21 @@ bool FPEPItemInstanceTree::ValidateDetailed(FPEPItemInstanceTreeValidationResult
 			continue;
 		}
 
-		if (Entry.Location.bRotated && (!Slot->bAllowRotation || !bItemCanRotate))
+		/*
+		 * IsStructurallyValid refused any other kind of placement and a negative cell, so this is a
+		 * grid placement, or none: the origin, unrotated.
+		 */
+		const FPEPGridPlacement Cell = PEPInventoryGrid::GetGridPlacement(Entry.Location);
+
+		if (Cell.bRotated && (!Slot->bAllowRotation || !bItemCanRotate))
 		{
 			AddItemError(Entry.Item, FText::FromString(
 				TEXT("The item's definition or container slot does not allow rotation.")));
 		}
-		const FIntPoint OrientedSize = Entry.Location.bRotated
+		const FIntPoint OrientedSize = Cell.bRotated
 			? FIntPoint(ItemSize.Y, ItemSize.X)
 			: ItemSize;
-		const FIntPoint Position = Entry.Location.GridPosition;
+		const FIntPoint Position = Cell.Position;
 
 		/* Subtracted rather than added: an authored position near INT32_MAX must not wrap inside. */
 		if (Position.X < 0 || Position.Y < 0

@@ -14,13 +14,12 @@ class UGMCAbilityEffect;
  * UPEPEquipmentAbilityBridgeComponent, which must sit on the same pawn as the equipment and the
  * GMC ability system components.
  *
- * Granting follows the PUBLIC equipment projection: the item counts while it is a node of it and
- * only then. Two consequences designers must know:
- *  - a container's private content never grants anything;
- *  - an item in a slot whose profile entry has bShowPublicly off grants nothing either, even though
- *    it is equipped: that slot never enters the projection, so it raises no OnItemEquipped. The
- *    equipment profile's data validation warns about every such slot.
- * Use ActiveInSlots to narrow where an item grants, never a hidden slot.
+ * Granting follows the equipment's OWNER view: the item counts while it occupies one of the
+ * profile's slots, or hangs from such an item as a visible attachment, and only then.
+ *  - Whether the slot is shown publicly (bShowPublicly) makes no difference: a hidden slot grants
+ *    like any other, it only keeps its visual and public events from other players.
+ *  - A container's private content never grants anything.
+ * Use ActiveInSlots to narrow where an item grants.
  */
 USTRUCT(BlueprintType, meta=(DisplayName="Equipment Abilities (GMAS)"))
 struct PEPEQUIPMENTGMAS_API FPEPItemFragment_EquipmentAbilities : public FPEPItemFragment
@@ -49,8 +48,8 @@ struct PEPEQUIPMENTGMAS_API FPEPItemFragment_EquipmentAbilities : public FPEPIte
 
 	/**
 	 * Equipment slots in which the item grants anything, matched against the slot of the root it
-	 * hangs under. Empty means any public slot: set it to Hand slots for a weapon whose abilities
-	 * should not follow it onto the back. A slot with bShowPublicly off never grants, listed or not.
+	 * hangs under. Empty means any slot, shown publicly or not: set it to Hand slots for a weapon
+	 * whose abilities should not follow it onto the back.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Equipment|Abilities",
 		meta=(Categories="Equipment.Slot"))

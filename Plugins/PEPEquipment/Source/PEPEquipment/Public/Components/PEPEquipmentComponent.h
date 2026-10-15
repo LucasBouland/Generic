@@ -16,6 +16,7 @@
 
 class APEPEquippedPresentationActor;
 class AController;
+class APawn;
 struct FStreamableHandle;
 class UPEPEquipmentProfile;
 class USceneComponent;
@@ -27,6 +28,7 @@ struct FPEPItemStoreChange;
 class IPEPItemStore;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnPEPPublicEquipmentChanged);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnPEPOwnerEquipmentChanged);
 DECLARE_MULTICAST_DELEGATE(FOnPEPLocalEquipmentPresentationChanged);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
 	FOnPEPEquipmentRequestResolved,
@@ -41,10 +43,15 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
  * Bridges an authoritative item store to a small public equipment projection. Presentation actors
  * are local cosmetics reconstructed from that projection; private item state never crosses.
  *
- * Store changes are folded into one projection rebuild per frame: the authority marks the
- * projection dirty on each relevant store event and rebuilds it once, at the next engine tick.
- * Equip and unequip requests executed by this component rebuild it before returning instead.
- * FlushDeferredUpdates runs any pending rebuild at once.
+ * Beside it, the authority and the owning client keep an owner view: every item under every slot
+ * of the profile, hidden slots included, computed locally from the full item store those two
+ * machines hold. It is never replicated; a simulated proxy keeps only the public projection.
+ *
+ * Store changes are folded into one rebuild per frame: the authority marks both views dirty on
+ * each relevant store event and rebuilds them once, at the next engine tick; the owning client
+ * does the same for its owner view from its own store copy. Equip and unequip requests executed
+ * by this component rebuild before returning instead. FlushDeferredUpdates runs any pending
+ * rebuild at once.
  */
 UCLASS(ClassGroup=(PEP), BlueprintType, meta=(BlueprintSpawnableComponent))
 class PEPEQUIPMENT_API UPEPEquipmentComponent : public UActorComponent
@@ -153,6 +160,49 @@ public:
 	UFUNCTION(BlueprintPure, Category="PEP|Equipment")
 	EPEPEquipmentHand GetSlotHand(FGameplayTag SlotTag) const;
 
+	/** The slots of the effective profile (or of the fallback definitions), in profile order. */
+	UFUNCTION(BlueprintPure, Category="PEP|Equipment|Slots")
+	TArray<FGameplayTag> GetEquipmentSlotTags() const;
+
+	/** SlotTag's entry in the effective profile. False, with OutSlot reset, for an unknown slot. */
+	UFUNCTION(BlueprintPure, Category="PEP|Equipment|Slots")
+	bool FindEquipmentSlotDefinition(
+		FGameplayTag SlotTag,
+		FPEPEquipmentSlotDefinition& OutSlot) const;
+
+	/**
+	 * Whether this machine keeps the owner view: the authority, and the owning client (autonomous
+	 * proxy, or a pawn whose net owner is local). A simulated proxy does not, and reads only the
+	 * public projection.
+	 */
+	UFUNCTION(BlueprintPure, Category="PEP|Equipment|Owner")
+	bool HasOwnerEquipmentView() const;
+
+	/**
+	 * Every equipped node this machine's owner view holds: the occupant of each profile slot,
+	 * hidden slots included, then its visible attachments (by the store's GetPublicChildren, as for
+	 * the projection). Roots in profile order, each followed by its attachments. Local and never
+	 * replicated; empty where HasOwnerEquipmentView is false.
+	 */
+	UFUNCTION(BlueprintPure, Category="PEP|Equipment|Owner")
+	TArray<FPEPEquippedItemInfo> GetOwnerEquipmentNodes() const;
+
+	/** Any node of the owner view, root or attachment, hidden slot or not. */
+	UFUNCTION(BlueprintPure, Category="PEP|Equipment|Owner")
+	bool FindOwnerEquipmentNode(
+		FPEPItemId ItemId,
+		FPEPEquippedItemInfo& OutNode) const;
+
+	/**
+	 * The root occupying SlotTag, read from the most complete view this machine has: the owner view
+	 * where it is kept (so a hidden slot answers for its owner), the public projection elsewhere.
+	 * What an equipment UI shows.
+	 */
+	UFUNCTION(BlueprintPure, Category="PEP|Equipment")
+	bool FindEquippedRootInSlot(
+		FGameplayTag SlotTag,
+		FPEPEquippedItemInfo& OutNode) const;
+
 	/**
 	 * Asks for an item to be equipped in SlotTag.
 	 *
@@ -170,6 +220,17 @@ public:
 	/** Local validation only. It never mutates or predicts replicated equipment state. */
 	UFUNCTION(BlueprintCallable, Category="PEP|Equipment|Preview")
 	FPEPItemResult PreviewEquipItem(FPEPItemId ItemId, FGameplayTag SlotTag) const;
+
+	/**
+	 * Forgets the cached list of eligibility providers; the next eligibility check gathers it again.
+	 *
+	 * The cache follows the owner by itself: it is rebuilt when the owner changes, when the owner's
+	 * component count changes, or when a cached provider is gone. Call this after a change those
+	 * checks cannot see — one component swapped for another in the same frame, leaving the count
+	 * as it was and no cached provider destroyed.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Equipment|Eligibility")
+	void InvalidateEligibilityProviders();
 
 	/**
 	 * Asks for an item occupying one of this component's slots to be moved to TargetLocation.
@@ -199,10 +260,11 @@ public:
 	FPEPItemResult PreviewUnequipItem(FPEPItemId ItemId, FPEPItemLocation TargetLocation) const;
 
 	/**
-	 * Runs now what this component otherwise defers to the next engine tick: a projection rebuild
-	 * pending from store changes (authority), a presentation reconcile waiting on loaded assets,
-	 * and request resolutions raised on the authority. For server code that must read the
-	 * projection in the frame it wrote the store, and for tests. Safe to call at any time.
+	 * Runs now what this component otherwise defers to the next engine tick: a projection and owner
+	 * view rebuild pending from store changes (authority), an owner view rebuild (owning client), a
+	 * presentation reconcile waiting on loaded assets, and request resolutions raised on the
+	 * authority. For server code that must read the projection in the frame it wrote the store,
+	 * and for tests. Safe to call at any time.
 	 */
 	void FlushDeferredUpdates();
 
@@ -218,7 +280,8 @@ public:
 	 * Raised as the projection changes, which may be before a listener's BeginPlay on a freshly
 	 * replicated pawn: read GetPublicPresentationNodes() when binding to catch up.
 	 *
-	 * Only public slots take part: an item in a slot with bShowPublicly off raises nothing.
+	 * Only public slots take part: an item in a slot with bShowPublicly off raises nothing here.
+	 * Its owner sees it through OnOwnerItemEquipped.
 	 */
 	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Event")
 	FOnPEPEquipmentItemChanged OnItemEquipped;
@@ -226,6 +289,28 @@ public:
 	/** A public node left the projection, or changed slot or parent. See OnItemEquipped. */
 	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Event")
 	FOnPEPEquipmentItemChanged OnItemUnequipped;
+
+	/**
+	 * A node entered the owner view: any slot of the profile, hidden ones included, plus visible
+	 * attachments. Raised only where the owner view is kept — the authority and the owning client —
+	 * with the same payload and the same deterministic order as OnItemEquipped (every Unequipped
+	 * first, roots before attachments, ties by ItemId). Use it for what the wearer has rather than
+	 * what others see: abilities, effects, the owner's own equipment screen.
+	 *
+	 * The authority rebuilds both views in one pass and raises the public events first, then these.
+	 * The owning client rebuilds from its own store copy, at the next tick after that copy changed.
+	 * Read GetOwnerEquipmentNodes() when binding to catch up.
+	 */
+	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Owner")
+	FOnPEPEquipmentItemChanged OnOwnerItemEquipped;
+
+	/** A node left the owner view, or changed slot or parent. See OnOwnerItemEquipped. */
+	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Owner")
+	FOnPEPEquipmentItemChanged OnOwnerItemUnequipped;
+
+	/** The owner view changed; raised after OnOwnerItemUnequipped / OnOwnerItemEquipped. */
+	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Owner")
+	FOnPEPOwnerEquipmentChanged OnOwnerEquipmentChanged;
 
 	/**
 	 * Resolves a request on the machine that made it. A request issued on the authority resolves
@@ -318,13 +403,32 @@ protected:
 
 	/**
 	 * A temporary presentation may show an item only if the store grants it at least one of these
-	 * gameplay accesses (IPEPItemStore::HasGrantedGameplayAccess): what the wearer could reach for
-	 * equip, reload or use may be flashed in hand, what sits deep in a backpack may not. Empty means
-	 * any item of the store qualifies.
+	 * gameplay accesses (IPEPItemStore::HasGrantedGameplayAccess), so that what sits deep in a
+	 * backpack is not flashed in hand.
+	 *
+	 * Empty by default: any item of the owner's store qualifies, still subject to the key cap and
+	 * the socket check. Equipment defines no access vocabulary of its own; the picker only offers
+	 * the Inventory.GameplayAccess branch PEPInventory declares (Inventory.GameplayAccess.Equip,
+	 * .Use, and a project's own children). A store with another vocabulary takes any tag it
+	 * answers to.
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Presentation|Temporary",
 		meta=(Categories="Inventory.GameplayAccess"))
 	FGameplayTagContainer TemporaryPresentationAccessTags;
+
+	/**
+	 * RequestEquipItem and PreviewEquipItem accept an item only if the store grants it at least one
+	 * of these gameplay accesses (IPEPItemStore::HasGrantedGameplayAccess) — an item buried in a
+	 * container that grants no Equip access cannot be equipped from there.
+	 *
+	 * Empty by default: no access requirement; the slot's eligibility and the store's own move and
+	 * swap rules still apply. A PEPInventory project typically sets Inventory.GameplayAccess.Equip
+	 * here. Like the temporary presentation tags, only a filter string ties this to
+	 * Inventory.GameplayAccess.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Slots",
+		meta=(Categories="Inventory.GameplayAccess"))
+	FGameplayTagContainer EquipAccessTags;
 
 	UPROPERTY(
 		VisibleInstanceOnly,
@@ -355,6 +459,16 @@ private:
 	void HandlePublicEquipmentReplicated();
 	void HandleTemporaryPresentationsReplicated();
 
+	/**
+	 * Possession can turn a simulated proxy into the owning client's pawn, or back: the owner view
+	 * is rebuilt (or emptied) at the next tick, once the new role has landed.
+	 */
+	UFUNCTION()
+	void HandleOwnerControllerChanged(
+		APawn* Pawn,
+		AController* OldController,
+		AController* NewController);
+
 	void InitializeItemStoreIntegration();
 	void UninitializeItemStoreIntegration();
 	UObject* FindItemStoreObjectOnOwner() const;
@@ -372,8 +486,15 @@ private:
 	/**
 	 * The owner actor first, then its implementing components ordered by name: stable on one
 	 * machine. Components are filtered before any sorting, and one implementer is never sorted.
+	 *
+	 * Served from a per-component cache, rebuilt only when the owner changed, the owner's component
+	 * count moved, a cached provider is gone, or InvalidateEligibilityProviders was called. This
+	 * runs inside every store write into a slot and in every preview.
 	 */
 	void GatherEligibilityProviders(TArray<const UObject*>& OutProviders) const;
+	bool IsEligibilityProviderCacheCurrent(const AActor& Owner) const;
+	/** Whether the store grants ItemId at least one of EquipAccessTags; true when they are empty. */
+	bool HasEquipAccess(const IPEPItemStore& ItemStore, FPEPItemId ItemId) const;
 	FPEPItemResult ExecuteEquipItem(FPEPItemId ItemId, FGameplayTag SlotTag, ERequestOrigin Origin);
 	/** Everything an unequip can be refused for without asking the store to move anything. */
 	FPEPItemResult ValidateUnequipRequest(
@@ -385,23 +506,50 @@ private:
 		ERequestOrigin Origin);
 	const FPEPEquipmentSlotDefinition* FindSlotDefinition(FGameplayTag SlotTag) const;
 
-	/** Rebuilds the projection from the store now. Authority only. True when it changed. */
+	/**
+	 * Rebuilds the projection and the owner view from the store now, in one walk. Authority only.
+	 * True when the public projection changed; the owner view announces its own changes.
+	 */
 	bool RefreshPublicProjection();
-	/** Notes that the projection may be stale and folds the rebuild into the next tick, or batch. */
-	void MarkPublicProjectionDirty();
+	/**
+	 * Rebuilds the owner view alone: the owning client's path, from its store copy. Empties it
+	 * where this machine keeps none. True when it changed.
+	 */
+	bool RefreshOwnerView();
+	/**
+	 * Notes that the views may be stale and folds the rebuild into the next tick, or batch: both on
+	 * the authority, the owner view elsewhere.
+	 */
+	void MarkEquipmentViewsDirty();
 	/** Around this component's own store writes: their events rebuild once, before returning. */
 	void BeginProjectionBatch();
 	void EndProjectionBatch();
+	/** Runs whichever rebuild is pending: both views on the authority, the owner view elsewhere. */
+	void RefreshDirtyEquipmentViews();
 	/**
 	 * Diffs the projection against what this machine last announced and raises OnItemUnequipped
 	 * then OnItemEquipped. The one place both events come from, on authority and clients alike.
 	 */
 	void BroadcastEquipmentItemChanges();
-	void AppendPublicAttachmentEntries(
+	/** Same contract for the owner view: OnOwnerItemUnequipped then OnOwnerItemEquipped. */
+	void BroadcastOwnerItemChanges();
+	/** Replaces the owner view when Nodes differs from it as a set. True when it changed. */
+	bool ApplyOwnerViewNodes(TArray<FPEPEquippedItemInfo>&& Nodes);
+	/**
+	 * Every node under this component's slots: each slot's occupant in profile order, followed by
+	 * its visible attachments depth first. OutOwnerNodes gets all of them; OutPublicNodes, when
+	 * given, only those under a slot shown publicly. Both are appended to, not reset.
+	 */
+	void CollectEquippedNodes(
+		const IPEPItemStore& ItemStore,
+		TArray<FPEPEquippedItemInfo>& OutOwnerNodes,
+		TArray<FPEPEquippedItemInfo>* OutPublicNodes) const;
+	void AppendAttachmentNodes(
 		const IPEPItemStore& ItemStore,
 		FPEPItemId ParentItemId,
-		TMap<FPEPItemId, FPEPEquippedItemPublic>& OutEntries,
+		TArray<FPEPEquippedItemInfo>& OutNodes,
 		TSet<FPEPItemId>& VisitedItemIds) const;
+	const FPEPEquippedItemInfo* FindOwnerViewNode(FPEPItemId ItemId) const;
 	/** Indexed by ItemId; falls back to a scan if the index is stale, so it is never wrong. */
 	const FPEPEquippedItemPublic* FindPublicEntry(FPEPItemId ItemId) const;
 	FPEPEquippedItemPublic* FindMutablePublicEntry(FPEPItemId ItemId);
@@ -584,8 +732,30 @@ private:
 	bool bBroadcastingEquipmentItemChanges = false;
 	bool bEquipmentItemChangesPending = false;
 
-	/** Authority: a store change may have moved the projection since it was last built. */
+	/**
+	 * The owner view: authority and owning client only, never replicated. Roots in profile order,
+	 * each followed by its attachments.
+	 */
+	TArray<FPEPEquippedItemInfo> OwnerViewNodes;
+	/** ItemId -> index in OwnerViewNodes. Rebuilt whenever the array changes. */
+	TMap<FPEPItemId, int32> OwnerViewIndex;
+	/** The owner view as of the last OnOwnerItemEquipped/OnOwnerItemUnequipped this machine raised. */
+	TArray<FPEPEquippedItemInfo> AnnouncedOwnerNodes;
+	bool bBroadcastingOwnerItemChanges = false;
+	bool bOwnerItemChangesPending = false;
+
+	/**
+	 * Authority: a store change may have moved the projection, and so the owner view, since they
+	 * were last built.
+	 */
 	bool bPublicProjectionDirty = false;
+	/** The owner view alone may be stale: the owning client's store copy changed, or its role. */
+	bool bOwnerViewDirty = false;
+
+	/** GatherEligibilityProviders' cache, and what it was built against. */
+	mutable TArray<TWeakObjectPtr<const UObject>> CachedEligibilityProviders;
+	mutable TWeakObjectPtr<const AActor> CachedEligibilityProviderOwner;
+	mutable int32 CachedEligibilityComponentCount = INDEX_NONE;
 	int32 ProjectionBatchDepth = 0;
 	bool bLocalPresentationReconcilePending = false;
 	/** Resolutions of requests issued on this machine, raised at the next tick. */

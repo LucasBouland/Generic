@@ -13,7 +13,7 @@ Le widget utilise actuellement une présentation Slate native, hébergée par un
 ## Vue Item Definitions
 
 - Liste les assets `UPEPItemDefinition` détectés par l’Asset Registry.
-- Le panneau latéral liste les catégories racines dérivées de `Item.Type.*`. Par exemple, `Item.Type.Weapon.Rifle` est affiché dans la liste sous `Item.Type.Weapon`.
+- Le panneau latéral liste les catégories racines dérivées de `Item.Type.*`. Par exemple, `Item.Type.Weapon.Rifle` est affiché dans la liste sous `Item.Type.Weapon`. ItemCore ne déclare que la racine `Item.Type` (`PEPItemTags::Item_Type`) : les catégories elles-mêmes sont les tags que le projet déclare sous cette racine.
 - La table montre le nom affiché, le chemin `Item.Type` complet, le nom d’asset et les fragments.
 - Sélectionner une ligne puis utiliser **Open Details Window** ouvre les propriétés éditables dans une fenêtre Slate séparée. Un double-clic sur une ligne ouvre la même fenêtre.
 - Cette fenêtre suit la sélection dans le navigateur tant qu’elle reste ouverte. Les modifications sont appliquées directement à l’asset via le panneau de détails; utiliser les commandes de sauvegarde habituelles de l’éditeur pour les enregistrer.

@@ -77,18 +77,12 @@ EDataValidationResult UPEPEquipmentProfile::IsDataValid(
 				*Slot.PresentationTargetTag.ToString())));
 			Result = EDataValidationResult::Invalid;
 		}
-		if (!Slot.bShowPublicly)
-		{
-			/*
-			 * Legitimate (a secure pouch nobody should see), but easy to set without realising what
-			 * else hangs off the public projection: equipment events and the GMAS ability bridge.
-			 */
-			Context.AddWarning(FText::FromString(FString::Printf(
-				TEXT("Slot '%s' is not shown publicly: its occupant gets no visual, raises no "
-					"OnItemEquipped/OnItemUnequipped and grants no ability or effect through "
-					"PEPEquipmentGMAS."),
-				*Slot.SlotTag.ToString())));
-		}
+		/*
+		 * A slot with bShowPublicly off is not reported: it is a legitimate choice (a secure pouch
+		 * nobody else should see) and no longer costs anything but its public presence. Its
+		 * occupant still enters the owner view, raises OnOwnerItemEquipped and grants through
+		 * PEPEquipmentGMAS; only the visual and the public events are withheld.
+		 */
 		if (Slot.Hand != EPEPEquipmentHand::None)
 		{
 			if (SeenHands.Contains(Slot.Hand))

@@ -6,18 +6,43 @@ PEPItems fournit le modèle générique des objets du jeu : définitions, instan
 
 | Module | Responsabilité |
 | --- | --- |
-| `PEPItemCore` | `UPEPItemDefinition`, identifiants et instances, fragments génériques (stack, ressource, durabilité, poids, présentation), état, requêtes, règles, mutations et vocabulaire de localisation de store. |
-| `PEPItemUI` | Présentation réutilisable d’un item : données d’affichage, payload de drag générique et `WBP_PEPItemView`. Aucun accès ou placement dans un inventaire. |
+| `PEPItemCore` | `UPEPItemDefinition`, identifiants et instances, fragments génériques (stack, ressource, durabilité, poids, présentation), état, requêtes, règles, mutations, vocabulaire de localisation de store et base de placement opaque (`FPEPItemPlacement`). |
+| `PEPItemUI` | Présentation réutilisable d’un item : données d’affichage et `WBP_PEPItemView`. Aucun accès ou placement dans un inventaire. |
 | `PEPItemCoreEditor` | Personnalisation et validation des définitions d’items génériques. |
-| `PEPInventory` | Arbres d’items, conteneurs et slots, forme de grille, presets avec placement, acteurs d’items dans le monde et réglages d’inventaire. |
+| `PEPInventory` | Arbres d’items, conteneurs et slots, grille (forme, placement `FPEPGridPlacement` et helpers `PEPInventoryGrid`), presets avec placement, acteurs d’items dans le monde, réglages et tags natifs d’inventaire. |
 | `PEPInventoryUI` | Workflow UI d’inventaire : contextes source/destination, prévisualisation et demandes de placement, fenêtres et sessions. |
 | `PEPInventoryEditor` | Personnalisations d’assets d’inventaire et navigateur de définitions actuellement rendu en Slate. Le futur navigateur Blueprint décrit dans `README_PEPInventoryEditor.md` couvrira aussi les acteurs du niveau. |
-| `PEPEquipment` | Fragment `Equippable`, requêtes et contrats de slots d’équipement. Il dépend de ItemCore et Inventory; ces modules ne dépendent pas d’Equipment. |
+| `PEPEquipment` | Fragment `Equippable`, requêtes et contrats de slots d’équipement. Son runtime dépend de ItemCore et atteint l’inventaire par l’interface `IPEPItemStore`; ItemCore et Inventory ne dépendent pas d’Equipment. |
 | `PEPPickup` | Politique par défaut d’éligibilité au pickup et règles de pickup, appliquées par le domaine Pickup. |
 
 Les fichiers de conteneur, de forme d’inventaire, de preset et d’acteur monde ont été déplacés de `PEPItemCore` vers `PEPInventory`. Le fragment `Equippable` et sa requête ont été déplacés vers `PEPEquipment`. Les réglages de pickup ont été déplacés vers `PEPPickup`. Les Core Redirects de `Plugins/PEPItems/Config/DefaultEngine.ini` conservent la résolution des types et propriétés réfléchis déplacés pour les assets existants.
 
 `FPEPItemLocation` reste dans ItemCore comme contrat d’adresse de store. Le noyau conserve les formes génériques `ItemContainer` et `NamedSlot`; les règles qui donnent leur sens aux conteneurs et aux équipements restent dans les plugins de domaine.
+
+ItemCore ne connaît pas la grille. Une location `ItemContainer` porte un champ `Placement` opaque : un `FInstancedStruct` (`SaveGame`, répliqué) dont le type dérive de `FPEPItemPlacement` (`Item/PEPItemPlacement.h`), c’est-à-dire une position définie par le domaine à l’intérieur du slot et interprétée par le store qui possède ce slot. Il est vide quand le slot n’a pas besoin de position.
+
+- `IsStructurallyValid` n’accepte un placement que sur une location `ItemContainer`, et seulement s’il dérive de `FPEPItemPlacement`; une location `NamedSlot` ne porte jamais de placement. Le contenu du placement (cellule négative, type inconnu du slot) est jugé par le store propriétaire.
+- `operator==` compare le placement : même type, puis comparaison du struct lui-même (`operator==` + `WithIdenticalViaEquality` sur le type dérivé). Vide n’est égal qu’à vide. `GetTypeHash` ignore le placement, qu’ItemCore ne sait pas hacher : deux locations égales ont toujours le même hash, deux locations qui ne diffèrent que par leur placement partagent seulement un bucket.
+- `MakeItemContainer(ParentItemId, SlotName)` construit une location sans placement; la surcharge `MakeItemContainer(ParentItemId, SlotName, Placement)` prend un `FInstancedStruct`. L’ancienne signature à position/rotation et les champs `GridPosition`/`bRotated` ont disparu d’ItemCore.
+
+## Grille d’inventaire
+
+La grille appartient à `PEPInventory` (`Inventory/PEPInventoryGrid.h`). `FPEPGridPlacement : FPEPItemPlacement` porte `Position` (cellule du coin supérieur gauche) et `bRotated` (largeur et hauteur échangées), tous deux `SaveGame`.
+
+- Écriture canonique : l’origine non tournée s’écrit *sans* placement. `PEPInventoryGrid::MakeGridLocation(Parent, SlotName, Position, bRotated)` et `SetGridPlacement` respectent cette règle, si bien que `MakeGridLocation(Parent, Slot, (0,0))` est égal à `MakeItemContainer(Parent, Slot)`, comme l’ancienne location par défaut valait `(0,0)`. Construire les locations avec ces helpers : `FindItemAtLocation` compare les locations exactement, et une origine écrite explicitement (`FPEPGridPlacement` à `(0,0)`) est acceptée par la validation mais n’est pas égale à la forme canonique.
+- Lecture : `FindGridPlacement(Location)` renvoie le `const FPEPGridPlacement*` porté, ou null (aucun placement, autre type); `GetGridPlacement(Location)` renvoie la cellule et l’orientation telles que la grille les lit, l’origine non tournée par défaut. `IsPlacementWellFormed` dit si l’inventaire sait lire le placement : aucun, ou une grille sur une cellule non négative.
+- Blueprint : `UPEPInventoryGridLibrary` expose `MakeGridLocation`, `GetGridPlacement` (faux pour un slot nommé ou un placement d’un autre type) et `SetGridPlacement`. `UPEPInventoryItemUILibrary::MakeItemContainerLocation` garde sa signature et produit la même forme canonique; `FPEPContainerItemViewData` garde `GridPosition`/`bRotated`, lus depuis le placement.
+- Validation (`ValidateLocationForItem`) : un slot `Grid` lit une location sans placement comme l’origine non tournée et accepte un `FPEPGridPlacement`; un placement d’un autre type ou une cellule négative est refusé avec `Reason_InvalidTarget` avant tout examen du slot; une rotation non autorisée donne `Reason_BlockedByState`, un débordement ou un chevauchement `Reason_NoFreeSlot`. Un slot `Single` refuse tout placement, l’origine explicite comprise (`Reason_InvalidTarget`), comme il refusait auparavant toute position non nulle ou rotation. `FPEPItemInstanceTree::IsStructurallyValid` refuse aussi un placement illisible; `ValidateDetailed` applique les mêmes règles de slot.
+- Le placement automatique ne construit pas de `FInstancedStruct` par cellule : un seul candidat est réécrit sur place, et la location renvoyée n’est construite que pour la cellule retenue, sous forme canonique.
+- `FPEPItemPresetChild` garde ses champs auteur `GridPosition`/`bRotated` (données d’asset propres à Inventory); le preset les convertit avec `MakeGridLocation`.
+
+`FPEPItemDragData` (PEPItemUI), qui n’était utilisé nulle part, a été supprimé : le payload de drag d’inventaire appartient au workflow de `PEPInventoryUI`.
+
+## Tags natifs
+
+ItemCore ne déclare plus qu’une racine de convention, `PEPItemTags::Item_Type` (`Item.Type`). Les sortes d’items sont du vocabulaire de jeu : chaque projet déclare ses propres enfants (`Item.Type.Weapon.Rifle`, …) dans son module ou ses tables de tags. Le navigateur de définitions de `PEPInventoryEditor` regroupe toujours les définitions par le chemin qui suit `Item.Type.`.
+
+Ne sont plus natifs dans ItemCore : `Item.Type.Weapon`, `Ammo`, `Magazine`, `Medical`, `Consumable`, `Armor`, `Backpack`, `Container`, `Key`, `Quest`, `Currency`, `Misc`, ainsi que `Item.Static`, `Item.Container`, `Item.Slot.Content.Main/QuickAccess/Secure`, `Inventory.GameplayAccess.Equip/Reload/Use` et `UseContext.Menu/World`. `PEPInventoryTags` porte désormais `Inventory_Slot_Main` (`Inventory.Slot.Main`, slot racine générique du stockage principal), `Inventory_GameplayAccess_Equip` et `Inventory_GameplayAccess_Use` (mêmes chaînes qu’avant). QuickAccess, Secure et Reload ne sont pas recréés : un projet qui en a besoin les déclare lui-même. Un asset qui référence un tag retiré ne le résout plus tant que le projet ne le déclare pas (par exemple dans `Config/DefaultGameplayTags.ini`).
 
 ## Résultats d’opération
 
@@ -65,11 +90,13 @@ Le registre de définitions transitoires des tests (`PEPItemAutomationTestSuppor
 
 PEPItems et PEPInventory n’écrivent aucun fichier : le projet sérialise lui-même, avec son propre système de sauvegarde, le résultat de `UPEPInventoryComponent::ExportItemTrees` (un `FPEPInventoryTreePlacement[]`, un arbre par entrée racine avec sa `RootLocation`) et l’état de l’allocateur d’IDs, `UPEPIdAllocatorSubsystem::GetSaveState()`. Tout ce qui doit survivre à une sauvegarde porte le flag `SaveGame`, jusqu’aux champs des structs imbriquées, car une archive `ArIsSaveGame` ignore tout champ non marqué, même à l’intérieur d’une struct ou d’un `FInstancedStruct` :
 
-- `FPEPItemInstance` (`SchemaVersion`, `ItemId`, `DefinitionId`, `StateFragments`) et `FPEPItemLocation` ;
+- `FPEPItemInstance` (`SchemaVersion`, `ItemId`, `DefinitionId`, `StateFragments`) et `FPEPItemLocation`, placement compris (côté Inventory, `FPEPGridPlacement::Position` et `bRotated`) ;
 - les états d’item (`FPEPItemState_Stack::Count`, `FPEPItemState_Durability::Durability`, `FPEPItemState_Resource::Current`, `FPEPItemState_WorldPresentation` et ses cosmétiques, `FPEPItemState_ContainerRuntime::bLocked` côté Inventory). Ces champs restent `EditAnywhere` pour que les presets décrivent un état initial, mais sont en lecture seule pour Blueprint : l’état change par le store propriétaire. Un stack à 0 est un état épuisé légal ;
 - les enveloppes d’export Inventory (`FPEPInventoryTreePlacement`, `FPEPItemInstanceTree`, `FPEPItemInstanceTreeEntry`).
 
-Un nouvel état d’item doit marquer `SaveGame` chacun de ses champs persistants. Les tests `PEP.Items.Save.*` et `PEP.Inventory.Save.SaveGameArchiveRoundTrips` font un vrai aller-retour par archive `ArIsSaveGame`.
+Un nouvel état d’item ou un nouveau type de placement doit marquer `SaveGame` chacun de ses champs persistants. Les tests `PEP.Items.Save.*` et `PEP.Inventory.Save.SaveGameArchiveRoundTrips` font un vrai aller-retour par archive `ArIsSaveGame`; ce dernier vérifie qu’un placement de grille tourné revient intact.
+
+Aucune migration n’est prévue pour les anciens champs `FPEPItemLocation::GridPosition` et `bRotated` (pré-release; aucun asset ne les référençait) : dans une sauvegarde écrite avant le passage au `Placement`, ces propriétés sont ignorées au chargement et l’item serait lu à l’origine non tournée de sa grille, ce que `AddItemTrees` refuse dès que deux items s’y chevauchent.
 
 `FPEPItemInstance` est versionné par `SchemaVersion`. La valeur par défaut est `UnversionedSchemaVersion` (0, « héritée / non versionnée ») : une archive sans ce champ — sauvegarde antérieure à sa persistance, ou champ omis par une sérialisation delta parce qu’il valait l’ancien défaut 1 — est donc reconnue comme ancienne au lieu d’être étiquetée courante, et tout enregistrement réel diffère du défaut et est toujours écrit. Les chemins de création (`MakeNew`/`InitializeNew`, donc `CreateItemInstance`, presets, `SplitStack`, tests) posent `CurrentSchemaVersion`; `Reset()` ramène l’enregistrement à l’état par défaut (0).
 
@@ -79,4 +106,4 @@ Au chargement depuis une archive, `PostSerialize` appelle `MigrateInstanceFromVe
 
 ## Vérification
 
-Les tests d’automatisation ciblent notamment la validation et la réparation des ressources/durabilités, le refus des montants non finis, les opérations de stack avec un état invalide, la prévisualisation de split sans allocation, l’échec explicite des requêtes sans état ou sans définition, le contexte d’accès système, la migration des enregistrements non versionnés (`PEP.Items.Save.UnversionedRecordLoadsAsCurrent`), la non-réallocation des IDs chargés et le rejet d’enfants directs invalides dans un preset. Les tests Inventory appartiennent à `PEPInventory`; ceux des règles génériques restent dans `PEPItemCore`.
+Les tests d’automatisation ciblent notamment la validation et la réparation des ressources/durabilités, le refus des montants non finis, les opérations de stack avec un état invalide, la prévisualisation de split sans allocation, l’échec explicite des requêtes sans état ou sans définition, le contexte d’accès système, la migration des enregistrements non versionnés (`PEP.Items.Save.UnversionedRecordLoadsAsCurrent`), la non-réallocation des IDs chargés et le rejet d’enfants directs invalides dans un preset. Les tests Inventory appartiennent à `PEPInventory`; ceux des règles génériques restent dans `PEPItemCore`. Le contrat de placement de grille est couvert par `PEP.Inventory.Grid.PlacementSpelling` (écriture canonique, égalité, hash, validité structurelle) et `PEP.Inventory.Grid.SlotsReadPlacements` (lecture par les slots `Grid` et `Single`, empreinte tournée, placement automatique canonique). Les tests Inventory n’utilisent plus de tags de jeu : ils déclarent leur propre vocabulaire sous `Test.Inventory.*` (`PEPInventoryTestTags.cpp`).

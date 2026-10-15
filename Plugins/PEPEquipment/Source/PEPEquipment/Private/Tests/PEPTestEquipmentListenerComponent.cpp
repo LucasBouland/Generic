@@ -15,6 +15,38 @@ void UPEPTestEquipmentListenerComponent::Listen(UPEPEquipmentComponent* Equipmen
 		&UPEPTestEquipmentListenerComponent::HandleRequestResolved);
 }
 
+void UPEPTestEquipmentListenerComponent::ListenToOwnerView(UPEPEquipmentComponent* Equipment)
+{
+	if (!Equipment)
+	{
+		return;
+	}
+	Equipment->OnOwnerItemEquipped.AddDynamic(
+		this,
+		&UPEPTestEquipmentListenerComponent::HandleOwnerItemEquipped);
+	Equipment->OnOwnerItemUnequipped.AddDynamic(
+		this,
+		&UPEPTestEquipmentListenerComponent::HandleOwnerItemUnequipped);
+	Equipment->OnOwnerEquipmentChanged.AddDynamic(
+		this,
+		&UPEPTestEquipmentListenerComponent::HandleOwnerEquipmentChanged);
+}
+
+void UPEPTestEquipmentListenerComponent::HandleOwnerItemEquipped(const FPEPEquipmentChange& Change)
+{
+	OwnerChanges.Add(Change);
+}
+
+void UPEPTestEquipmentListenerComponent::HandleOwnerItemUnequipped(const FPEPEquipmentChange& Change)
+{
+	OwnerChanges.Add(Change);
+}
+
+void UPEPTestEquipmentListenerComponent::HandleOwnerEquipmentChanged()
+{
+	++OwnerViewChangedCount;
+}
+
 void UPEPTestEquipmentListenerComponent::HandleItemEquipped(const FPEPEquipmentChange& Change)
 {
 	Changes.Add(Change);

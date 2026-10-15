@@ -13,7 +13,7 @@ bool FPEPInventoryRootSlotChangeTest::RunTest(const FString&)
 {
     FFixture Fixture;
     const FGameplayTag FirstTag = FFixture::RootSlotTag();
-    const FGameplayTag SecondTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+    const FGameplayTag SecondTag = FFixture::SecondarySlotTag();
     Fixture.Inventory->RegisterLocationValidator(SecondTag,
         FPEPItemLocationValidator::CreateLambda([](const FPEPItemInstance& Item, const FPEPItemLocation&)
         {
@@ -30,10 +30,10 @@ bool FPEPInventoryRootSlotChangeTest::RunTest(const FString&)
     Fixture.Inventory->OnItemStoreChanged().AddLambda([&Events](const FPEPItemStoreChange& Change) { Events.Add(Change); });
     TestTrue(TEXT("root added"), Fixture.AddToRootSlot(Root).bSuccess);
     TestTrue(TEXT("child added"), Fixture.Inventory->AddItem(Child,
-        FPEPItemLocation::MakeItemContainer(Root.ItemId, Slot, FIntPoint(0, 0), false), Access).bSuccess);
+        PEPInventoryGrid::MakeGridLocation(Root.ItemId, Slot, FIntPoint(0, 0), false), Access).bSuccess);
     TestTrue(TEXT("grandchild added"), Fixture.Inventory->AddItem(Grandchild,
-        FPEPItemLocation::MakeItemContainer(Child.ItemId, Slot, FIntPoint(0, 0), false), Access).bSuccess);
-    const FPEPItemLocation LeafOrigin = FPEPItemLocation::MakeItemContainer(Grandchild.ItemId, Slot, FIntPoint(0, 0), false);
+        PEPInventoryGrid::MakeGridLocation(Child.ItemId, Slot, FIntPoint(0, 0), false), Access).bSuccess);
+    const FPEPItemLocation LeafOrigin = PEPInventoryGrid::MakeGridLocation(Grandchild.ItemId, Slot, FIntPoint(0, 0), false);
     TestTrue(TEXT("leaf added"), Fixture.Inventory->AddItem(Leaf, LeafOrigin, Access).bSuccess);
     for (const FPEPItemStoreChange& Event : Events)
     {
@@ -68,7 +68,7 @@ bool FPEPInventoryReplicatedRootSlotChangeTest::RunTest(const FString&)
     const FPEPItemAccessContext Access = FPEPItemAccessContext::System();
     const FName Slot = TEXT("contents");
     const FGameplayTag FirstTag = FFixture::RootSlotTag();
-    const FGameplayTag SecondTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+    const FGameplayTag SecondTag = FFixture::SecondarySlotTag();
     Fixture.Inventory->RegisterLocationValidator(SecondTag,
         FPEPItemLocationValidator::CreateLambda([](const FPEPItemInstance& Item, const FPEPItemLocation&)
         {
@@ -76,7 +76,7 @@ bool FPEPInventoryReplicatedRootSlotChangeTest::RunTest(const FString&)
         }), /*bAllowAutoPlacement*/ true);
     const FPEPItemInstance Root = FFixture::MakeItem(Fixture.MakeContainerDefinition(TEXT("ReplicatedRootTagContainer"), Slot, FIntPoint(4, 4)));
     const FPEPItemInstance Leaf = FFixture::MakeItem(Fixture.MakeShapedDefinition(TEXT("ReplicatedRootTagLeaf"), FIntPoint(1, 1)));
-    const FPEPItemLocation Origin = FPEPItemLocation::MakeItemContainer(Root.ItemId, Slot, FIntPoint(0, 0), false);
+    const FPEPItemLocation Origin = PEPInventoryGrid::MakeGridLocation(Root.ItemId, Slot, FIntPoint(0, 0), false);
     TestTrue(TEXT("root seeded"), Fixture.AddToRootSlot(Root).bSuccess);
     TestTrue(TEXT("leaf seeded"), Fixture.Inventory->AddItem(Leaf, Origin, Access).bSuccess);
     FPEPInventoryView ReceivedView;
@@ -86,7 +86,7 @@ bool FPEPInventoryReplicatedRootSlotChangeTest::RunTest(const FString&)
     TestTrue(TEXT("root relocated"), Fixture.Inventory->MoveItem(Root.ItemId, FPEPItemLocation::MakeNamedSlot(SecondTag), Access).bSuccess);
     FPEPInventoryEntry Received;
     Received.Item = Leaf;
-    Received.Location = FPEPItemLocation::MakeItemContainer(Root.ItemId, Slot, FIntPoint(1, 0), false);
+    Received.Location = PEPInventoryGrid::MakeGridLocation(Root.ItemId, Slot, FIntPoint(1, 0), false);
     TArray<FPEPItemStoreChange> Events;
     Fixture.Inventory->OnItemStoreChanged().AddLambda([&Events](const FPEPItemStoreChange& Change) { Events.Add(Change); });
     Received.LastObservedLocation = Origin;

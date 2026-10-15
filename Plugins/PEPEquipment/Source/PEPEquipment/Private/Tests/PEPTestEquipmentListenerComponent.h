@@ -24,11 +24,23 @@ class UPEPTestEquipmentListenerComponent final
 public:
 	void Listen(UPEPEquipmentComponent* Equipment);
 
+	/** Records the owner view's events into OwnerChanges, apart from the public ones. */
+	void ListenToOwnerView(UPEPEquipmentComponent* Equipment);
+
 	UFUNCTION()
 	void HandleItemEquipped(const FPEPEquipmentChange& Change);
 
 	UFUNCTION()
 	void HandleItemUnequipped(const FPEPEquipmentChange& Change);
+
+	UFUNCTION()
+	void HandleOwnerItemEquipped(const FPEPEquipmentChange& Change);
+
+	UFUNCTION()
+	void HandleOwnerItemUnequipped(const FPEPEquipmentChange& Change);
+
+	UFUNCTION()
+	void HandleOwnerEquipmentChanged();
 
 	UFUNCTION()
 	void HandleRequestResolved(const FPEPEquipmentRequestResult& RequestResult);
@@ -40,6 +52,8 @@ public:
 		FGameplayTag SlotTag) const override;
 
 	TArray<FPEPEquipmentChange> Changes;
+	TArray<FPEPEquipmentChange> OwnerChanges;
+	int32 OwnerViewChangedCount = 0;
 	TArray<FPEPEquipmentRequestResult> Resolutions;
 
 	/** Refused when valid; every other slot is allowed. */

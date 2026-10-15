@@ -3,7 +3,7 @@
   "Version": 1,
   "VersionName": "1.0",
   "FriendlyName": "PEPEquipment",
-  "Description": "Public replicated equipment projection and local equipped-item presentation.",
+  "Description": "Public replicated equipment projection, local owner view, equipped-item presentation, GMAS bridge and equipment slot UI.",
   "Category": "PEP",
   "CanContainContent": true,
   "Installed": false,
@@ -34,6 +34,7 @@
     { "Name": "PEPItems", "Enabled": true },
     { "Name": "PEPInventory", "Enabled": true, "TargetAllowList": [ "Editor" ] },
     { "Name": "PEPCoreUI", "Enabled": true },
+    { "Name": "CommonUI", "Enabled": true },
     { "Name": "GMCAbilitySystem", "Enabled": true },
     {
       "Name": "DataValidation",

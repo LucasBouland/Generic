@@ -13,7 +13,9 @@
 #include "Item/Fragments/PEPItemFragment_Stackable.h"
 #include "Item/PEPItemDefinition.h"
 #include "Item/PEPItemInstance.h"
-#include "Item/PEPItemTags.h"
+#include "Inventory/PEPInventoryGrid.h"
+#include "Inventory/PEPInventoryTags.h"
+#include "NativeGameplayTags.h"
 #include "StructUtils/InstancedStruct.h"
 
 /**
@@ -33,6 +35,20 @@ struct FPEPInventoryViewTestAccess
 
 namespace PEPInventoryTest
 {
+	/*
+	 * Test-only vocabulary, defined once in PEPInventoryTestTags.cpp. The plugins define no item
+	 * kinds and no second root slot of their own; these stand in for what a game would declare.
+	 * Exported because PEPInventoryUI's tests include this fixture too.
+	 */
+	/** A second root named slot, standing in for another equipment slot. */
+	PEPINVENTORY_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Test_Inventory_Slot_Secondary);
+	/** Owned by magazine-like test items; attachment mounts require it. */
+	PEPINVENTORY_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Test_Inventory_Item_Magazine);
+	/** Owned by no test item: a slot requiring it accepts nothing. */
+	PEPINVENTORY_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Test_Inventory_Item_Key);
+	/** A gameplay access the inventory does not define, granted alongside its own. */
+	PEPINVENTORY_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Test_Inventory_GameplayAccess_Reload);
+
 	/**
 	 * The session component standing in for the player who owns Inventory, created on its owner
 	 * the first time it is asked for. In a game it sits on the PlayerController; a test owner is
@@ -101,7 +117,13 @@ namespace PEPInventoryTest
 
 		static FGameplayTag RootSlotTag()
 		{
-			return PEPItemTags::Item_Slot_Content_Main;
+			return PEPInventoryTags::Inventory_Slot_Main;
+		}
+
+		/** A second root slot, standing in for another equipment slot; a test using it claims it itself. */
+		static FGameplayTag SecondarySlotTag()
+		{
+			return Test_Inventory_Slot_Secondary;
 		}
 
 		/** Places Item in the stand-in equipment slot, which is the only way into an empty store. */

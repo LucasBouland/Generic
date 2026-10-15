@@ -20,11 +20,14 @@ class UPEPEquipmentComponent;
  * GMC ability system, and refuses equipment whose active-tag requirements the wearer does not meet.
  *
  * Place it on the pawn next to a UPEPEquipmentComponent and a UGMC_AbilitySystemComponent; both
- * are found on the owner. It follows the public equipment projection through OnItemEquipped and
- * OnItemUnequipped, on every machine:
+ * are found on the owner. It follows the equipment's OWNER view through OnOwnerItemEquipped and
+ * OnOwnerItemUnequipped: every slot of the profile, including slots hidden from the public
+ * projection (bShowPublicly off), computed locally on the authority and on the owning client from
+ * the full item store both hold. A simulated proxy keeps no owner view, and needs none (below).
  *
  *  - Ability map entries are local GMAS data, not replicated, so they are written on the server
- *    and on every client alike — always with bGrantedByDefault cleared, so a client never grants.
+ *    and on the owning client alike — always with bGrantedByDefault cleared, so a client never
+ *    grants.
  *  - Granting an InputTag (GrantedAbilityTags is GMC-bound, server-authoritative output) and
  *    applying EquippedEffects happen on the authority only. Effects use the ServerAuth queue:
  *    equipment changes arrive from server RPCs, store writes and replication, outside the GMC
@@ -39,8 +42,10 @@ class UPEPEquipmentComponent;
  * holds nothing. A pawn whose role changes (possessed after spawn, unpossessed) is brought in
  * line when its controller changes.
  *
- * Grants follow the PUBLIC projection: an item in a slot whose profile entry has bShowPublicly off
- * raises no equipment event and so grants nothing, whatever its fragment says.
+ * Grants do not depend on bShowPublicly: an item in a hidden slot grants like any other, and only
+ * its visual and public events are withheld from other players. A container's private content
+ * grants nothing (it is in neither view). Use the fragment's ActiveInSlots to narrow where an item
+ * grants.
  */
 UCLASS(ClassGroup=(PEP), BlueprintType, meta=(BlueprintSpawnableComponent))
 class PEPEQUIPMENTGMAS_API UPEPEquipmentAbilityBridgeComponent
@@ -71,6 +76,20 @@ public:
 	/** Server only: the GMAS effect ids applied for ItemId, empty when none. */
 	UFUNCTION(BlueprintPure, Category="PEP|Equipment|Abilities")
 	TArray<int32> GetAppliedEffectIds(FPEPItemId ItemId) const;
+
+	/**
+	 * What the bridge grants from: every node of Equipment's owner view, hidden slots included, as
+	 * Equipped changes in announcement order (roots first, then by ItemId). Empty where the machine
+	 * keeps no owner view. Output is reset. Pure; exposed for tests and tools.
+	 */
+	static void GatherGrantSourceChanges(
+		const UPEPEquipmentComponent& Equipment,
+		TArray<FPEPEquipmentChange>& OutChanges);
+
+	/** Whether a node entering as Change grants what Fragment describes. False without a fragment. */
+	static bool DoesChangeGrant(
+		const FPEPItemFragment_EquipmentAbilities* Fragment,
+		const FPEPEquipmentChange& Change);
 
 protected:
 	virtual void BeginPlay() override;
@@ -110,7 +129,7 @@ private:
 	 */
 	void TryInitialSync();
 	/**
-	 * Brings applied state in line with the projection: used at start, after a load and after a
+	 * Brings applied state in line with the owner view: used at start, after a load and after a
 	 * controller change. On a simulated proxy it gives back whatever earlier writes left.
 	 */
 	void ReconcileWithProjection();

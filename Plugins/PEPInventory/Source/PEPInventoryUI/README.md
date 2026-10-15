@@ -40,8 +40,9 @@ Add **DestinationContext : PEPInventoryUIContext** to your container. At initial
 remote container. These getters return a None context if their store is unavailable. Use
 **Is Context Current** to gate interaction.
 
-Add **SourceContext : PEPInventoryUIContext** to `BP_PEP_DragDropOperation`, separate from the
-existing `PEPItemDragData`. At drag start, copy the source container's DestinationContext.
+Add **SourceContext : PEPInventoryUIContext** to `BP_PEP_DragDropOperation`, next to the
+operation's own drag payload (the dragged item, grab offset and preview rotation; PEPItemUI no
+longer provides one). At drag start, copy the source container's DestinationContext.
 Keep that captured context unchanged during the drag. Do not query a fresh source context in
 OnDrop; that would silently reroute an old drag after a session change.
 
@@ -56,13 +57,17 @@ Close requests; the server rejects an ID that no longer matches the active sessi
 ## OnDragOver and OnDrop
 
 The container still calculates CandidateCell/Destination with its own ParentItemId, SlotName,
-grid geometry, CellSize, and the drag's grab offset/preview rotation.
+grid geometry, CellSize, and the drag's grab offset/preview rotation. Build the destination with
+**Make Grid Location** (`PEPInventoryGridLibrary`) or **Make Item Container Location**: both give
+the same location, and leave the placement empty for the unrotated origin, which is also the form
+a Single slot accepts. A location's cell and orientation are read back with **Get Grid Placement**;
+the grid lives in the location's `Placement`, not in fields of `PEPItemLocation`.
 
 **OnDragOver** calls **Preview Placement** on the subsystem:
 
 - Source Context = operation.SourceContext
 - Destination Context = container.DestinationContext
-- Item Id = operation.DragData.Item.ItemId
+- Item Id = the dragged item's ItemId, held by the operation
 - Destination = calculated PEPItemLocation
 
 Break the returned **PEPItemResult** and use **Success** to choose green/red. Context mismatches

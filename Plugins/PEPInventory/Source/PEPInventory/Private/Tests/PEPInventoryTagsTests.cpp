@@ -3,6 +3,7 @@
 #include "Misc/AutomationTest.h"
 
 #include "Inventory/PEPInventoryTags.h"
+#include "Item/PEPItemTags.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FPEPInventoryNativeTagsTest,
@@ -18,6 +19,15 @@ bool FPEPInventoryNativeTagsTest::RunTest(const FString& Parameters)
 			FGameplayTag::RequestGameplayTag(TEXT("Inventory.Event.Item"))));
 	TestTrue(TEXT("transfer session state is registered"),
 		PEPInventoryTags::Inventory_State_TransferSession_Active.GetTag().IsValid());
+	TestTrue(TEXT("the generic main root slot is registered"),
+		PEPInventoryTags::Inventory_Slot_Main.GetTag().IsValid());
+	TestTrue(TEXT("gameplay accesses share their hierarchy"),
+		PEPInventoryTags::Inventory_GameplayAccess_Equip.GetTag().MatchesTag(
+			FGameplayTag::RequestGameplayTag(TEXT("Inventory.GameplayAccess")))
+		&& PEPInventoryTags::Inventory_GameplayAccess_Use.GetTag().MatchesTag(
+			FGameplayTag::RequestGameplayTag(TEXT("Inventory.GameplayAccess"))));
+	TestTrue(TEXT("item kinds hang from ItemCore's convention root"),
+		PEPItemTags::Item_Type.GetTag() == FGameplayTag::RequestGameplayTag(TEXT("Item.Type")));
 
 	return true;
 }

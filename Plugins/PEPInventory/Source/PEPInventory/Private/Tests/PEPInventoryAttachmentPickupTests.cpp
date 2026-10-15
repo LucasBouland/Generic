@@ -15,7 +15,7 @@ namespace
 		Slot.SlotName = Name;
 		Slot.Mode = EPEPContainerSlotMode::Single;
 		Slot.Purpose = EPEPContainerSlotPurpose::Attachment;
-		Slot.RequiredItemTags.AddTag(PEPItemTags::Item_Type_Magazine);
+		Slot.RequiredItemTags.AddTag(PEPInventoryTest::Test_Inventory_Item_Magazine);
 		return Slot;
 	}
 
@@ -32,7 +32,7 @@ namespace
 
 	void RegisterSecondEquipmentSlot(FFixture& Fixture)
 	{
-		Fixture.Inventory->RegisterLocationValidator(PEPItemTags::Item_Slot_Content_QuickAccess,
+		Fixture.Inventory->RegisterLocationValidator(FFixture::SecondarySlotTag(),
 			FPEPItemLocationValidator::CreateLambda(
 				[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 				{
@@ -55,7 +55,7 @@ bool FPEPInventoryAttachmentPickupPriorityTest::RunTest(const FString&)
 	Pocket.GridSize = FIntPoint(3, 1);
 	FPEPContainerSlotDefinition Incompatible = MakeAttachmentSlot(TEXT("incompatible"));
 	Incompatible.RequiredItemTags.Reset();
-	Incompatible.RequiredItemTags.AddTag(PEPItemTags::Item_Type_Key);
+	Incompatible.RequiredItemTags.AddTag(PEPInventoryTest::Test_Inventory_Item_Key);
 	FPEPContainerSlotDefinition ContentSingle = MakeAttachmentSlot(TEXT("content_single"));
 	ContentSingle.Purpose = EPEPContainerSlotPurpose::Content;
 	FPEPContainerSlotDefinition Forbidden = MakeAttachmentSlot(TEXT("forbidden"));
@@ -69,7 +69,7 @@ bool FPEPInventoryAttachmentPickupPriorityTest::RunTest(const FString&)
 		TEXT("AttachmentPickupWeapon"), { MakeAttachmentSlot(MountName) }));
 	if (!TestTrue(TEXT("first equipment root added"), Fixture.AddToRootSlot(Rig).bSuccess)
 		|| !TestTrue(TEXT("second equipment root added"), Fixture.Inventory->AddItem(Weapon,
-			FPEPItemLocation::MakeNamedSlot(PEPItemTags::Item_Slot_Content_QuickAccess),
+			FPEPItemLocation::MakeNamedSlot(FFixture::SecondarySlotTag()),
 			FPEPItemAccessContext::System()).bSuccess))
 	{
 		return false;
@@ -77,7 +77,7 @@ bool FPEPInventoryAttachmentPickupPriorityTest::RunTest(const FString&)
 
 	UPEPItemDefinition* MagazineDef = Fixture.MakeShapedDefinition(
 		TEXT("AttachmentPickupMagazine"), FIntPoint(1, 1));
-	MagazineDef->OwnedTags.AddTag(PEPItemTags::Item_Type_Magazine);
+	MagazineDef->OwnedTags.AddTag(PEPInventoryTest::Test_Inventory_Item_Magazine);
 	const FPEPItemInstance Magazine = FFixture::MakeItem(MagazineDef);
 	TestTrue(TEXT("preview accepts a compatible attachment"), Fixture.Inventory->CanAddPickupItem(
 		Magazine, FPEPItemAccessContext::System()).bSuccess);
@@ -91,8 +91,7 @@ bool FPEPInventoryAttachmentPickupPriorityTest::RunTest(const FString&)
 	TestTrue(TEXT("pickup location found"), Fixture.Inventory->FindItemLocation(Magazine.ItemId, Location));
 	TestTrue(TEXT("all equipped roots searched before first root's grid"), Location.ParentItemId == Weapon.ItemId);
 	TestEqual(TEXT("correct attachment slot"), Location.ContainerSlotName, MountName);
-	TestTrue(TEXT("single slot uses zero cell and no rotation"),
-		Location.GridPosition == FIntPoint::ZeroValue && !Location.bRotated);
+	TestFalse(TEXT("single slot carries no placement"), Location.Placement.IsValid());
 
 	const FPEPItemInstance Second = FFixture::MakeItem(MagazineDef);
 	TestTrue(TEXT("occupied mount falls back to storage in preview"),
@@ -131,7 +130,7 @@ bool FPEPInventoryAttachmentPickupTreeTest::RunTest(const FString&)
 	const FName ContentsName(TEXT("contents"));
 	UPEPItemDefinition* MagazineDef = Fixture.MakeContainerDefinition(
 		TEXT("AttachmentTreeMagazine"), ContentsName, FIntPoint(1, 1));
-	MagazineDef->OwnedTags.AddTag(PEPItemTags::Item_Type_Magazine);
+	MagazineDef->OwnedTags.AddTag(PEPInventoryTest::Test_Inventory_Item_Magazine);
 	FPEPItemInstanceTree Tree;
 	Tree.RootItem = FFixture::MakeItem(MagazineDef);
 	FPEPItemInstanceTreeEntry& Child = Tree.Children.AddDefaulted_GetRef();
@@ -180,7 +179,7 @@ bool FPEPInventoryAttachmentPickupBeforeMergeTest::RunTest(const FString&)
 		return false;
 	}
 	UPEPItemDefinition* MagazineDef = Fixture.MakeStackableDefinition(TEXT("StackAttachmentMagazine"), 10);
-	MagazineDef->OwnedTags.AddTag(PEPItemTags::Item_Type_Magazine);
+	MagazineDef->OwnedTags.AddTag(PEPInventoryTest::Test_Inventory_Item_Magazine);
 	const FPEPItemInstance Stored = FFixture::MakeItem(MagazineDef);
 	if (!TestTrue(TEXT("compatible stack stored in pocket"), Fixture.Inventory->AddItem(Stored,
 		FPEPItemLocation::MakeItemContainer(Weapon.ItemId, Pocket.SlotName),

@@ -6,9 +6,14 @@
 
 #include "PEPTestItemStoreComponent.generated.h"
 
-/** Minimal alternate store used to prove that PEPEquipment has no inventory-specific contract. */
+/**
+ * Minimal alternate store used to prove that PEPEquipment has no inventory-specific contract.
+ *
+ * Exported so the plugin's other test modules (PEPEquipmentGMAS, PEPEquipmentUI) can build the
+ * same fixture: they include this private header by relative path. Test-only all the same.
+ */
 UCLASS()
-class UPEPTestItemStoreComponent final : public UActorComponent, public IPEPItemStore
+class PEPEQUIPMENT_API UPEPTestItemStoreComponent final : public UActorComponent, public IPEPItemStore
 {
 	GENERATED_BODY()
 

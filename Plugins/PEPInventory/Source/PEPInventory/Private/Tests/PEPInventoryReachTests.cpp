@@ -64,7 +64,7 @@ namespace PEPInventoryReachTests
 
 	FPEPItemLocation At(const FPEPItemId InParentItemId, const FName InSlotName, const int32 X, const int32 Y)
 	{
-		return FPEPItemLocation::MakeItemContainer(InParentItemId, InSlotName, FIntPoint(X, Y));
+		return PEPInventoryGrid::MakeGridLocation(InParentItemId, InSlotName, FIntPoint(X, Y));
 	}
 
 	/*
@@ -420,7 +420,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FPEPInventoryValidatorClaimTest::RunTest(const FString&)
 {
 	FFixture Fixture;
-	const FGameplayTag SlotTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+	const FGameplayTag SlotTag = FFixture::SecondarySlotTag();
 	const FPEPItemLocation Slot = FPEPItemLocation::MakeNamedSlot(SlotTag);
 	const FPEPItemAccessContext System = FPEPItemAccessContext::System();
 

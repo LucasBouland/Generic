@@ -25,7 +25,6 @@
 #include "Item/PEPItemLocation.h"
 #include "Item/PEPItemQuery.h"
 #include "Item/PEPItemStore.h"
-#include "Item/PEPItemTags.h"
 #include "Net/UnrealNetwork.h"
 
 namespace
@@ -42,6 +41,52 @@ namespace
 #else
 		return nullptr;
 #endif
+	}
+
+	/**
+	 * Whether the store grants ItemId at least one of AccessTags. No tags means no requirement:
+	 * Equipment owns no access vocabulary, so it asks only about the accesses it was given.
+	 */
+	bool HasAnyGrantedGameplayAccess(
+		const IPEPItemStore& ItemStore,
+		const FPEPItemId ItemId,
+		const FGameplayTagContainer& AccessTags)
+	{
+		const TArray<FGameplayTag>& Tags = AccessTags.GetGameplayTagArray();
+		if (Tags.IsEmpty())
+		{
+			return true;
+		}
+		for (const FGameplayTag& AccessTag : Tags)
+		{
+			if (ItemStore.HasGrantedGameplayAccess(ItemId, AccessTag))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Order-independent equality of two views, whose ItemIds are unique. */
+	bool AreSameEquippedNodes(
+		const TArray<FPEPEquippedItemInfo>& Current,
+		const TMap<FPEPItemId, int32>& CurrentIndex,
+		const TArray<FPEPEquippedItemInfo>& Candidate)
+	{
+		if (Current.Num() != Candidate.Num())
+		{
+			return false;
+		}
+		for (const FPEPEquippedItemInfo& Node : Candidate)
+		{
+			const int32* Index = CurrentIndex.Find(Node.ItemId);
+			if (!Index || !Current.IsValidIndex(*Index)
+				|| !PEPEquipmentEvents::IsSameEquippedNode(Current[*Index], Node))
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/** A refusal always says why and names the item, whoever produced it. */
@@ -107,10 +152,10 @@ UPEPEquipmentComponent::UPEPEquipmentComponent()
 	PublicEquipmentView.OwnerComponent = this;
 	TemporaryPresentationView.OwnerComponent = this;
 
-	/* Reachable for some gameplay action: equipped, or in a container that grants one of these. */
-	TemporaryPresentationAccessTags.AddTag(PEPItemTags::GameplayAccess_Equip);
-	TemporaryPresentationAccessTags.AddTag(PEPItemTags::GameplayAccess_Reload);
-	TemporaryPresentationAccessTags.AddTag(PEPItemTags::GameplayAccess_Use);
+	/*
+	 * TemporaryPresentationAccessTags and EquipAccessTags start empty: Equipment declares no
+	 * gameplay access of its own, and a project names the accesses its store grants.
+	 */
 
 	SlotDefinitions.Add(MakeSlot(
 		PEPEquipmentTags::Equipment_Slot_Hand_Left,
@@ -178,6 +223,7 @@ void UPEPEquipmentComponent::OnRegister()
 void UPEPEquipmentComponent::OnUnregister()
 {
 	UninitializeItemStoreIntegration();
+	InvalidateEligibilityProviders();
 	Super::OnUnregister();
 }
 
@@ -205,12 +251,14 @@ void UPEPEquipmentComponent::BeginPlay()
 	bool bReconciled = false;
 	if (GetOwner() && GetOwner()->HasAuthority())
 	{
-		/* Folds every store change made before BeginPlay into one rebuild. */
+		/* Folds every store change made before BeginPlay into one rebuild, owner view included. */
 		bReconciled = RefreshPublicProjection();
 	}
 	else
 	{
 		RebuildPublicEntryIndex();
+		/* The owning client's store copy may already hold equipment; a proxy's view stays empty. */
+		RefreshOwnerView();
 	}
 	if (!bReconciled)
 	{
@@ -218,7 +266,14 @@ void UPEPEquipmentComponent::BeginPlay()
 	}
 	ApplyTemporaryPresentations();
 
-	if (bPublicProjectionDirty || bLocalPresentationReconcilePending
+	if (APawn* Pawn = Cast<APawn>(GetOwner()))
+	{
+		Pawn->ReceiveControllerChangedDelegate.AddUniqueDynamic(
+			this,
+			&UPEPEquipmentComponent::HandleOwnerControllerChanged);
+	}
+
+	if (bPublicProjectionDirty || bOwnerViewDirty || bLocalPresentationReconcilePending
 		|| !PendingLocalResolutions.IsEmpty())
 	{
 		ScheduleDeferredUpdates();
@@ -227,7 +282,14 @@ void UPEPEquipmentComponent::BeginPlay()
 
 void UPEPEquipmentComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	if (APawn* Pawn = Cast<APawn>(GetOwner()))
+	{
+		Pawn->ReceiveControllerChangedDelegate.RemoveDynamic(
+			this,
+			&UPEPEquipmentComponent::HandleOwnerControllerChanged);
+	}
 	UninitializeItemStoreIntegration();
+	InvalidateEligibilityProviders();
 	CancelDeferredUpdates();
 	PendingLocalResolutions.Reset();
 	bLocalPresentationReconcilePending = false;
@@ -277,11 +339,12 @@ bool UPEPEquipmentComponent::SetItemStore(UObject* InItemStoreObject)
 	if (IsRegistered())
 	{
 		InitializeItemStoreIntegration();
-		/* Before BeginPlay, BeginPlay builds the projection from whatever store is set by then. */
+		/* Before BeginPlay, BeginPlay builds the views from whatever store is set by then. */
 		bPublicProjectionDirty = true;
+		bOwnerViewDirty = true;
 		if (HasBegunPlay())
 		{
-			RefreshPublicProjection();
+			RefreshDirtyEquipmentViews();
 		}
 	}
 	return true;
@@ -332,8 +395,9 @@ void UPEPEquipmentComponent::SetEquipmentProfile(UPEPEquipmentProfile* InProfile
 	{
 		InitializeItemStoreIntegration();
 	}
-	/* Setup only, so before BeginPlay: BeginPlay builds the projection and the visuals from it. */
+	/* Setup only, so before BeginPlay: BeginPlay builds the views and the visuals from them. */
 	bPublicProjectionDirty = true;
+	bOwnerViewDirty = true;
 	RebuildLocalPresentations();
 }
 
@@ -631,19 +695,14 @@ bool UPEPEquipmentComponent::HasTemporaryPresentationAccess(
 	const IPEPItemStore& ItemStore,
 	const FPEPItemId ItemId) const
 {
-	const TArray<FGameplayTag>& AccessTags = TemporaryPresentationAccessTags.GetGameplayTagArray();
-	if (AccessTags.IsEmpty())
-	{
-		return true;
-	}
-	for (const FGameplayTag& AccessTag : AccessTags)
-	{
-		if (ItemStore.HasGrantedGameplayAccess(ItemId, AccessTag))
-		{
-			return true;
-		}
-	}
-	return false;
+	return HasAnyGrantedGameplayAccess(ItemStore, ItemId, TemporaryPresentationAccessTags);
+}
+
+bool UPEPEquipmentComponent::HasEquipAccess(
+	const IPEPItemStore& ItemStore,
+	const FPEPItemId ItemId) const
+{
+	return HasAnyGrantedGameplayAccess(ItemStore, ItemId, EquipAccessTags);
 }
 
 const FPEPTemporaryPresentationEntry* UPEPEquipmentComponent::FindTemporaryPresentationEntry(
@@ -953,6 +1012,36 @@ FPEPItemResult UPEPEquipmentComponent::CanEquipItemInSlot_Implementation(
 	return FPEPItemResult::Success(Item.ItemId);
 }
 
+void UPEPEquipmentComponent::InvalidateEligibilityProviders()
+{
+	CachedEligibilityProviders.Reset();
+	CachedEligibilityProviderOwner.Reset();
+	CachedEligibilityComponentCount = INDEX_NONE;
+}
+
+bool UPEPEquipmentComponent::IsEligibilityProviderCacheCurrent(const AActor& Owner) const
+{
+	/*
+	 * Cheap enough for every store write: a pointer, a count and one weak lookup per provider —
+	 * usually none or one. A component added or removed moves the count; a provider destroyed
+	 * goes stale. A same-frame swap that keeps the count and spares every provider is the one
+	 * change this cannot see, which is what InvalidateEligibilityProviders is for.
+	 */
+	if (CachedEligibilityProviderOwner.Get() != &Owner
+		|| CachedEligibilityComponentCount != Owner.GetComponents().Num())
+	{
+		return false;
+	}
+	for (const TWeakObjectPtr<const UObject>& Provider : CachedEligibilityProviders)
+	{
+		if (!Provider.IsValid())
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
 void UPEPEquipmentComponent::GatherEligibilityProviders(
 	TArray<const UObject*>& OutProviders) const
 {
@@ -962,35 +1051,55 @@ void UPEPEquipmentComponent::GatherEligibilityProviders(
 	{
 		return;
 	}
-	if (Owner->GetClass()->ImplementsInterface(UPEPEquipmentEligibilityProvider::StaticClass()))
+
+	if (!IsEligibilityProviderCacheCurrent(*Owner))
 	{
-		OutProviders.Add(Owner);
+		CachedEligibilityProviders.Reset();
+		if (Owner->GetClass()->ImplementsInterface(UPEPEquipmentEligibilityProvider::StaticClass()))
+		{
+			const UObject* OwnerProvider = Owner;
+			CachedEligibilityProviders.Emplace(OwnerProvider);
+		}
+
+		/*
+		 * Filtered first, so the sort only ever sees the few components that answer — usually
+		 * none or one, which need no sorting at all.
+		 */
+		TInlineComponentArray<UActorComponent*> Components(Owner);
+		TArray<const UObject*, TInlineAllocator<4>> ComponentProviders;
+		for (const UActorComponent* Component : Components)
+		{
+			if (Component
+				&& Component->GetClass()->ImplementsInterface(
+					UPEPEquipmentEligibilityProvider::StaticClass()))
+			{
+				ComponentProviders.Add(Component);
+			}
+		}
+		/* Component storage order is a set's; the name gives one first failure per configuration. */
+		if (ComponentProviders.Num() > 1)
+		{
+			Algo::Sort(ComponentProviders, [](const UObject* A, const UObject* B)
+			{
+				return A->GetFName().LexicalLess(B->GetFName());
+			});
+		}
+		for (const UObject* ComponentProvider : ComponentProviders)
+		{
+			CachedEligibilityProviders.Emplace(ComponentProvider);
+		}
+		CachedEligibilityProviderOwner = Owner;
+		CachedEligibilityComponentCount = Owner->GetComponents().Num();
 	}
 
-	/*
-	 * Filtered first, so the sort only ever sees the few components that answer — usually none or
-	 * one, which need no sorting at all. This runs inside every store write into a slot.
-	 */
-	TInlineComponentArray<UActorComponent*> Components(Owner);
-	TArray<const UObject*, TInlineAllocator<4>> ComponentProviders;
-	for (const UActorComponent* Component : Components)
+	OutProviders.Reserve(CachedEligibilityProviders.Num());
+	for (const TWeakObjectPtr<const UObject>& Provider : CachedEligibilityProviders)
 	{
-		if (Component
-			&& Component->GetClass()->ImplementsInterface(
-				UPEPEquipmentEligibilityProvider::StaticClass()))
+		if (const UObject* Resolved = Provider.Get())
 		{
-			ComponentProviders.Add(Component);
+			OutProviders.Add(Resolved);
 		}
 	}
-	/* Component storage order is a set's; the name gives one first failure per configuration. */
-	if (ComponentProviders.Num() > 1)
-	{
-		Algo::Sort(ComponentProviders, [](const UObject* A, const UObject* B)
-		{
-			return A->GetFName().LexicalLess(B->GetFName());
-		});
-	}
-	OutProviders.Append(ComponentProviders);
 }
 
 const FPEPEquipmentSlotDefinition* UPEPEquipmentComponent::FindSlotDefinition(
@@ -1006,40 +1115,103 @@ const FPEPEquipmentSlotDefinition* UPEPEquipmentComponent::FindSlotDefinition(
 void UPEPEquipmentComponent::HandleItemStoreChanged(const FPEPItemStoreChange& Change)
 {
 	const AActor* Owner = GetOwner();
-	/* Already dirty: the pending rebuild reads the store as it will be then. */
-	if (!Owner || !Owner->HasAuthority() || bPublicProjectionDirty)
+	if (!Owner)
+	{
+		return;
+	}
+	/*
+	 * The authority rebuilds both views from one flag. Any other machine only ever builds its owner
+	 * view, from the store copy the owning client receives (PEPInventory replicates owner-only and
+	 * raises these events on that copy). A simulated proxy's copy is empty and raises nothing; it
+	 * is not filtered out here, so a copy that starts arriving just before the role does is not
+	 * missed. Already dirty: the pending rebuild reads the store as it will be then.
+	 */
+	const bool bAuthority = Owner->HasAuthority();
+	if (bAuthority ? bPublicProjectionDirty : bOwnerViewDirty)
 	{
 		return;
 	}
 	if (Change.ChangeType == EPEPItemStoreChangeType::StateChanged)
 	{
 		/*
-		 * The item stayed where it was. The projection carries no item state, and which children
-		 * are public is the store's decision by location (IPEPItemStore::GetPublicChildren), so the
-		 * only state change that can show is a projected node changing definition. Charges, ammo
-		 * and durability ticking on an equipped item rebuild nothing.
+		 * The item stayed where it was. The views carry no item state, and which children are
+		 * shown is the store's decision by location (IPEPItemStore::GetPublicChildren), so the only
+		 * state change that can show is a viewed node changing definition. Charges, ammo and
+		 * durability ticking on an equipped item rebuild nothing.
 		 */
-		const FPEPEquippedItemPublic* Node = FindPublicEntry(Change.ItemId);
-		if (Node && Node->DefinitionId != Change.ItemInstance.DefinitionId)
+		const FPrimaryAssetId DefinitionId = Change.ItemInstance.DefinitionId;
+		const FPEPEquippedItemPublic* PublicNode = bAuthority ? FindPublicEntry(Change.ItemId) : nullptr;
+		const FPEPEquippedItemInfo* OwnerNode = FindOwnerViewNode(Change.ItemId);
+		if ((PublicNode && PublicNode->DefinitionId != DefinitionId)
+			|| (OwnerNode && OwnerNode->DefinitionId != DefinitionId))
 		{
-			MarkPublicProjectionDirty();
+			MarkEquipmentViewsDirty();
 		}
 		return;
 	}
-	// A bandage moving between two pockets never reaches the projection; only an item under one
-	// of this component's slots, before or after the change, can.
+	// A bandage moving between two pockets never reaches either view; only an item under one of
+	// this component's slots, hidden or not, before or after the change, can.
 	if (DoesChangeTouchEquipment(Change))
 	{
-		MarkPublicProjectionDirty();
+		MarkEquipmentViewsDirty();
 	}
 }
 
-void UPEPEquipmentComponent::MarkPublicProjectionDirty()
+void UPEPEquipmentComponent::MarkEquipmentViewsDirty()
 {
-	bPublicProjectionDirty = true;
+	const AActor* Owner = GetOwner();
+	if (Owner && Owner->HasAuthority())
+	{
+		/* One rebuild covers both views on the authority. */
+		bPublicProjectionDirty = true;
+	}
+	else
+	{
+		bOwnerViewDirty = true;
+	}
 	/* Inside one of this component's own writes, the end of the batch rebuilds instead. */
 	if (ProjectionBatchDepth == 0)
 	{
+		ScheduleDeferredUpdates();
+	}
+}
+
+void UPEPEquipmentComponent::RefreshDirtyEquipmentViews()
+{
+	const AActor* Owner = GetOwner();
+	if (Owner && Owner->HasAuthority())
+	{
+		if (bPublicProjectionDirty || bOwnerViewDirty)
+		{
+			/* Reconciles the visuals itself when the projection changed. */
+			RefreshPublicProjection();
+		}
+		return;
+	}
+	/* The projection is the server's to build: a client only ever rebuilds its owner view. */
+	bPublicProjectionDirty = false;
+	if (bOwnerViewDirty)
+	{
+		RefreshOwnerView();
+	}
+}
+
+void UPEPEquipmentComponent::HandleOwnerControllerChanged(
+	APawn* Pawn,
+	AController* OldController,
+	AController* NewController)
+{
+	(void)Pawn;
+	(void)OldController;
+	(void)NewController;
+	/*
+	 * The authority's owner view does not depend on who drives the pawn. A client's does: next
+	 * tick, since the new role can land in the same bunch as the controller, after this callback.
+	 */
+	const AActor* Owner = GetOwner();
+	if (Owner && !Owner->HasAuthority())
+	{
+		bOwnerViewDirty = true;
 		ScheduleDeferredUpdates();
 	}
 }
@@ -1057,10 +1229,10 @@ void UPEPEquipmentComponent::EndProjectionBatch()
 		return;
 	}
 	--ProjectionBatchDepth;
-	/* Before BeginPlay the projection waits for BeginPlay, like any other store change. */
-	if (ProjectionBatchDepth == 0 && bPublicProjectionDirty && HasBegunPlay())
+	/* Before BeginPlay the views wait for BeginPlay, like any other store change. */
+	if (ProjectionBatchDepth == 0 && HasBegunPlay())
 	{
-		RefreshPublicProjection();
+		RefreshDirtyEquipmentViews();
 	}
 }
 
@@ -1071,48 +1243,39 @@ bool UPEPEquipmentComponent::RefreshPublicProjection()
 	{
 		return false;
 	}
+	/* The owner view is rebuilt by this same walk. */
+	bOwnerViewDirty = false;
+
+	/*
+	 * One walk of the store feeds both views: the owner view takes every slot, the projection
+	 * only the slots shown publicly. A hidden slot projects nothing, so nothing public (visuals,
+	 * OnItemEquipped) sees it; the owner view, and what is built on it, does.
+	 */
+	TArray<FPEPEquippedItemInfo> OwnerNodes;
+	TArray<FPEPEquippedItemInfo> PublicNodes;
+	if (const IPEPItemStore* ItemStore = GetItemStoreConst())
+	{
+		CollectEquippedNodes(*ItemStore, OwnerNodes, &PublicNodes);
+	}
 
 	TMap<FPEPItemId, FPEPEquippedItemPublic> DesiredEntries;
-	const IPEPItemStore* ItemStore = GetItemStoreConst();
-	if (ItemStore)
+	DesiredEntries.Reserve(PublicNodes.Num());
+	for (const FPEPEquippedItemInfo& Node : PublicNodes)
 	{
-		for (const FPEPEquipmentSlotDefinition& Slot : GetEffectiveSlotDefinitions())
-		{
-			/* A hidden slot projects nothing, so nothing downstream (events, GMAS) sees it either. */
-			if (!Slot.IsValid() || !Slot.bShowPublicly)
-			{
-				continue;
-			}
-
-			FPEPItemId ItemId;
-			if (!ItemStore->FindItemAtLocation(
-				FPEPItemLocation::MakeNamedSlot(Slot.SlotTag),
-				ItemId))
-			{
-				continue;
-			}
-
-			const FPEPItemInstance* Item = ItemStore->FindItem(ItemId);
-			if (!Item)
-			{
-				continue;
-			}
-
-			FPEPEquippedItemPublic PublicEntry;
-			PublicEntry.ItemId = Item->ItemId;
-			PublicEntry.DefinitionId = Item->DefinitionId;
-			PublicEntry.SlotTag = Slot.SlotTag;
-			DesiredEntries.Add(PublicEntry.ItemId, PublicEntry);
-
-			TSet<FPEPItemId> VisitedItemIds;
-			VisitedItemIds.Add(PublicEntry.ItemId);
-			AppendPublicAttachmentEntries(
-				*ItemStore,
-				PublicEntry.ItemId,
-				DesiredEntries,
-				VisitedItemIds);
-		}
+		FPEPEquippedItemPublic PublicEntry;
+		PublicEntry.ItemId = Node.ItemId;
+		PublicEntry.DefinitionId = Node.DefinitionId;
+		PublicEntry.SlotTag = Node.SlotTag;
+		PublicEntry.ParentItemId = Node.ParentItemId;
+		PublicEntry.ParentSlotName = Node.ParentSlotName;
+		DesiredEntries.Add(PublicEntry.ItemId, PublicEntry);
 	}
+
+	/*
+	 * Both views are current before anything is announced, so a listener of either set of
+	 * events reads the other one already rebuilt.
+	 */
+	const bool bOwnerViewChanged = ApplyOwnerViewNodes(MoveTemp(OwnerNodes));
 
 	bool bProjectionChanged = false;
 	bool bRemovedEntry = false;
@@ -1154,24 +1317,103 @@ bool UPEPEquipmentComponent::RefreshPublicProjection()
 		}
 	}
 
-	if (!bProjectionChanged)
+	if (bProjectionChanged)
+	{
+		if (bRemovedEntry)
+		{
+			PublicEquipmentView.MarkArrayDirty();
+		}
+
+		ReconcileLocalPresentations();
+		BroadcastEquipmentItemChanges();
+		OnPublicEquipmentChanged.Broadcast();
+		if (AActor* Owner = GetOwner())
+		{
+			Owner->ForceNetUpdate();
+		}
+	}
+	/* After the public events: the owner view only adds what the projection leaves out. */
+	if (bOwnerViewChanged)
+	{
+		BroadcastOwnerItemChanges();
+		OnOwnerEquipmentChanged.Broadcast();
+	}
+	return bProjectionChanged;
+}
+
+bool UPEPEquipmentComponent::RefreshOwnerView()
+{
+	bOwnerViewDirty = false;
+	TArray<FPEPEquippedItemInfo> OwnerNodes;
+	/* Where no owner view is kept (a simulated proxy, a client that lost the pawn) it is empty. */
+	if (HasOwnerEquipmentView())
+	{
+		if (const IPEPItemStore* ItemStore = GetItemStoreConst())
+		{
+			CollectEquippedNodes(*ItemStore, OwnerNodes, nullptr);
+		}
+	}
+	if (!ApplyOwnerViewNodes(MoveTemp(OwnerNodes)))
 	{
 		return false;
 	}
+	BroadcastOwnerItemChanges();
+	OnOwnerEquipmentChanged.Broadcast();
+	return true;
+}
 
-	if (bRemovedEntry)
+bool UPEPEquipmentComponent::ApplyOwnerViewNodes(TArray<FPEPEquippedItemInfo>&& Nodes)
+{
+	/*
+	 * Compared as sets: a store may list children in another order from one walk to the next,
+	 * which is no change to announce.
+	 */
+	if (AreSameEquippedNodes(OwnerViewNodes, OwnerViewIndex, Nodes))
 	{
-		PublicEquipmentView.MarkArrayDirty();
+		return false;
 	}
-
-	ReconcileLocalPresentations();
-	BroadcastEquipmentItemChanges();
-	OnPublicEquipmentChanged.Broadcast();
-	if (AActor* Owner = GetOwner())
+	OwnerViewNodes = MoveTemp(Nodes);
+	OwnerViewIndex.Reset();
+	OwnerViewIndex.Reserve(OwnerViewNodes.Num());
+	for (int32 Index = 0; Index < OwnerViewNodes.Num(); ++Index)
 	{
-		Owner->ForceNetUpdate();
+		OwnerViewIndex.Add(OwnerViewNodes[Index].ItemId, Index);
 	}
 	return true;
+}
+
+void UPEPEquipmentComponent::BroadcastOwnerItemChanges()
+{
+	/* Same re-entrancy rule as the public events: a nested change gets its own, later pass. */
+	if (bBroadcastingOwnerItemChanges)
+	{
+		bOwnerItemChangesPending = true;
+		return;
+	}
+	TGuardValue<bool> BroadcastGuard(bBroadcastingOwnerItemChanges, true);
+	do
+	{
+		bOwnerItemChangesPending = false;
+		TArray<FPEPEquippedItemInfo> Previous = MoveTemp(AnnouncedOwnerNodes);
+		AnnouncedOwnerNodes = OwnerViewNodes;
+
+		TArray<FPEPEquipmentChange> Unequipped;
+		TArray<FPEPEquipmentChange> Equipped;
+		PEPEquipmentEvents::DiffPublicProjection(
+			Previous,
+			AnnouncedOwnerNodes,
+			Unequipped,
+			Equipped);
+		for (const FPEPEquipmentChange& Change : Unequipped)
+		{
+			OnOwnerItemUnequipped.Broadcast(Change);
+		}
+		for (const FPEPEquipmentChange& Change : Equipped)
+		{
+			OnOwnerItemEquipped.Broadcast(Change);
+		}
+	}
+	while (bOwnerItemChangesPending);
 }
 
 void UPEPEquipmentComponent::BroadcastEquipmentItemChanges()
@@ -1217,13 +1459,59 @@ void UPEPEquipmentComponent::BroadcastEquipmentItemChanges()
 	while (bEquipmentItemChangesPending);
 }
 
-void UPEPEquipmentComponent::AppendPublicAttachmentEntries(
+void UPEPEquipmentComponent::CollectEquippedNodes(
+	const IPEPItemStore& ItemStore,
+	TArray<FPEPEquippedItemInfo>& OutOwnerNodes,
+	TArray<FPEPEquippedItemInfo>* OutPublicNodes) const
+{
+	TSet<FPEPItemId> VisitedItemIds;
+	for (const FPEPEquipmentSlotDefinition& Slot : GetEffectiveSlotDefinitions())
+	{
+		if (!Slot.IsValid())
+		{
+			continue;
+		}
+
+		FPEPItemId ItemId;
+		if (!ItemStore.FindItemAtLocation(FPEPItemLocation::MakeNamedSlot(Slot.SlotTag), ItemId))
+		{
+			continue;
+		}
+		const FPEPItemInstance* Item = ItemStore.FindItem(ItemId);
+		if (!Item || !Item->ItemId.IsValid() || VisitedItemIds.Contains(Item->ItemId))
+		{
+			continue;
+		}
+
+		const int32 FirstNodeIndex = OutOwnerNodes.Num();
+		VisitedItemIds.Add(Item->ItemId);
+		FPEPEquippedItemInfo& Root = OutOwnerNodes.AddDefaulted_GetRef();
+		Root.ItemId = Item->ItemId;
+		Root.DefinitionId = Item->DefinitionId;
+		Root.SlotTag = Slot.SlotTag;
+		AppendAttachmentNodes(ItemStore, Item->ItemId, OutOwnerNodes, VisitedItemIds);
+
+		if (OutPublicNodes && Slot.bShowPublicly)
+		{
+			for (int32 Index = FirstNodeIndex; Index < OutOwnerNodes.Num(); ++Index)
+			{
+				OutPublicNodes->Add(OutOwnerNodes[Index]);
+			}
+		}
+	}
+}
+
+void UPEPEquipmentComponent::AppendAttachmentNodes(
 	const IPEPItemStore& ItemStore,
 	const FPEPItemId ParentItemId,
-	TMap<FPEPItemId, FPEPEquippedItemPublic>& OutEntries,
+	TArray<FPEPEquippedItemInfo>& OutNodes,
 	TSet<FPEPItemId>& VisitedItemIds) const
 {
-	/* Which children are public is the store's knowledge, not a container vocabulary read here. */
+	/*
+	 * Which children are shown is the store's knowledge, not a container vocabulary read here.
+	 * The owner view follows the same rule as the projection: an attachment, never the private
+	 * content of a container, which is an inventory's business.
+	 */
 	TArray<FPEPItemId> ChildItemIds;
 	ItemStore.GetPublicChildren(ParentItemId, ChildItemIds);
 	for (const FPEPItemId ChildItemId : ChildItemIds)
@@ -1244,19 +1532,24 @@ void UPEPEquipmentComponent::AppendPublicAttachmentEntries(
 		}
 
 		VisitedItemIds.Add(ChildItemId);
-		FPEPEquippedItemPublic ChildEntry;
-		ChildEntry.ItemId = ChildItemId;
-		ChildEntry.DefinitionId = ChildItem->DefinitionId;
-		ChildEntry.ParentItemId = ParentItemId;
-		ChildEntry.ParentSlotName = ChildLocation.ContainerSlotName;
-		OutEntries.Add(ChildItemId, ChildEntry);
+		/* Copied out before recursing: the recursion grows OutNodes and may move its storage. */
+		FPEPEquippedItemInfo ChildNode;
+		ChildNode.ItemId = ChildItemId;
+		ChildNode.DefinitionId = ChildItem->DefinitionId;
+		ChildNode.ParentItemId = ParentItemId;
+		ChildNode.ParentSlotName = ChildLocation.ContainerSlotName;
+		OutNodes.Add(ChildNode);
 
-		AppendPublicAttachmentEntries(
-			ItemStore,
-			ChildItemId,
-			OutEntries,
-			VisitedItemIds);
+		AppendAttachmentNodes(ItemStore, ChildItemId, OutNodes, VisitedItemIds);
 	}
+}
+
+const FPEPEquippedItemInfo* UPEPEquipmentComponent::FindOwnerViewNode(const FPEPItemId ItemId) const
+{
+	const int32* Index = ItemId.IsValid() ? OwnerViewIndex.Find(ItemId) : nullptr;
+	return Index && OwnerViewNodes.IsValidIndex(*Index) && OwnerViewNodes[*Index].ItemId == ItemId
+		? &OwnerViewNodes[*Index]
+		: nullptr;
 }
 
 const FPEPEquippedItemPublic* UPEPEquipmentComponent::FindPublicEntry(const FPEPItemId ItemId) const
@@ -1424,6 +1717,95 @@ EPEPEquipmentHand UPEPEquipmentComponent::GetSlotHand(const FGameplayTag SlotTag
 	return Slot ? Slot->Hand : EPEPEquipmentHand::None;
 }
 
+TArray<FGameplayTag> UPEPEquipmentComponent::GetEquipmentSlotTags() const
+{
+	TArray<FGameplayTag> SlotTags;
+	for (const FPEPEquipmentSlotDefinition& Slot : GetEffectiveSlotDefinitions())
+	{
+		if (Slot.IsValid())
+		{
+			SlotTags.AddUnique(Slot.SlotTag);
+		}
+	}
+	return SlotTags;
+}
+
+bool UPEPEquipmentComponent::FindEquipmentSlotDefinition(
+	const FGameplayTag SlotTag,
+	FPEPEquipmentSlotDefinition& OutSlot) const
+{
+	const FPEPEquipmentSlotDefinition* Slot = SlotTag.IsValid() ? FindSlotDefinition(SlotTag) : nullptr;
+	OutSlot = Slot ? *Slot : FPEPEquipmentSlotDefinition();
+	return Slot != nullptr;
+}
+
+bool UPEPEquipmentComponent::HasOwnerEquipmentView() const
+{
+	const AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return false;
+	}
+	if (Owner->HasAuthority())
+	{
+		return true;
+	}
+	/*
+	 * The owning client holds the full store (owner-only replication) and so can compute every
+	 * equipped item. By role, and by net owner as well: right after possession the owner can be
+	 * known before the autonomous role lands.
+	 */
+	return Owner->GetLocalRole() == ROLE_AutonomousProxy || Owner->HasLocalNetOwner();
+}
+
+TArray<FPEPEquippedItemInfo> UPEPEquipmentComponent::GetOwnerEquipmentNodes() const
+{
+	return OwnerViewNodes;
+}
+
+bool UPEPEquipmentComponent::FindOwnerEquipmentNode(
+	const FPEPItemId ItemId,
+	FPEPEquippedItemInfo& OutNode) const
+{
+	const FPEPEquippedItemInfo* Node = FindOwnerViewNode(ItemId);
+	OutNode = Node ? *Node : FPEPEquippedItemInfo();
+	return Node != nullptr;
+}
+
+bool UPEPEquipmentComponent::FindEquippedRootInSlot(
+	const FGameplayTag SlotTag,
+	FPEPEquippedItemInfo& OutNode) const
+{
+	OutNode = FPEPEquippedItemInfo();
+	if (!SlotTag.IsValid())
+	{
+		return false;
+	}
+	/*
+	 * Strictly one view per machine: mixing them would show a slot the owner just emptied, still
+	 * occupied in a projection that has not caught up yet.
+	 */
+	if (HasOwnerEquipmentView())
+	{
+		const FPEPEquippedItemInfo* Root = OwnerViewNodes.FindByPredicate(
+			[SlotTag](const FPEPEquippedItemInfo& Node)
+			{
+				return !Node.IsAttachment() && Node.SlotTag == SlotTag;
+			});
+		if (Root)
+		{
+			OutNode = *Root;
+		}
+		return Root != nullptr;
+	}
+	if (const FPEPEquippedItemPublic* Root = FindPublicRootInSlot(SlotTag))
+	{
+		OutNode = Root->ToInfo();
+		return true;
+	}
+	return false;
+}
+
 EPEPRequestResult UPEPEquipmentComponent::RequestEquipItem(
 	const FPEPItemId ItemId,
 	const FGameplayTag SlotTag,
@@ -1433,7 +1815,7 @@ EPEPRequestResult UPEPEquipmentComponent::RequestEquipItem(
 	AActor* Owner = GetOwner();
 	IPEPItemStore* ItemStore = GetItemStore();
 	if (!Owner || !ItemStore || !ItemId.IsValid() || !FindSlotDefinition(SlotTag)
-		|| !ItemStore->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Equip))
+		|| !HasEquipAccess(*ItemStore, ItemId))
 	{
 		return EPEPRequestResult::Failed;
 	}
@@ -1462,7 +1844,7 @@ FPEPItemResult UPEPEquipmentComponent::PreviewEquipItem(
 {
 	const IPEPItemStore* ItemStore = GetItemStoreConst();
 	if (!ItemStore || !ItemId.IsValid() || !FindSlotDefinition(SlotTag)
-		|| !ItemStore->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Equip))
+		|| !HasEquipAccess(*ItemStore, ItemId))
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
 	}
@@ -1498,7 +1880,7 @@ FPEPItemResult UPEPEquipmentComponent::ExecuteEquipItem(
 {
 	IPEPItemStore* ItemStore = GetItemStore();
 	if (!ItemStore || !ItemId.IsValid() || !FindSlotDefinition(SlotTag)
-		|| !ItemStore->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Equip))
+		|| !HasEquipAccess(*ItemStore, ItemId))
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
 	}
@@ -1798,11 +2180,7 @@ void UPEPEquipmentComponent::ResolveEquipRequest(
 
 void UPEPEquipmentComponent::FlushDeferredUpdates()
 {
-	if (bPublicProjectionDirty)
-	{
-		/* Reconciles the visuals itself when the projection changed. */
-		RefreshPublicProjection();
-	}
+	RefreshDirtyEquipmentViews();
 	if (bLocalPresentationReconcilePending)
 	{
 		ReconcileLocalPresentations();
@@ -1866,6 +2244,17 @@ void UPEPEquipmentComponent::HandlePublicEquipmentReplicated()
 	 */
 	BroadcastEquipmentItemChanges();
 	OnPublicEquipmentChanged.Broadcast();
+
+	/*
+	 * The owning client's owner view follows its store copy's events. The server's projection
+	 * moving says that copy probably moved too, which keeps the view current even behind a store
+	 * that raises nothing on its replicated copy. Folded into the next tick, like a store event.
+	 */
+	if (HasOwnerEquipmentView() && !bOwnerViewDirty)
+	{
+		bOwnerViewDirty = true;
+		ScheduleDeferredUpdates();
+	}
 }
 
 bool UPEPEquipmentComponent::FindLocalPresentationTarget(

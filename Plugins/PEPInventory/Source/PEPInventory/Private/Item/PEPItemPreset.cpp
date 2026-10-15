@@ -4,6 +4,7 @@
 #include "Item/PEPItemDefinition.h"
 #include "Item/Internal/PEPItemMutableAccess.h"
 #include "Item/PEPItemInstanceLibrary.h"
+#include "Inventory/PEPInventoryGrid.h"
 #include "Inventory/PEPInventorySettings.h"
 #include "Item/Fragments/PEPItemFragment_InventoryShape.h"
 #include "Item/PEPItemStateFragment.h"
@@ -167,7 +168,7 @@ namespace PEPItemPresetPrivate
 		{
 			FPEPItemInstanceTreeEntry& Entry = OutTree.Children.AddDefaulted_GetRef();
 			Entry.Item = MoveTemp(Item);
-			Entry.Location = FPEPItemLocation::MakeItemContainer(
+			Entry.Location = PEPInventoryGrid::MakeGridLocation(
 				ParentItemId,
 				ParentSlotName,
 				GridPosition,
@@ -345,7 +346,7 @@ namespace PEPItemPresetPrivate
 						*Preset.GetName(),
 						*Child.ItemDefinition->GetName()));
 				}
-				ChildEntry.Location = FPEPItemLocation::MakeItemContainer(
+				ChildEntry.Location = PEPInventoryGrid::MakeGridLocation(
 					NewItemId,
 					Child.ContainerSlotName,
 					EffectivePosition,

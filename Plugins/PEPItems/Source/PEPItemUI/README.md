@@ -24,17 +24,15 @@ Le snapshot courant se lit par `GetViewData()` (Blueprint Pure); la propriété 
 
 `BuildItemViewData` retourne des données de présentation et ne modifie jamais l’instance. Il ne charge pas la définition : si elle n’est pas déjà en mémoire, le helper renvoie `false`. `bHasStack` n’est vrai que si l’item est stackable et porte un état de stack valide. Le propriétaire doit charger cette définition de façon asynchrone puis rappeler `SetItemInstance`. Une fois les données de présentation disponibles, le widget charge lui-même l’icône soft de façon asynchrone. Les autres champs de définition sont accessibles via les requêtes d’ItemCore.
 
-## Drag & drop générique
+## Drag & drop
 
-`FPEPItemDragData` est un payload Blueprint destiné à être stocké dans un `DragDropOperation`. Au démarrage du drag, renseigner l’item, sa localisation source, le décalage de saisie dans la grille et l’orientation de prévisualisation.
-
-Ce payload ne démarre pas le drag, ne calcule pas une destination, ne valide pas un drop et ne mute pas l’inventaire. La source UI garde son contexte de store/session. L’UI destinataire porte la règle métier : placement dans `PEPInventoryUI`, filtre de slot dans `PEPEquipmentUI`.
+`PEPItemUI` ne fournit pas de payload de drag : l’ancien `FPEPItemDragData`, inutilisé, a été supprimé avec la sortie de la grille d’ItemCore (une cellule et une orientation n’ont de sens que dans une grille d’inventaire). Le `DragDropOperation` du projet porte lui-même l’item glissé, son contexte source et son orientation de prévisualisation. L’UI destinataire porte la règle métier : placement dans `PEPInventoryUI`, filtre de slot dans `PEPEquipmentUI`.
 
 ## Exemple d’intégration
 
 1. Créer un `WBP_PEPItemView` ou un Blueprint enfant dans le projet hôte.
 2. À partir de l’instance lue dans le store, appeler `SetItemInstance` sur le widget.
 3. Réutiliser ce widget dans une grille, une liste, un panneau de détail ou une prévisualisation de drag.
-4. Pour permettre le drag, ajouter le workflow de la UI source et transmettre `FPEPItemDragData`; ne pas confier la mutation à `PEPItemUI`.
+4. Pour permettre le drag, ajouter le workflow de la UI source (voir `PEPInventoryUI`); ne pas confier la mutation à `PEPItemUI`.
 
 Les widgets de conteneur, fenêtres d’inventaire et sessions de transfert restent dans `PEPInventoryUI`.

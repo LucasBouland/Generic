@@ -36,7 +36,7 @@ namespace
 		Mount.SlotName = MountName;
 		Mount.Mode = EPEPContainerSlotMode::Single;
 		Mount.Purpose = EPEPContainerSlotPurpose::Attachment;
-		Mount.RequiredItemTags.AddTag(PEPItemTags::Item_Type_Magazine);
+		Mount.RequiredItemTags.AddTag(PEPInventoryTest::Test_Inventory_Item_Magazine);
 
 		FPEPItemFragment_Container Container;
 		Container.Slots.Add(Grid);
@@ -62,7 +62,7 @@ bool FPEPInventorySaveExportRoundTripsTest::RunTest(const FString&)
 	UPEPItemDefinition* AmmoDef = Source.MakeStackableDefinition(TEXT("SaveAmmoDef"), 60);
 	UPEPItemDefinition* ToolDef = Source.MakeShapedDefinition(TEXT("SaveToolDef"), FIntPoint(2, 1));
 	UPEPItemDefinition* MagazineDef = Source.MakeShapedDefinition(TEXT("SaveMagazineDef"), FIntPoint(1, 1));
-	MagazineDef->OwnedTags.AddTag(PEPItemTags::Item_Type_Magazine);
+	MagazineDef->OwnedTags.AddTag(PEPInventoryTest::Test_Inventory_Item_Magazine);
 
 	const FPEPItemInstance Rig = FFixture::MakeItem(RigDef);
 	const FPEPItemId RigId = Rig.ItemId;
@@ -76,8 +76,8 @@ bool FPEPInventorySaveExportRoundTripsTest::RunTest(const FString&)
 	const FPEPItemInstance Tool = FFixture::MakeItem(ToolDef);
 	const FPEPItemInstance Magazine = FFixture::MakeItem(MagazineDef);
 
-	const FPEPItemLocation AmmoAt = FPEPItemLocation::MakeItemContainer(RigId, GridName, FIntPoint(0, 0));
-	const FPEPItemLocation ToolAt = FPEPItemLocation::MakeItemContainer(RigId, GridName, FIntPoint(1, 1), true);
+	const FPEPItemLocation AmmoAt = PEPInventoryGrid::MakeGridLocation(RigId, GridName, FIntPoint(0, 0));
+	const FPEPItemLocation ToolAt = PEPInventoryGrid::MakeGridLocation(RigId, GridName, FIntPoint(1, 1), true);
 	const FPEPItemLocation MagazineAt = FPEPItemLocation::MakeItemContainer(RigId, MountName);
 
 	if (!TestTrue(TEXT("the ammo is stored"),
@@ -198,8 +198,8 @@ bool FPEPInventorySaveGameArchiveRoundTripsTest::RunTest(const FString&)
 	FPEPItemInstance Ammo = FFixture::MakeItem(AmmoDef);
 	TestTrue(TEXT("the ammo stack holds seven"), PEPItemMutation::SetStackCount(Ammo, 7).bSuccess);
 	const FPEPItemInstance Tool = FFixture::MakeItem(ToolDef);
-	const FPEPItemLocation AmmoAt = FPEPItemLocation::MakeItemContainer(RigId, GridName, FIntPoint(0, 0));
-	const FPEPItemLocation ToolAt = FPEPItemLocation::MakeItemContainer(RigId, GridName, FIntPoint(1, 1), true);
+	const FPEPItemLocation AmmoAt = PEPInventoryGrid::MakeGridLocation(RigId, GridName, FIntPoint(0, 0));
+	const FPEPItemLocation ToolAt = PEPInventoryGrid::MakeGridLocation(RigId, GridName, FIntPoint(1, 1), true);
 	if (!TestTrue(TEXT("the ammo is stored"),
 			Source.Inventory->AddItem(Ammo, AmmoAt, FPEPItemAccessContext::System()).bSuccess)
 		|| !TestTrue(TEXT("the tool is stored rotated"),
@@ -239,6 +239,37 @@ bool FPEPInventorySaveGameArchiveRoundTripsTest::RunTest(const FString&)
 			Loaded[0].Tree.Children[Index].Location == Placements[0].Tree.Children[Index].Location);
 	}
 
+	/*
+	 * Location equality would also hold if both sides had lost the placement, so the rotated tool
+	 * is read back field by field: the grid placement is an instanced struct inside the location,
+	 * and only its SaveGame fields cross an ArIsSaveGame archive.
+	 */
+	const FPEPItemInstanceTreeEntry* LoadedTool = Loaded[0].Tree.Children.FindByPredicate(
+		[&Tool](const FPEPItemInstanceTreeEntry& Child)
+		{
+			return Child.Item.ItemId == Tool.ItemId;
+		});
+	if (TestNotNull(TEXT("the rotated tool is in the archive"), LoadedTool))
+	{
+		const FPEPGridPlacement* LoadedCell = PEPInventoryGrid::FindGridPlacement(LoadedTool->Location);
+		if (TestNotNull(TEXT("the tool keeps a grid placement"), LoadedCell))
+		{
+			TestEqual(TEXT("the tool keeps its cell"), LoadedCell->Position, FIntPoint(1, 1));
+			TestTrue(TEXT("the tool stays rotated"), LoadedCell->bRotated);
+		}
+		TestTrue(TEXT("the tool keeps its whole location"), LoadedTool->Location == ToolAt);
+	}
+	const FPEPItemInstanceTreeEntry* LoadedAmmo = Loaded[0].Tree.Children.FindByPredicate(
+		[&Ammo](const FPEPItemInstanceTreeEntry& Child)
+		{
+			return Child.Item.ItemId == Ammo.ItemId;
+		});
+	if (TestNotNull(TEXT("the ammo is in the archive"), LoadedAmmo))
+	{
+		TestFalse(TEXT("the origin stays spelled as no placement"), LoadedAmmo->Location.Placement.IsValid());
+		TestTrue(TEXT("the ammo keeps its whole location"), LoadedAmmo->Location == AmmoAt);
+	}
+
 	/* Unlock again so the restore exercises the ordinary path rather than the lock policy. */
 	FPEPItemMutableAccess::FindOrAddState<FPEPItemState_ContainerRuntime>(Loaded[0].Tree.RootItem).bLocked = false;
 
@@ -256,6 +287,10 @@ bool FPEPInventorySaveGameArchiveRoundTripsTest::RunTest(const FString&)
 		PEPItemQuery::GetStackData(*RestoredAmmo, StackData);
 		TestEqual(TEXT("the stack count survived the archive"), StackData.Count, 7);
 	}
+
+	FPEPItemLocation RestoredToolAt;
+	TestTrue(TEXT("the restored tool sits where it was saved, still rotated"),
+		Restored.Inventory->FindItemLocation(Tool.ItemId, RestoredToolAt) && RestoredToolAt == ToolAt);
 
 	return true;
 }

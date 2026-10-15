@@ -68,6 +68,26 @@ TArray<int32> UPEPEquipmentAbilityBridgeComponent::GetAppliedEffectIds(const FPE
 	return Applied ? Applied->EffectIds : TArray<int32>();
 }
 
+void UPEPEquipmentAbilityBridgeComponent::GatherGrantSourceChanges(
+	const UPEPEquipmentComponent& Equipment,
+	TArray<FPEPEquipmentChange>& OutChanges)
+{
+	/* Diffing from nothing yields the owner view as an ordered list of Equipped changes. */
+	TArray<FPEPEquipmentChange> Unused;
+	PEPEquipmentEvents::DiffPublicProjection(
+		TArray<FPEPEquippedItemInfo>(),
+		Equipment.GetOwnerEquipmentNodes(),
+		Unused,
+		OutChanges);
+}
+
+bool UPEPEquipmentAbilityBridgeComponent::DoesChangeGrant(
+	const FPEPItemFragment_EquipmentAbilities* Fragment,
+	const FPEPEquipmentChange& Change)
+{
+	return Fragment && Fragment->AppliesTo(Change.RootSlotTag, Change.Node.IsAttachment());
+}
+
 UGMC_AbilitySystemComponent* UPEPEquipmentAbilityBridgeComponent::ResolveAbilitySystem() const
 {
 	if (UGMC_AbilitySystemComponent* Cached = CachedAbilitySystem.Get())
@@ -140,10 +160,14 @@ void UPEPEquipmentAbilityBridgeComponent::BeginPlay()
 		return;
 	}
 
-	EquipmentComponent->OnItemEquipped.AddDynamic(
+	/*
+	 * The owner view, not the public projection: a slot hidden from other players still grants.
+	 * Both are raised only where the owner view is kept, the authority and the owning client.
+	 */
+	EquipmentComponent->OnOwnerItemEquipped.AddDynamic(
 		this,
 		&UPEPEquipmentAbilityBridgeComponent::HandleItemEquipped);
-	EquipmentComponent->OnItemUnequipped.AddDynamic(
+	EquipmentComponent->OnOwnerItemUnequipped.AddDynamic(
 		this,
 		&UPEPEquipmentAbilityBridgeComponent::HandleItemUnequipped);
 	if (APawn* Pawn = Cast<APawn>(GetOwner()))
@@ -159,10 +183,10 @@ void UPEPEquipmentAbilityBridgeComponent::EndPlay(const EEndPlayReason::Type End
 {
 	if (UPEPEquipmentComponent* EquipmentComponent = CachedEquipment.Get())
 	{
-		EquipmentComponent->OnItemEquipped.RemoveDynamic(
+		EquipmentComponent->OnOwnerItemEquipped.RemoveDynamic(
 			this,
 			&UPEPEquipmentAbilityBridgeComponent::HandleItemEquipped);
-		EquipmentComponent->OnItemUnequipped.RemoveDynamic(
+		EquipmentComponent->OnOwnerItemUnequipped.RemoveDynamic(
 			this,
 			&UPEPEquipmentAbilityBridgeComponent::HandleItemUnequipped);
 	}
@@ -245,14 +269,8 @@ void UPEPEquipmentAbilityBridgeComponent::ReconcileWithProjection()
 		return;
 	}
 
-	/* Diffing from nothing yields the projection as an ordered list of Equipped changes. */
-	TArray<FPEPEquipmentChange> Unused;
 	TArray<FPEPEquipmentChange> Desired;
-	PEPEquipmentEvents::DiffPublicProjection(
-		TArray<FPEPEquippedItemInfo>(),
-		EquipmentComponent->GetPublicPresentationNodes(),
-		Unused,
-		Desired);
+	GatherGrantSourceChanges(*EquipmentComponent, Desired);
 
 	TArray<FPEPItemId> Stale;
 	for (const TPair<FPEPItemId, FAppliedEquipment>& Pair : AppliedItems)
@@ -279,7 +297,7 @@ void UPEPEquipmentAbilityBridgeComponent::ReconcileWithProjection()
 
 void UPEPEquipmentAbilityBridgeComponent::HandleItemEquipped(const FPEPEquipmentChange& Change)
 {
-	/* Before the initial sync, the projection that sync reads already contains this change. */
+	/* Before the initial sync, the owner view that sync reads already contains this change. */
 	if (IsReadyToApply())
 	{
 		ApplyChange(Change);
@@ -333,12 +351,12 @@ void UPEPEquipmentAbilityBridgeComponent::ApplyChange(const FPEPEquipmentChange&
 
 	if (!ResolveLoadedDefinition(Node.DefinitionId))
 	{
-		/* Clients receive only the DefinitionId; the grant waits for the asset, never stalls on it. */
+		/* A view carries only the DefinitionId; the grant waits for the asset, never stalls on it. */
 		RequestDefinitionLoad(Node.DefinitionId);
 		return;
 	}
 	const FPEPItemFragment_EquipmentAbilities* Fragment = FindLoadedFragment(Node.DefinitionId);
-	if (!Fragment || !Fragment->AppliesTo(Change.RootSlotTag, Node.IsAttachment()))
+	if (!DoesChangeGrant(Fragment, Change))
 	{
 		return;
 	}
@@ -498,7 +516,7 @@ void UPEPEquipmentAbilityBridgeComponent::RequestDefinitionLoad(const FPrimaryAs
 			DefinitionLoadHandles.Remove(DefinitionId);
 			if (ResolveLoadedDefinition(DefinitionId))
 			{
-				/* The item may have moved or gone while loading: ask the projection, not the past. */
+				/* The item may have moved or gone while loading: ask the owner view, not the past. */
 				ReconcileWithProjection();
 			}
 			else

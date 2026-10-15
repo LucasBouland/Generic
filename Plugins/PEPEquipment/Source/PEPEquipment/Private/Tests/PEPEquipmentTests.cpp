@@ -5,6 +5,7 @@
 #include "Components/PEPEquipmentComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Core/PEPCoreTags.h"
 #include "Engine/Engine.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
@@ -22,11 +23,26 @@
 #if WITH_EDITOR
 #include "Misc/DataValidation.h"
 #endif
+#include "NativeGameplayTags.h"
 #include "StructUtils/InstancedStruct.h"
 #include "Tests/PEPTestItemStoreComponent.h"
+#include "UObject/UnrealType.h"
 
 namespace PEPEquipmentTest
 {
+	/* Test-only gameplay access: Equipment declares no access vocabulary of its own. */
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(Access_Reach, "Test.Equipment.Access.Reach");
+
+	/** The access filters are designer settings with no setter; tests reach them by reflection. */
+	FGameplayTagContainer* FindAccessTags(UPEPEquipmentComponent* Equipment, const FName PropertyName)
+	{
+		const FStructProperty* Property =
+			FindFProperty<FStructProperty>(UPEPEquipmentComponent::StaticClass(), PropertyName);
+		return Equipment && Property && Property->Struct == FGameplayTagContainer::StaticStruct()
+			? Property->ContainerPtrToValuePtr<FGameplayTagContainer>(Equipment)
+			: nullptr;
+	}
+
 	struct FFixture
 	{
 		UWorld* World = nullptr;
@@ -507,8 +523,8 @@ bool FPEPEquipmentProfileTargetSchemaTest::RunTest(const FString& Parameters)
 	FDataValidationContext HiddenContext;
 	TestTrue(TEXT("a slot hidden from the projection is legitimate"),
 		HiddenSlotProfile->IsDataValid(HiddenContext) != EDataValidationResult::Invalid);
-	TestEqual(TEXT("but warns that it raises no event and grants nothing"),
-		HiddenContext.GetNumWarnings(), 1u);
+	TestEqual(TEXT("and raises no warning: its occupant still grants through the owner view"),
+		HiddenContext.GetNumWarnings(), 0u);
 	return true;
 }
 #endif
@@ -722,7 +738,21 @@ bool FPEPEquipmentTemporaryPresentationGuardTest::RunTest(const FString& Paramet
 
 	Fixture.Equipment->RequestHideTemporaryItemPresentation(TEXT("K3"));
 	Fixture.Store->DeniedGameplayAccess.Add(Pocketed[0]);
-	TestFalse(TEXT("an item out of reach for every gameplay action is refused"),
+	TestTrue(TEXT("with no access tag (the default) any item of the store qualifies"),
+		Show(Pocketed[0], TEXT("K6")));
+	Fixture.Equipment->RequestHideTemporaryItemPresentation(TEXT("K6"));
+
+	FGameplayTagContainer* AccessTags = PEPEquipmentTest::FindAccessTags(
+		Fixture.Equipment,
+		TEXT("TemporaryPresentationAccessTags"));
+	TestNotNull(TEXT("the temporary presentation access filter exists"), AccessTags);
+	if (!AccessTags)
+	{
+		return false;
+	}
+	TestTrue(TEXT("the access filter is empty by default"), AccessTags->IsEmpty());
+	AccessTags->AddTag(PEPEquipmentTest::Access_Reach);
+	TestFalse(TEXT("an item out of reach for every configured access is refused"),
 		Show(Pocketed[0], TEXT("K6")));
 	FPEPItemId Foreign;
 	Foreign.Value = 987654;
@@ -784,6 +814,51 @@ bool FPEPEquipmentPresentationWaitsForBeginPlayTest::RunTest(const FString& Para
 	FPEPEquippedItemInfo Node;
 	TestTrue(TEXT("the projection includes the item equipped before BeginPlay"),
 		Fixture.Equipment->FindPublicPresentationNode(ItemId, Node));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentEquipAccessTagsTest,
+	"PEP.Equipment.Request.EquipAccessTagsGateRequestsOnlyWhenSet",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentEquipAccessTagsTest::RunTest(const FString& Parameters)
+{
+	FFixture Fixture;
+	UPEPItemDefinition* Definition = Fixture.MakeDefinition(
+		TEXT("EquipmentEquipAccess"),
+		FPEPEquipmentPresentationFragment());
+	FPEPItemInstance Pistol = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	const FPEPItemId PistolId = Pistol.ItemId;
+	TestTrue(TEXT("the pistol sits on the belt"), Fixture.Add(
+		Pistol,
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Belt)));
+	Fixture.Store->DeniedGameplayAccess.Add(PistolId);
+
+	const FGameplayTag Hand = PEPEquipmentTags::Equipment_Slot_Hand_Right;
+	TestTrue(TEXT("with no equip access tag (the default) the store's own rules decide"),
+		Fixture.Equipment->PreviewEquipItem(PistolId, Hand).bSuccess);
+
+	FGameplayTagContainer* AccessTags =
+		PEPEquipmentTest::FindAccessTags(Fixture.Equipment, TEXT("EquipAccessTags"));
+	TestNotNull(TEXT("the equip access filter exists"), AccessTags);
+	if (!AccessTags)
+	{
+		return false;
+	}
+	AccessTags->AddTag(PEPEquipmentTest::Access_Reach);
+	const FPEPItemResult Preview = Fixture.Equipment->PreviewEquipItem(PistolId, Hand);
+	TestTrue(TEXT("an item the store grants none of the accesses is refused in preview"),
+		!Preview.bSuccess && Preview.ReasonTag == PEPCoreTags::Reason_InvalidTarget);
+	int32 RequestId = 0;
+	TestEqual(TEXT("and as a request"),
+		static_cast<int32>(Fixture.Equipment->RequestEquipItem(PistolId, Hand, RequestId)),
+		static_cast<int32>(EPEPRequestResult::Failed));
+
+	Fixture.Store->DeniedGameplayAccess.Remove(PistolId);
+	TestEqual(TEXT("once the store grants the access, the equip executes"),
+		static_cast<int32>(Fixture.Equipment->RequestEquipItem(PistolId, Hand, RequestId)),
+		static_cast<int32>(EPEPRequestResult::Executed));
 	return true;
 }
 

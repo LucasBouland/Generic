@@ -35,7 +35,7 @@ namespace
 		const int32 Y,
 		const bool bRotated = false)
 	{
-		return FPEPItemLocation::MakeItemContainer(
+		return PEPInventoryGrid::MakeGridLocation(
 			ParentItemId, SlotName, FIntPoint(X, Y), bRotated);
 	}
 
@@ -835,7 +835,8 @@ bool FPEPInventoryAutoPlacementTest::RunTest(const FString&)
 	Fixture.Inventory->FindItemLocation(SecondId, SecondPlaced);
 
 	TestTrue(TEXT("the two pickups occupy different cells"),
-		SecondPlaced.GridPosition != Placed.GridPosition);
+		PEPInventoryGrid::GetGridPlacement(SecondPlaced).Position
+			!= PEPInventoryGrid::GetGridPlacement(Placed).Position);
 
 	TestEqual(TEXT("rig plus two trinkets are stored"),
 		Fixture.Inventory->GetInventoryView().Entries.Num(), 3);
@@ -1742,7 +1743,7 @@ bool FPEPInventoryMultiTreeRestoreTest::RunTest(const FString&)
 		Fixture.MakeShapedDefinition(TEXT("RestoreSmallDef"), FIntPoint(1, 1));
 
 	/* One root slot is claimed by the fixture; a second stands in for another equipment slot. */
-	const FGameplayTag SecondSlotTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+	const FGameplayTag SecondSlotTag = FFixture::SecondarySlotTag();
 	Fixture.Inventory->RegisterLocationValidator(
 		SecondSlotTag,
 		FPEPItemLocationValidator::CreateLambda(
@@ -1823,7 +1824,7 @@ bool FPEPInventoryLoadoutTest::RunTest(const FString&)
 	UPEPItemDefinition* SmallDef =
 		Fixture.MakeShapedDefinition(TEXT("LoadoutSmallDef"), FIntPoint(1, 1));
 
-	const FGameplayTag SecondSlotTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+	const FGameplayTag SecondSlotTag = FFixture::SecondarySlotTag();
 	Fixture.Inventory->RegisterLocationValidator(
 		SecondSlotTag,
 		FPEPItemLocationValidator::CreateLambda(
@@ -2424,7 +2425,7 @@ bool FPEPInventoryMoveInvalidatesOccupancyTest::RunTest(const FString&)
 	UPEPItemDefinition* SmallDef =
 		Fixture.MakeShapedDefinition(TEXT("OccupancySmallDef"), FIntPoint(1, 1));
 
-	const FGameplayTag SecondSlotTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+	const FGameplayTag SecondSlotTag = FFixture::SecondarySlotTag();
 	Fixture.Inventory->RegisterLocationValidator(
 		SecondSlotTag,
 		FPEPItemLocationValidator::CreateLambda(
@@ -2498,7 +2499,7 @@ bool FPEPInventoryCrossSlotSwapTest::RunTest(const FString&)
 	UPEPItemDefinition* SmallDef =
 		Fixture.MakeShapedDefinition(TEXT("CrossSwapSmallDef"), FIntPoint(1, 1));
 
-	const FGameplayTag SecondSlotTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+	const FGameplayTag SecondSlotTag = FFixture::SecondarySlotTag();
 	Fixture.Inventory->RegisterLocationValidator(
 		SecondSlotTag,
 		FPEPItemLocationValidator::CreateLambda(
@@ -2749,7 +2750,7 @@ bool FPEPInventoryPruneDeadRootTest::RunTest(const FString&)
 	FPEPItemId KeeperId;
 	FPEPItemInstanceTree Keeper = MakeLeafTree(SmallDef, KeeperId);
 
-	const FGameplayTag SecondSlotTag = PEPItemTags::Item_Slot_Content_QuickAccess;
+	const FGameplayTag SecondSlotTag = FFixture::SecondarySlotTag();
 	Fixture.Inventory->RegisterLocationValidator(
 		SecondSlotTag,
 		FPEPItemLocationValidator::CreateLambda(
@@ -3123,8 +3124,8 @@ bool FPEPInventoryGrantedGameplayAccessTest::RunTest(const FString&)
 	};
 
 	FGameplayTagContainer EquipAndReload;
-	EquipAndReload.AddTag(PEPItemTags::GameplayAccess_Equip);
-	EquipAndReload.AddTag(PEPItemTags::GameplayAccess_Reload);
+	EquipAndReload.AddTag(PEPInventoryTags::Inventory_GameplayAccess_Equip);
+	EquipAndReload.AddTag(PEPInventoryTest::Test_Inventory_GameplayAccess_Reload);
 	const FGameplayTagContainer NoAccess;
 	UPEPItemDefinition* BackpackDefinition =
 		MakeContainer(TEXT("GameplayAccessBackpack"), NoAccess);
@@ -3154,15 +3155,15 @@ bool FPEPInventoryGrantedGameplayAccessTest::RunTest(const FString&)
 
 	TestFalse(
 		TEXT("a granting rig cannot bypass a non-granting backpack ancestor"),
-		Fixture.Inventory->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Equip));
+		Fixture.Inventory->HasGrantedGameplayAccess(ItemId, PEPInventoryTags::Inventory_GameplayAccess_Equip));
 	TestTrue(
 		TEXT("a root item requires no container grant"),
 		Fixture.Inventory->HasGrantedGameplayAccess(
 			BackpackId,
-			PEPItemTags::GameplayAccess_Equip));
+			PEPInventoryTags::Inventory_GameplayAccess_Equip));
 
 	Fixture.Inventory->RegisterLocationValidator(
-		PEPItemTags::Item_Slot_Content_QuickAccess,
+		FFixture::SecondarySlotTag(),
 		FPEPItemLocationValidator::CreateLambda(
 			[](const FPEPItemInstance& Candidate, const FPEPItemLocation&)
 			{
@@ -3170,15 +3171,15 @@ bool FPEPInventoryGrantedGameplayAccessTest::RunTest(const FString&)
 			}), /*bAllowAutoPlacement*/ true);
 	const FPEPItemResult MoveRig = Fixture.Inventory->MoveItem(
 		RigId,
-		FPEPItemLocation::MakeNamedSlot(PEPItemTags::Item_Slot_Content_QuickAccess),
+		FPEPItemLocation::MakeNamedSlot(FFixture::SecondarySlotTag()),
 		FPEPItemAccessContext::System());
 	TestTrue(TEXT("the rig can be moved out of the backpack"), MoveRig.bSuccess);
 	TestTrue(
 		TEXT("the rig grant applies once every ancestor grants or the chain reaches a root"),
-		Fixture.Inventory->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Equip));
+		Fixture.Inventory->HasGrantedGameplayAccess(ItemId, PEPInventoryTags::Inventory_GameplayAccess_Equip));
 	TestFalse(
 		TEXT("an ungranted action remains unavailable"),
-		Fixture.Inventory->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Use));
+		Fixture.Inventory->HasGrantedGameplayAccess(ItemId, PEPInventoryTags::Inventory_GameplayAccess_Use));
 
 	return true;
 }

@@ -2,13 +2,15 @@
 
 #include "Item/PEPItemDefinition.h"
 #include "Item/PEPItemQuery.h"
+#include "Inventory/PEPInventoryGrid.h"
 #include "Inventory/PEPInventorySettings.h"
 #include "Item/Fragments/PEPItemFragment_InventoryShape.h"
 
 FPEPItemLocation UPEPInventoryItemUILibrary::MakeItemContainerLocation(FPEPItemId ParentItemId,
 	FName ContainerSlotName, FIntPoint GridPosition, bool bRotated)
 {
-	return FPEPItemLocation::MakeItemContainer(ParentItemId, ContainerSlotName, GridPosition, bRotated);
+	/* The unrotated origin carries no placement, so the same call also addresses a single slot. */
+	return PEPInventoryGrid::MakeGridLocation(ParentItemId, ContainerSlotName, GridPosition, bRotated);
 }
 
 FPEPItemLocation UPEPInventoryItemUILibrary::MakeItemNamedSlotLocation(FGameplayTag SlotTag)
@@ -81,15 +83,17 @@ bool UPEPInventoryItemUILibrary::BuildContainerItemViewData(const FPEPItemInstan
 	{
 		return false;
 	}
-	if (Location.bRotated)
+	/* A location without a grid placement is the grid's origin, unrotated, as the inventory reads it. */
+	const FPEPGridPlacement Cell = PEPInventoryGrid::GetGridPlacement(Location);
+	if (Cell.bRotated)
 	{
 		Swap(Size.X, Size.Y);
 	}
 	PEPItemQuery::GetDisplayDataFromDefinition(Definition, OutData.DisplayData);
-	OutData.GridPosition = Location.GridPosition;
+	OutData.GridPosition = Cell.Position;
 	OutData.GridSize = Size;
-	OutData.bRotated = Location.bRotated;
-	OutData.PixelPosition = FVector2D(Location.GridPosition.X, Location.GridPosition.Y) * static_cast<double>(CellSize);
+	OutData.bRotated = Cell.bRotated;
+	OutData.PixelPosition = FVector2D(Cell.Position.X, Cell.Position.Y) * static_cast<double>(CellSize);
 	OutData.PixelSize = FVector2D(Size.X, Size.Y) * static_cast<double>(CellSize);
 	return true;
 }

@@ -123,18 +123,21 @@ bool FPEPInventoryUIRoutingTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Subsystem relays the changed item identity"), Listener->LastItemId == Bag.ItemId);
 	TestTrue(TEXT("Seed item"), Inventory->AddItem(Item,
 		FPEPItemLocation::MakeItemContainer(Bag.ItemId, Slot), FPEPItemAccessContext::System()).bSuccess);
-	const FPEPItemLocation Moved = FPEPItemLocation::MakeItemContainer(Bag.ItemId, Slot, FIntPoint(1, 2));
+	const FPEPItemLocation Moved = PEPInventoryGrid::MakeGridLocation(Bag.ItemId, Slot, FIntPoint(1, 2));
 	TestTrue(TEXT("Move preview succeeds"), UI->PreviewPlacement(Local, Local, Item.ItemId, Moved).bSuccess);
 	FPEPInventoryEntry Entry;
 	Inventory->FindInventoryEntry(Item.ItemId, Entry);
-	TestEqual(TEXT("Preview does not mutate location"), Entry.Location.GridPosition, FIntPoint::ZeroValue);
+	TestEqual(TEXT("Preview does not mutate location"),
+		PEPInventoryGrid::GetGridPlacement(Entry.Location).Position, FIntPoint::ZeroValue);
 	int32 RequestId = 0;
 	TestEqual(TEXT("Local request executes"), UI->RequestPlacement(Local, Local, Item.ItemId, Moved, RequestId),
 		EPEPRequestResult::Executed);
 	Inventory->FindInventoryEntry(Item.ItemId, Entry);
-	TestEqual(TEXT("Requested position applied"), Entry.Location.GridPosition, Moved.GridPosition);
+	TestEqual(TEXT("Requested position applied"),
+		PEPInventoryGrid::GetGridPlacement(Entry.Location).Position, FIntPoint(1, 2));
+	TestTrue(TEXT("Requested location stored as sent"), Entry.Location == Moved);
 	TestTrue(TEXT("Request gets an id"), RequestId > 0);
-	const FPEPItemLocation Outside = FPEPItemLocation::MakeItemContainer(Bag.ItemId, Slot, FIntPoint(4, 4));
+	const FPEPItemLocation Outside = PEPInventoryGrid::MakeGridLocation(Bag.ItemId, Slot, FIntPoint(4, 4));
 	TestEqual(TEXT("Invalid placement rejected"), UI->RequestPlacement(Local, Local, Item.ItemId, Outside, RequestId),
 		EPEPRequestResult::Failed);
 	TestEqual(TEXT("Rejected preview allocates no request id"), RequestId, 0);
@@ -178,7 +181,7 @@ bool FPEPInventoryUIRoutingTest::RunTest(const FString& Parameters)
 
 	const FPEPItemLocation Taken = FPEPItemLocation::MakeItemContainer(Bag.ItemId, Slot);
 	TestTrue(TEXT("Take preview succeeds"), UI->PreviewPlacement(Remote, Local, RemoteItem.ItemId, Taken).bSuccess);
-	const FPEPItemLocation RemoteMoved = FPEPItemLocation::MakeItemContainer(
+	const FPEPItemLocation RemoteMoved = PEPInventoryGrid::MakeGridLocation(
 		RemoteItem.ItemId, Slot, FIntPoint(1, 1));
 	Fixture.Inventory->ExternalAccess = EPEPExternalAccessMode::SlotRules;
 	TestEqual(TEXT("Remote move respects external permissions"),
@@ -188,16 +191,19 @@ bool FPEPInventoryUIRoutingTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Remote rearrangement preview succeeds"),
 		UI->PreviewPlacement(Remote, Remote, RemoteChild.ItemId, RemoteMoved).bSuccess);
 	Fixture.Inventory->FindInventoryEntry(RemoteChild.ItemId, Entry);
-	TestEqual(TEXT("Remote preview does not mutate store"), Entry.Location.GridPosition, FIntPoint::ZeroValue);
+	TestEqual(TEXT("Remote preview does not mutate store"),
+		PEPInventoryGrid::GetGridPlacement(Entry.Location).Position, FIntPoint::ZeroValue);
 	TestEqual(TEXT("Remote rearrangement request executes"),
 		UI->RequestPlacement(Remote, Remote, RemoteChild.ItemId, RemoteMoved, RequestId), EPEPRequestResult::Executed);
 	TestTrue(TEXT("Remote rearrangement allocates request id"), RequestId > 0);
 	Fixture.Inventory->FindInventoryEntry(RemoteChild.ItemId, Entry);
-	TestEqual(TEXT("Remote store position updated"), Entry.Location.GridPosition, RemoteMoved.GridPosition);
+	TestEqual(TEXT("Remote store position updated"),
+		PEPInventoryGrid::GetGridPlacement(Entry.Location).Position, FIntPoint(1, 1));
 	Session->FindSessionEntry(RemoteChild.ItemId, Entry);
-	TestEqual(TEXT("Remote session view refreshed"), Entry.Location.GridPosition, RemoteMoved.GridPosition);
+	TestEqual(TEXT("Remote session view refreshed"),
+		PEPInventoryGrid::GetGridPlacement(Entry.Location).Position, FIntPoint(1, 1));
 	TestFalse(TEXT("Rearrangement never transfers to player"), Inventory->ContainsItem(RemoteChild.ItemId));
-	const FPEPItemLocation RemoteOutside = FPEPItemLocation::MakeItemContainer(
+	const FPEPItemLocation RemoteOutside = PEPInventoryGrid::MakeGridLocation(
 		RemoteItem.ItemId, Slot, FIntPoint(2, 2));
 	TestEqual(TEXT("Remote out of bounds preview rejected"),
 		UI->RequestPlacement(Remote, Remote, RemoteChild.ItemId, RemoteOutside, RequestId), EPEPRequestResult::Failed);
@@ -205,7 +211,7 @@ bool FPEPInventoryUIRoutingTest::RunTest(const FString& Parameters)
 		Session->RequestMoveInSession(Session->GetTransferSessionId(), RemoteChild.ItemId, RemoteOutside, RequestId),
 		EPEPRequestResult::Failed);
 	Fixture.Inventory->FindInventoryEntry(RemoteChild.ItemId, Entry);
-	TestEqual(TEXT("Rejected remote move preserves position"), Entry.Location.GridPosition, RemoteMoved.GridPosition);
+	TestTrue(TEXT("Rejected remote move preserves position"), Entry.Location == RemoteMoved);
 	TestEqual(TEXT("Take request routed"), UI->RequestPlacement(Remote, Local, RemoteItem.ItemId, Taken, RequestId),
 		EPEPRequestResult::Executed);
 	TestTrue(TEXT("Taken item in player inventory"), Inventory->FindInventoryEntry(RemoteItem.ItemId, Entry));
@@ -324,7 +330,7 @@ bool FPEPInventoryUIReplicatedCallbackTest::RunTest(const FString& Parameters)
 	Received.PostReplicatedAdd(*View);
 	TestEqual(TEXT("Replicated add reaches the subsystem listener"), Listener->InventoryChangeCount, 1);
 	TestTrue(TEXT("Replicated add relays the received item"), Listener->LastItemId == Received.Item.ItemId);
-	Received.Location = FPEPItemLocation::MakeItemContainer(PEPItemAutomationTestSupport::MakeItemIdForTests(), TEXT("Storage"), FIntPoint(1, 0));
+	Received.Location = PEPInventoryGrid::MakeGridLocation(PEPItemAutomationTestSupport::MakeItemIdForTests(), TEXT("Storage"), FIntPoint(1, 0));
 	Received.PostReplicatedChange(*View);
 	TestEqual(TEXT("Replicated change reaches the subsystem listener"), Listener->InventoryChangeCount, 2);
 	UI->UnregisterInventoryComponent();
@@ -403,11 +409,11 @@ bool FPEPInventoryUISessionMirrorGateTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Seed visible item"), Fixture.Inventory->AddItem(Visible,
 		FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot), System).bSuccess);
 	TestTrue(TEXT("Seed visible bag"), Fixture.Inventory->AddItem(VisibleBag,
-		FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot, FIntPoint(0, 1)), System).bSuccess);
+		PEPInventoryGrid::MakeGridLocation(Rig.ItemId, OpenSlot, FIntPoint(0, 1)), System).bSuccess);
 	TestTrue(TEXT("Seed hidden item"), Fixture.Inventory->AddItem(Hidden,
 		FPEPItemLocation::MakeItemContainer(Rig.ItemId, SealedSlot), System).bSuccess);
 	TestTrue(TEXT("Seed hidden bag"), Fixture.Inventory->AddItem(HiddenBag,
-		FPEPItemLocation::MakeItemContainer(Rig.ItemId, SealedSlot, FIntPoint(1, 0)), System).bSuccess);
+		PEPInventoryGrid::MakeGridLocation(Rig.ItemId, SealedSlot, FIntPoint(1, 0)), System).bSuccess);
 
 	const FPEPItemInstance LocalBag = FFixture::MakeItem(
 		Fixture.MakeContainerDefinition(TEXT("GateLocalBag"), TEXT("Storage"), FIntPoint(4, 4)));
@@ -451,9 +457,10 @@ bool FPEPInventoryUISessionMirrorGateTest::RunTest(const FString& Parameters)
 	const int32 RigReplicationId = Session->FindSessionEntryPtr(Rig.ItemId)->ReplicationID;
 	const int32 VisibleReplicationId = Session->FindSessionEntryPtr(Visible.ItemId)->ReplicationID;
 	TestTrue(TEXT("Move the visible bag"), Fixture.Inventory->MoveItem(VisibleBag.ItemId,
-		FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot, FIntPoint(1, 1)), System).bSuccess);
+		PEPInventoryGrid::MakeGridLocation(Rig.ItemId, OpenSlot, FIntPoint(1, 1)), System).bSuccess);
 	const FPEPInventoryEntry* MovedBag = Session->FindSessionEntryPtr(VisibleBag.ItemId);
-	TestTrue(TEXT("Mirror follows the moved bag"), MovedBag && MovedBag->Location.GridPosition == FIntPoint(1, 1));
+	TestTrue(TEXT("Mirror follows the moved bag"),
+		MovedBag && PEPInventoryGrid::GetGridPlacement(MovedBag->Location).Position == FIntPoint(1, 1));
 	const FPEPInventoryEntry* RigAfterMove = Session->FindSessionEntryPtr(Rig.ItemId);
 	const FPEPInventoryEntry* VisibleAfterMove = Session->FindSessionEntryPtr(Visible.ItemId);
 	TestTrue(TEXT("Reconciliation keeps the rig's replication id"),
@@ -464,14 +471,14 @@ bool FPEPInventoryUISessionMirrorGateTest::RunTest(const FString& Parameters)
 
 	// Ids the player was never sent are not actionable, whatever the store would have allowed.
 	int32 RequestId = 0;
-	const FPEPItemLocation LocalCell = FPEPItemLocation::MakeItemContainer(LocalBag.ItemId, TEXT("Storage"), FIntPoint(1, 1));
+	const FPEPItemLocation LocalCell = PEPInventoryGrid::MakeGridLocation(LocalBag.ItemId, TEXT("Storage"), FIntPoint(1, 1));
 	TestEqual(TEXT("Taking an unmirrored item is refused"),
 		Session->RequestTakeFromSession(SessionId, Hidden.ItemId, LocalCell, RequestId), EPEPRequestResult::Failed);
 	TestTrue(TEXT("The hidden item stays in the remote store"), Fixture.Inventory->ContainsItem(Hidden.ItemId));
 	TestFalse(TEXT("and never reaches the player"), Inventory->ContainsItem(Hidden.ItemId));
 	TestEqual(TEXT("Moving an unmirrored item is refused"),
 		Session->RequestMoveInSession(SessionId, Hidden.ItemId,
-			FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot, FIntPoint(1, 0)), RequestId),
+			PEPInventoryGrid::MakeGridLocation(Rig.ItemId, OpenSlot, FIntPoint(1, 0)), RequestId),
 		EPEPRequestResult::Failed);
 	FPEPItemLocation HiddenLocation;
 	Fixture.Inventory->FindItemLocation(Hidden.ItemId, HiddenLocation);

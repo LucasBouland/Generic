@@ -14,12 +14,15 @@ enum class EPEPEquipmentChangeType : uint8
 };
 
 /**
- * One public node entering or leaving the equipment projection, as seen by this machine.
+ * One node entering or leaving an equipment view, as seen by this machine: the public projection
+ * (OnItemEquipped / OnItemUnequipped) or the owner view (OnOwnerItemEquipped /
+ * OnOwnerItemUnequipped), which also covers slots hidden from the projection.
  *
- * Derived by diffing the projection before and after a change, never sent over the wire: the
- * authority raises it when it rebuilds the projection, every client when the Fast Array lands.
- * Attachments are reported too; a consumer interested only in what occupies a slot filters on
- * Node.IsAttachment() (ParentItemId valid).
+ * Derived by diffing the view before and after a change, never sent over the wire: the authority
+ * raises it when it rebuilds, every client when the public Fast Array lands, the owning client
+ * when it rebuilds its owner view from its own store copy. Attachments are reported too; a
+ * consumer interested only in what occupies a slot filters on Node.IsAttachment() (ParentItemId
+ * valid).
  */
 USTRUCT(BlueprintType)
 struct PEPEQUIPMENT_API FPEPEquipmentChange
@@ -57,7 +60,8 @@ namespace PEPEquipmentEvents
 		const FPEPEquippedItemInfo& B);
 
 	/**
-	 * Turns two projections into the changes between them, deterministically.
+	 * Turns two projections into the changes between them, deterministically. Works on any
+	 * equipment view: the owner view is diffed by the same function.
 	 *
 	 * A node whose slot, parent or definition changed counts as leaving then entering. That
 	 * cascades: when a node leaves, every descendant it carried leaves with it, and when it enters,

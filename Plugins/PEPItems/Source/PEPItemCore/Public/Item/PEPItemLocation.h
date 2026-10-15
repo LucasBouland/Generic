@@ -3,6 +3,8 @@
 #include "CoreMinimal.h"
 #include "Core/PEPTypes.h"
 #include "GameplayTagContainer.h"
+#include "Item/PEPItemPlacement.h"
+#include "StructUtils/InstancedStruct.h"
 
 #include "PEPItemLocation.generated.h"
 
@@ -43,23 +45,33 @@ struct PEPITEMCORE_API FPEPItemLocation
 	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Location")
 	FPEPItemId ParentItemId;
 
-	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Location")
-	FIntPoint GridPosition = FIntPoint::ZeroValue;
-
-	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Location")
-	bool bRotated = false;
+	/**
+	 * Where inside the container slot, in the terms of the plugin that owns the slot (a grid cell
+	 * and orientation for PEPInventory). ItemCore stores, copies and compares it without reading
+	 * it; the store holding the slot validates it. Empty when the slot needs no position, and
+	 * always empty for a NamedSlot. Must derive from FPEPItemPlacement.
+	 */
+	UPROPERTY(SaveGame, VisibleAnywhere, BlueprintReadOnly, Category="PEP|Item|Location",
+		meta=(BaseStruct="/Script/PEPItemCore.PEPItemPlacement"))
+	FInstancedStruct Placement;
 
 	/**
 	 * Whether the fields are exactly those Type requires — a location carrying data belonging to
-	 * another kind is rejected, not ignored. Says nothing about the slot actually existing.
+	 * another kind is rejected, not ignored. A placement is allowed on an ItemContainer location
+	 * only, and only if it derives from FPEPItemPlacement; what it says is the slot owner's to
+	 * judge. Says nothing about the slot actually existing.
 	 */
 	bool IsStructurallyValid() const;
 
 	static FPEPItemLocation MakeItemContainer(
 		FPEPItemId InParentItemId,
+		FName InContainerSlotName);
+
+	/** As above, with a placement for the store that owns the slot to interpret. */
+	static FPEPItemLocation MakeItemContainer(
+		FPEPItemId InParentItemId,
 		FName InContainerSlotName,
-		FIntPoint Position = FIntPoint::ZeroValue,
-		bool bInRotated = false);
+		const FInstancedStruct& InPlacement);
 
 	static FPEPItemLocation MakeNamedSlot(FGameplayTag SlotTag);
 };
@@ -73,4 +85,9 @@ inline bool operator!=(const FPEPItemLocation& A, const FPEPItemLocation& B)
 	return !(A == B);
 }
 
+/**
+ * Consistent with operator==, but Placement is left out: ItemCore cannot hash a struct it does not
+ * know. Equal locations still hash equal; locations differing only by placement share a hash,
+ * which costs a set or map nothing but bucket sharing.
+ */
 PEPITEMCORE_API uint32 GetTypeHash(const FPEPItemLocation& Location);

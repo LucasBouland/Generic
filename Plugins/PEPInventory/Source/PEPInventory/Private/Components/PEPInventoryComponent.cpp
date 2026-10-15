@@ -14,6 +14,7 @@
 #include "Item/PEPItemContainerQuery.h"
 #include "Item/PEPItemContainerRules.h"
 #include "Item/PEPItemLogChannels.h"
+#include "Inventory/PEPInventoryGrid.h"
 #include "Inventory/PEPInventorySettings.h"
 #include "Inventory/PEPInventoryQuery.h"
 #include "Loadout/PEPLoadoutPreset.h"
@@ -117,6 +118,30 @@ namespace PEPInventoryComponentPrivate
 		default:
 			return false;
 		}
+	}
+
+	/**
+	 * Negative, zero or positive as First's cell comes before, with or after Second's, row by row.
+	 * A location without a grid placement reads as the origin, exactly as validation reads it.
+	 */
+	int32 CompareGridCells(
+		const FPEPItemLocation& First,
+		const FPEPItemLocation& Second)
+	{
+		const FIntPoint FirstCell = PEPInventoryGrid::GetGridPlacement(First).Position;
+		const FIntPoint SecondCell = PEPInventoryGrid::GetGridPlacement(Second).Position;
+
+		if (FirstCell.Y != SecondCell.Y)
+		{
+			return FirstCell.Y < SecondCell.Y ? -1 : 1;
+		}
+
+		if (FirstCell.X != SecondCell.X)
+		{
+			return FirstCell.X < SecondCell.X ? -1 : 1;
+		}
+
+		return 0;
 	}
 
 	/** Drops one id from an id-list index, and the list itself once it is empty. */
@@ -1163,8 +1188,9 @@ const UPEPInventoryComponent::FPEPGridOccupancy* UPEPInventoryComponent::FindGri
             Occupancy.bUnknown = true;
             continue;
         }
-        const FIntPoint Size = PEPInventoryValidation::OrientedSize(Shape.Size, Entry->Location.bRotated);
-        const FIntPoint From = Entry->Location.GridPosition;
+        const FPEPGridPlacement Placement = PEPInventoryGrid::GetGridPlacement(Entry->Location);
+        const FIntPoint Size = PEPInventoryValidation::OrientedSize(Shape.Size, Placement.bRotated);
+        const FIntPoint From = Placement.Position;
         /* Clipped: an entry hanging off the grid is a corrupt store, not a reason to crash. */
         for (int32 Y = FMath::Max(0, From.Y); Y < FMath::Min(Slot->GridSize.Y, From.Y + Size.Y); ++Y)
         {
@@ -2550,11 +2576,16 @@ FPEPItemResult UPEPInventoryComponent::CanSwapItems(
 				return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, FirstItemId);
 			}
 
+			const FPEPGridPlacement FirstPlacement =
+				PEPInventoryGrid::GetGridPlacement(FirstEntry->Location);
+			const FPEPGridPlacement SecondPlacement =
+				PEPInventoryGrid::GetGridPlacement(SecondEntry->Location);
+
 			if (PEPInventoryValidation::DoFootprintsOverlap(
-				SecondEntry->Location.GridPosition,
-				PEPInventoryValidation::OrientedSize(FirstShape.Size, SecondEntry->Location.bRotated),
-				FirstEntry->Location.GridPosition,
-				PEPInventoryValidation::OrientedSize(SecondShape.Size, FirstEntry->Location.bRotated)))
+				SecondPlacement.Position,
+				PEPInventoryValidation::OrientedSize(FirstShape.Size, SecondPlacement.bRotated),
+				FirstPlacement.Position,
+				PEPInventoryValidation::OrientedSize(SecondShape.Size, FirstPlacement.bRotated)))
 			{
 				return FPEPItemResult::Failure(PEPCoreTags::Reason_NoFreeSlot, FirstItemId);
 			}
@@ -2661,14 +2692,11 @@ void UPEPInventoryComponent::GetEntriesInContainerSlot(
     Ordered.Sort(
         [](const FPEPInventoryEntry& First, const FPEPInventoryEntry& Second)
         {
-            if (First.Location.GridPosition.Y != Second.Location.GridPosition.Y)
+            const int32 CellOrder =
+                PEPInventoryComponentPrivate::CompareGridCells(First.Location, Second.Location);
+            if (CellOrder != 0)
             {
-                return First.Location.GridPosition.Y < Second.Location.GridPosition.Y;
-            }
-
-            if (First.Location.GridPosition.X != Second.Location.GridPosition.X)
-            {
-                return First.Location.GridPosition.X < Second.Location.GridPosition.X;
+                return CellOrder < 0;
             }
 
             return First.Item.ItemId.Value < Second.Item.ItemId.Value;
@@ -2924,7 +2952,13 @@ UPEPInventoryComponent::ValidateLocationForItem(
 	{
 	case EPEPItemLocationType::ItemContainer:
 	{
-		if (Location.ParentItemId == Item.ItemId)
+		/*
+		 * The placement on its own, before any slot is looked at: none, or a grid cell that is not
+		 * before a grid's first. Another domain's placement means nothing to this store, and a
+		 * negative cell is malformed rather than merely out of room.
+		 */
+		if (Location.ParentItemId == Item.ItemId
+			|| !PEPInventoryGrid::IsPlacementWellFormed(Location))
 		{
 			return FPEPItemResult::Failure(
 				PEPCoreTags::Reason_InvalidTarget,
@@ -3008,9 +3042,8 @@ UPEPInventoryComponent::ValidateLocationForItem(
 		if (ContainerSlot->Mode ==
 			EPEPContainerSlotMode::Single)
 		{
-			if (Location.GridPosition !=
-					FIntPoint::ZeroValue
-				|| Location.bRotated)
+			/* One item, no position inside the slot: any placement, a grid cell included, is wrong. */
+			if (Location.Placement.IsValid())
 			{
 				return FPEPItemResult::Failure(
 					PEPCoreTags::Reason_InvalidTarget,
@@ -3044,7 +3077,11 @@ UPEPInventoryComponent::ValidateLocationForItem(
 				Item.ItemId);
 		}
 
-		if (Location.bRotated
+		/* Well formed (checked above), so this is a grid placement or the unrotated origin. */
+		const FPEPGridPlacement Cell =
+			PEPInventoryGrid::GetGridPlacement(Location);
+
+		if (Cell.bRotated
 			&& (!ContainerSlot->bAllowRotation
 				|| !ShapeData.bCanRotate))
 		{
@@ -3054,10 +3091,10 @@ UPEPInventoryComponent::ValidateLocationForItem(
 		}
 
 		const FIntPoint ItemSize =
-			PEPInventoryValidation::OrientedSize(ShapeData.Size, Location.bRotated);
+			PEPInventoryValidation::OrientedSize(ShapeData.Size, Cell.bRotated);
 
 		if (!PEPInventoryValidation::IsFootprintInsideGrid(
-			Location.GridPosition,
+			Cell.Position,
 			ItemSize,
 			ContainerSlot->GridSize))
 		{
@@ -3077,7 +3114,7 @@ UPEPInventoryComponent::ValidateLocationForItem(
 		{
 			return IsGridFootprintFree(
 				*Occupancy,
-				Location.GridPosition,
+				Cell.Position,
 				ItemSize,
 				Item.ItemId,
 				AlsoIgnoredItemId)
@@ -3118,14 +3155,16 @@ UPEPInventoryComponent::ValidateLocationForItem(
 						Item.ItemId);
 				}
 
+				const FPEPGridPlacement ExistingCell =
+					PEPInventoryGrid::GetGridPlacement(Existing->Location);
 				const FIntPoint ExistingSize = PEPInventoryValidation::OrientedSize(
 					ExistingShapeData.Size,
-					Existing->Location.bRotated);
+					ExistingCell.bRotated);
 
 				if (PEPInventoryValidation::DoFootprintsOverlap(
-					Location.GridPosition,
+					Cell.Position,
 					ItemSize,
-					Existing->Location.GridPosition,
+					ExistingCell.Position,
 					ExistingSize))
 				{
 					return FPEPItemResult::Failure(
@@ -3268,14 +3307,11 @@ void UPEPInventoryComponent::AppendOrderedChildItems(
 					Second.Location.ContainerSlotName);
 			}
 
-			if (First.Location.GridPosition.Y != Second.Location.GridPosition.Y)
+			const int32 CellOrder =
+				PEPInventoryComponentPrivate::CompareGridCells(First.Location, Second.Location);
+			if (CellOrder != 0)
 			{
-				return First.Location.GridPosition.Y < Second.Location.GridPosition.Y;
-			}
-
-			if (First.Location.GridPosition.X != Second.Location.GridPosition.X)
-			{
-				return First.Location.GridPosition.X < Second.Location.GridPosition.X;
+				return CellOrder < 0;
 			}
 
 			return First.Item.ItemId.Value < Second.Item.ItemId.Value;
@@ -3346,6 +3382,19 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 	AppendOrderedNamedSlotItems(PendingParents);
 
 	TSet<FPEPItemId> VisitedParents;
+
+	/*
+	 * One candidate serves every cell tried: its slot and its placement are rewritten in place, so
+	 * walking a grid allocates nothing. The location handed back is built once, for the cell
+	 * chosen, in the form MakeGridLocation gives it.
+	 */
+	FPEPItemLocation CellCandidate = FPEPItemLocation::MakeItemContainer(FPEPItemId(), NAME_None);
+	CellCandidate.Placement.InitializeAs(FPEPGridPlacement::StaticStruct());
+	FPEPGridPlacement* CandidateCell = CellCandidate.Placement.GetMutablePtr<FPEPGridPlacement>();
+	if (!CandidateCell)
+	{
+		return false;
+	}
 
 	for (int32 Cursor = 0; Cursor < PendingParents.Num(); ++Cursor)
 	{
@@ -3489,21 +3538,26 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 							continue;
 						}
 
-						const FPEPItemLocation Candidate =
-							FPEPItemLocation::
-							MakeItemContainer(
+						CellCandidate.ParentItemId = ParentItemId;
+						CellCandidate.ContainerSlotName = Slot.SlotName;
+						CandidateCell->Position = Position;
+						CandidateCell->bRotated = bRotated;
+
+						/*
+						 * The full decision, for a cell the pruning could not rule out. An explicit
+						 * origin reads exactly as no placement does, so the candidate's spelling
+						 * changes nothing here.
+						 */
+						if (ValidateLocationForItem(
+							Item,
+							CellCandidate,
+							Role).bSuccess)
+						{
+							OutLocation = PEPInventoryGrid::MakeGridLocation(
 								ParentItemId,
 								Slot.SlotName,
 								Position,
 								bRotated);
-
-						/* The full decision, for a cell the pruning could not rule out. */
-						if (ValidateLocationForItem(
-							Item,
-							Candidate,
-							Role).bSuccess)
-						{
-							OutLocation = Candidate;
 							return true;
 						}
 					}
@@ -3559,7 +3613,7 @@ bool UPEPInventoryComponent::TryResolveAttachmentPlacement(
 			}
 
 			const FPEPItemLocation Candidate = FPEPItemLocation::MakeItemContainer(
-				ParentItemId, Slot.SlotName, FIntPoint::ZeroValue, false);
+				ParentItemId, Slot.SlotName);
 			if (ValidateLocationForItem(Item, Candidate, Role).bSuccess)
 			{
 				OutLocation = Candidate;

@@ -24,7 +24,7 @@ namespace PEPPruneSafetyTestSupport
 	{
 		FPEPItemInstanceTreeEntry& Entry = Tree.Children.AddDefaulted_GetRef();
 		Entry.Item = FFixture::MakeItem(Definition);
-		Entry.Location = FPEPItemLocation::MakeItemContainer(ParentId, InSlotName, Cell);
+		Entry.Location = PEPInventoryGrid::MakeGridLocation(ParentId, InSlotName, Cell);
 		return Entry.Item.ItemId;
 	}
 
@@ -171,7 +171,7 @@ bool FPEPPruneOrderIndependenceTest::RunTest(const FString&)
 	const FPEPItemId PouchId = PEPItemAutomationTestSupport::MakeItemIdForTests();
 	FPEPItemInstanceTreeEntry& EarlyGrandchild = Rig.Children.AddDefaulted_GetRef();
 	EarlyGrandchild.Item = FFixture::MakeItem(SmallDef);
-	EarlyGrandchild.Location = FPEPItemLocation::MakeItemContainer(
+	EarlyGrandchild.Location = PEPInventoryGrid::MakeGridLocation(
 		PouchId, PEPPruneSafetyTestSupport::SlotName, FIntPoint(0, 0));
 	const FPEPItemId GrandchildId = EarlyGrandchild.Item.ItemId;
 	const FPEPItemId FirstSurvivorId = AddChild(Rig, SmallDef, RigId, FIntPoint(0, 0));
@@ -179,7 +179,7 @@ bool FPEPPruneOrderIndependenceTest::RunTest(const FString&)
 	Pouch.Item = FFixture::MakeItem(DoomedDef);
 	/* The id the grandchild already names, as a save that wrote the pouch later would hold it. */
 	Pouch.Item.ItemId = PouchId;
-	Pouch.Location = FPEPItemLocation::MakeItemContainer(
+	Pouch.Location = PEPInventoryGrid::MakeGridLocation(
 		RigId, PEPPruneSafetyTestSupport::SlotName, FIntPoint(1, 0));
 	const FPEPItemId SecondSurvivorId = AddChild(Rig, SmallDef, RigId, FIntPoint(2, 0));
 

@@ -4,6 +4,7 @@
 
 #include "Algo/Reverse.h"
 #include "Components/PEPEquipmentComponent.h"
+#include "Components/SceneComponent.h"
 #include "Core/PEPCoreTags.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
@@ -565,6 +566,69 @@ bool FPEPEquipmentEligibilityOrderTest::RunTest(const FString& Parameters)
 	const FPEPItemResult Next = Fixture.Equipment->PreviewEquipItem(PistolId, Hand);
 	TestTrue(TEXT("with the first allowing, the second's refusal stands"),
 		!Next.bSuccess && Next.ReasonTag == PEPCoreTags::Reason_StateMismatch);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentEligibilityCacheTest,
+	"PEP.Equipment.Eligibility.ProviderCacheFollowsTheOwnersComponents",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentEligibilityCacheTest::RunTest(const FString& Parameters)
+{
+	using PEPEquipmentEventTest::Slot;
+	FEventFixture Fixture;
+	const FGameplayTag Hand = PEPEquipmentTags::Equipment_Slot_Hand_Right;
+	FPEPItemInstance Pistol = Fixture.MakeItem(TEXT("EquipmentEligibilityCachePistol"));
+	const FPEPItemId PistolId = Pistol.ItemId;
+	TestTrue(TEXT("the pistol sits on the belt"),
+		Fixture.Add(Pistol, Slot(PEPEquipmentTags::Equipment_Slot_Belt)));
+
+	/* The fixture's listener is the one provider; it allows, and the cache is built from it. */
+	TestTrue(TEXT("the only provider allows"),
+		Fixture.Equipment->PreviewEquipItem(PistolId, Hand).bSuccess);
+	const int32 QueriesBefore = Fixture.Listener->EligibilityQueries;
+	TestTrue(TEXT("a cached provider is still asked"),
+		Fixture.Equipment->PreviewEquipItem(PistolId, Hand).bSuccess
+		&& Fixture.Listener->EligibilityQueries > QueriesBefore);
+
+	UPEPTestEquipmentListenerComponent* Late =
+		NewObject<UPEPTestEquipmentListenerComponent>(Fixture.Owner, TEXT("ProviderLate"));
+	Late->RefusedSlotTag = Hand;
+	Late->RefusalReasonTag = PEPCoreTags::Reason_StateMismatch;
+	Late->RegisterComponent();
+	const FPEPItemResult WithLate = Fixture.Equipment->PreviewEquipItem(PistolId, Hand);
+	TestTrue(TEXT("a provider added after the cache was built is asked"),
+		!WithLate.bSuccess && WithLate.ReasonTag == PEPCoreTags::Reason_StateMismatch);
+
+	Late->DestroyComponent();
+	TestTrue(TEXT("a destroyed provider is no longer asked"),
+		Fixture.Equipment->PreviewEquipItem(PistolId, Hand).bSuccess);
+
+	/*
+	 * One component swapped for another in the same frame: the count stays, and the one that left
+	 * was no provider, so nothing cached went stale. InvalidateEligibilityProviders covers it.
+	 */
+	USceneComponent* Filler = NewObject<USceneComponent>(Fixture.Owner, TEXT("EligibilityFiller"));
+	Filler->RegisterComponent();
+	TestTrue(TEXT("a component that is no provider changes no answer"),
+		Fixture.Equipment->PreviewEquipItem(PistolId, Hand).bSuccess);
+	const int32 ComponentCount = Fixture.Owner->GetComponents().Num();
+	Filler->DestroyComponent();
+	UPEPTestEquipmentListenerComponent* Swapped =
+		NewObject<UPEPTestEquipmentListenerComponent>(Fixture.Owner, TEXT("ProviderSwapped"));
+	Swapped->RefusedSlotTag = Hand;
+	Swapped->RefusalReasonTag = PEPCoreTags::Reason_OutOfRange;
+	Swapped->RegisterComponent();
+	if (Fixture.Owner->GetComponents().Num() == ComponentCount)
+	{
+		TestTrue(TEXT("a same-count swap is invisible to the cheap check (documented)"),
+			Fixture.Equipment->PreviewEquipItem(PistolId, Hand).bSuccess);
+	}
+	Fixture.Equipment->InvalidateEligibilityProviders();
+	const FPEPItemResult AfterInvalidate = Fixture.Equipment->PreviewEquipItem(PistolId, Hand);
+	TestTrue(TEXT("after InvalidateEligibilityProviders the swapped-in provider answers"),
+		!AfterInvalidate.bSuccess && AfterInvalidate.ReasonTag == PEPCoreTags::Reason_OutOfRange);
 	return true;
 }
 

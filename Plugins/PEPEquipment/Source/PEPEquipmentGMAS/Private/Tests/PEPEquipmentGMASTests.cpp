@@ -2,9 +2,21 @@
 
 #include "Misc/AutomationTest.h"
 
+#include "Components/PEPEquipmentAbilityBridgeComponent.h"
+#include "Components/PEPEquipmentComponent.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
 #include "Equipment/PEPEquipmentAbilityMapLedger.h"
+#include "Equipment/PEPEquipmentProfile.h"
 #include "Equipment/PEPEquipmentTags.h"
+#include "GameFramework/Actor.h"
 #include "Item/Fragments/PEPItemFragment_EquipmentAbilities.h"
+#include "Item/PEPItemAccess.h"
+#include "Item/PEPItemDefinition.h"
+#include "Item/PEPItemInstance.h"
+#include "StructUtils/InstancedStruct.h"
+/* The runtime module's test store (exported for its sibling test modules). */
+#include "../../../PEPEquipment/Private/Tests/PEPTestItemStoreComponent.h"
 
 namespace PEPEquipmentGMASTest
 {
@@ -32,6 +44,87 @@ namespace PEPEquipmentGMASTest
 	const FGameplayTag& SecondaryInput()
 	{
 		return PEPEquipmentTags::Equipment_Event_Changed;
+	}
+
+	/**
+	 * An equipment component over the runtime module's test store, with the belt hidden from the
+	 * projection. No ability system: the bridge's choice of source is a pure function of it.
+	 */
+	struct FBridgeSourceFixture
+	{
+		UWorld* World = nullptr;
+		AActor* Owner = nullptr;
+		UPEPTestItemStoreComponent* Store = nullptr;
+		UPEPEquipmentComponent* Equipment = nullptr;
+		TArray<TObjectPtr<UPEPItemDefinition>> Definitions;
+
+		FBridgeSourceFixture()
+		{
+			UPEPEquipmentProfile* Profile = NewObject<UPEPEquipmentProfile>(GetTransientPackage());
+			Profile->Slots.AddDefaulted_GetRef().SlotTag = PEPEquipmentTags::Equipment_Slot_Hand_Right;
+			FPEPEquipmentSlotDefinition& Belt = Profile->Slots.AddDefaulted_GetRef();
+			Belt.SlotTag = PEPEquipmentTags::Equipment_Slot_Belt;
+			Belt.bShowPublicly = false;
+
+			World = UWorld::CreateWorld(EWorldType::Game, false);
+			FWorldContext& Context = GEngine->CreateNewWorldContext(EWorldType::Game);
+			Context.SetCurrentWorld(World);
+			World->InitializeActorsForPlay(FURL());
+
+			Owner = World->SpawnActor<AActor>();
+			Store = NewObject<UPEPTestItemStoreComponent>(Owner);
+			Store->PublicSlotNames = { FName(TEXT("optic")) };
+			Store->RegisterComponent();
+			Equipment = NewObject<UPEPEquipmentComponent>(Owner);
+			Equipment->SetLocalPresentationEnabled(false);
+			Equipment->SetEquipmentProfile(Profile);
+			Equipment->RegisterComponent();
+			World->BeginPlay();
+			Owner->DispatchBeginPlay();
+		}
+
+		~FBridgeSourceFixture()
+		{
+			for (const TObjectPtr<UPEPItemDefinition>& Definition : Definitions)
+			{
+				if (Definition)
+				{
+					PEPItemAutomationTestSupport::UnregisterTransientDefinitionForTests(
+						Definition->GetPrimaryAssetId());
+				}
+			}
+			GEngine->DestroyWorldContext(World);
+			World->DestroyWorld(false);
+		}
+
+		UPEPItemDefinition* MakeDefinition(
+			const FName Name,
+			const FPEPItemFragment_EquipmentAbilities& Abilities)
+		{
+			UPEPItemDefinition* Definition = NewObject<UPEPItemDefinition>(GetTransientPackage(), Name);
+			Definition->DefinitionFragments.Add(FInstancedStruct::Make(Abilities));
+			PEPItemAutomationTestSupport::RegisterTransientDefinitionForTests(Definition);
+			Definitions.Add(Definition);
+			return Definition;
+		}
+
+		bool Add(const FPEPItemInstance& Item, const FPEPItemLocation& Location)
+		{
+			const bool bAdded =
+				Store->AddItem(Item, Location, FPEPItemAccessContext::System()).bSuccess;
+			Equipment->FlushDeferredUpdates();
+			return bAdded;
+		}
+	};
+
+	const FPEPEquipmentChange* FindChange(
+		const TArray<FPEPEquipmentChange>& Changes,
+		const FPEPItemId ItemId)
+	{
+		return Changes.FindByPredicate([ItemId](const FPEPEquipmentChange& Change)
+		{
+			return Change.Node.ItemId == ItemId;
+		});
 	}
 }
 
@@ -168,6 +261,87 @@ bool FPEPEquipmentAbilitiesFragmentTest::RunTest(const FString& Parameters)
 	Fragment.BlockedActiveTags.AddTag(Back);
 	TestTrue(TEXT("a blocked tag is an eligibility requirement"),
 		Fragment.HasEligibilityRequirements());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentAbilityBridgeSourceTest,
+	"PEP.Equipment.GMAS.Bridge.GrantsFromTheOwnerViewIncludingHiddenSlots",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentAbilityBridgeSourceTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPEquipmentGMASTest;
+	FBridgeSourceFixture Fixture;
+	const FGameplayTag Hand = PEPEquipmentTags::Equipment_Slot_Hand_Right;
+	const FGameplayTag Belt = PEPEquipmentTags::Equipment_Slot_Belt;
+
+	/* Defaults: any slot, roots only. */
+	FPEPItemFragment_EquipmentAbilities Anywhere;
+	UPEPItemDefinition* Definition = Fixture.MakeDefinition(TEXT("EquipmentGMASSourceItem"), Anywhere);
+	FPEPItemInstance Rifle = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	FPEPItemInstance Pistol = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	FPEPItemInstance Optic = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	const FPEPItemId RifleId = Rifle.ItemId;
+	const FPEPItemId PistolId = Pistol.ItemId;
+	const FPEPItemId OpticId = Optic.ItemId;
+	TestTrue(TEXT("the rifle is in the public hand"),
+		Fixture.Add(Rifle, FPEPItemLocation::MakeNamedSlot(Hand)));
+	TestTrue(TEXT("the pistol is on the hidden belt"),
+		Fixture.Add(Pistol, FPEPItemLocation::MakeNamedSlot(Belt)));
+	TestTrue(TEXT("an optic hangs from the pistol"), Fixture.Add(
+		Optic,
+		FPEPItemLocation::MakeItemContainer(PistolId, FName(TEXT("optic")))));
+
+	FPEPEquippedItemInfo Unused;
+	TestFalse(TEXT("the hidden pistol is absent from the public projection"),
+		Fixture.Equipment->FindPublicPresentationNode(PistolId, Unused));
+
+	TArray<FPEPEquipmentChange> Sources;
+	UPEPEquipmentAbilityBridgeComponent::GatherGrantSourceChanges(*Fixture.Equipment, Sources);
+	TestEqual(TEXT("the bridge reads every owner node"), Sources.Num(), 3);
+	const FPEPEquipmentChange* RifleSource = FindChange(Sources, RifleId);
+	const FPEPEquipmentChange* PistolSource = FindChange(Sources, PistolId);
+	const FPEPEquipmentChange* OpticSource = FindChange(Sources, OpticId);
+	TestTrue(TEXT("the hidden pistol is a grant source, under its own slot"),
+		PistolSource && PistolSource->RootSlotTag == Belt
+		&& PistolSource->ChangeType == EPEPEquipmentChangeType::Equipped);
+	TestTrue(TEXT("the optic is a source too, under the hidden root"),
+		OpticSource && OpticSource->RootSlotTag == Belt && OpticSource->Depth == 1);
+	TestTrue(TEXT("sources come roots first"),
+		Sources.Num() == 3 && Sources[2].Node.ItemId == OpticId);
+
+	const FPEPItemFragment_EquipmentAbilities* Fragment =
+		Definition->GetDefinitionFragment<FPEPItemFragment_EquipmentAbilities>();
+	TestNotNull(TEXT("the definition carries the abilities fragment"), Fragment);
+	if (!Fragment || !RifleSource || !PistolSource || !OpticSource)
+	{
+		return false;
+	}
+	TestTrue(TEXT("a hidden slot grants like any other"),
+		UPEPEquipmentAbilityBridgeComponent::DoesChangeGrant(Fragment, *PistolSource));
+	TestTrue(TEXT("and so does the public hand"),
+		UPEPEquipmentAbilityBridgeComponent::DoesChangeGrant(Fragment, *RifleSource));
+	TestFalse(TEXT("an attachment still grants only when its fragment opts in"),
+		UPEPEquipmentAbilityBridgeComponent::DoesChangeGrant(Fragment, *OpticSource));
+	TestFalse(TEXT("no fragment, no grant"),
+		UPEPEquipmentAbilityBridgeComponent::DoesChangeGrant(nullptr, *PistolSource));
+
+	FPEPItemFragment_EquipmentAbilities HandsOnly;
+	HandsOnly.ActiveInSlots.AddTag(Hand);
+	TestFalse(TEXT("ActiveInSlots is what narrows a grant, hidden slot or not"),
+		UPEPEquipmentAbilityBridgeComponent::DoesChangeGrant(&HandsOnly, *PistolSource));
+	TestTrue(TEXT("while the listed slot grants"),
+		UPEPEquipmentAbilityBridgeComponent::DoesChangeGrant(&HandsOnly, *RifleSource));
+
+	/* The source follows the owner view as it changes. */
+	TestTrue(TEXT("the pistol leaves the store with its optic"),
+		Fixture.Store->RemoveItem(OpticId, FPEPItemAccessContext::System()).bSuccess
+		&& Fixture.Store->RemoveItem(PistolId, FPEPItemAccessContext::System()).bSuccess);
+	Fixture.Equipment->FlushDeferredUpdates();
+	UPEPEquipmentAbilityBridgeComponent::GatherGrantSourceChanges(*Fixture.Equipment, Sources);
+	TestTrue(TEXT("only the rifle is left to grant"),
+		Sources.Num() == 1 && Sources[0].Node.ItemId == RifleId);
 	return true;
 }
 

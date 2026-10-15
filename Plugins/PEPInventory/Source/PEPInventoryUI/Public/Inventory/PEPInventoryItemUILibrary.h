@@ -41,7 +41,11 @@ class PEPINVENTORYUI_API UPEPInventoryItemUILibrary : public UBlueprintFunctionL
 	GENERATED_BODY()
 
 public:
-	/** Builds a destination only; placement must still be validated by the inventory. */
+	/**
+	 * Builds a destination only; placement must still be validated by the inventory. Same result
+	 * as PEPInventoryGridLibrary's MakeGridLocation: the unrotated origin carries no placement, so
+	 * leaving GridPosition at zero and bRotated off also addresses a single slot.
+	 */
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory|UI|Drag")
 	static FPEPItemLocation MakeItemContainerLocation(FPEPItemId ParentItemId,
 		FName ContainerSlotName, FIntPoint GridPosition, bool bRotated = false);
