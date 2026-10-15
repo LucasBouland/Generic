@@ -124,22 +124,6 @@ struct PEPEQUIPMENT_API FPEPEquipmentPresentationFragment : public FPEPItemFragm
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Presentation")
 	TArray<FName> MeshComponentTags;
 
-	/** Use a per-item right-hand aim position instead of the project default for its Item.Type. */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Presentation")
-	bool bOverrideRightHandAimLocation = false;
-
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Presentation",
-		meta=(EditCondition="bOverrideRightHandAimLocation", Units="cm"))
-	FVector RightHandAimLocationOverride = FVector::ZeroVector;
-
-	/** Override the item-type non-ADS local rotation correction. Does not affect sight alignment. */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Presentation")
-	bool bOverrideRightHandAimRotation = false;
-
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Presentation",
-		meta=(EditCondition="bOverrideRightHandAimRotation"))
-	FRotator RightHandAimRotationOverride = FRotator::ZeroRotator;
-
 	/** Attachment slots use their slot name as socket name unless overridden here. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Presentation")
 	TArray<FPEPEquipmentAttachmentSocketOverride> AttachmentSocketOverrides;

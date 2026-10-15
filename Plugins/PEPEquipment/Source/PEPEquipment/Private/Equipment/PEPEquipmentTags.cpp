@@ -38,16 +38,9 @@ namespace PEPEquipmentTags
 	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_PresentationTarget_Body_Legs, "Equipment.PresentationTarget.Body.Legs", "Modular legs skeletal mesh target.");
 
 	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_Action_Equip, "Equipment.Action.Equip", "Request that an item move into an equipment slot.");
-	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_Action_Fire, "Equipment.Action.Fire", "Request an equipped-item fire presentation.");
-	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_Action_Light_SetActive, "Equipment.Action.Light.SetActive", "Set an equipped light's active state.");
-	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_Action_Laser_SetActive, "Equipment.Action.Laser.SetActive", "Set an equipped laser's active state.");
-	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_Action_Laser_SetTarget, "Equipment.Action.Laser.SetTarget", "Update an equipped laser target.");
 
 	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_Event_Changed, "Equipment.Event.Changed", "The public equipment projection changed.");
-	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_Event_Fire, "Equipment.Event.Fire", "A cosmetic fire presentation was accepted.");
 
 	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_State_Hand_Left_Occupied, "Equipment.State.Hand.Left.Occupied", "The active left hand is occupied.");
 	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_State_Hand_Right_Occupied, "Equipment.State.Hand.Right.Occupied", "The active right hand is occupied.");
-	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_State_Light_Active, "Equipment.State.Light.Active", "An equipped light is active.");
-	UE_DEFINE_GAMEPLAY_TAG_COMMENT(Equipment_State_Laser_Active, "Equipment.State.Laser.Active", "An equipped laser is active.");
 }

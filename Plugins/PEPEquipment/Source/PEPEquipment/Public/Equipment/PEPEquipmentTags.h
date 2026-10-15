@@ -40,17 +40,10 @@ namespace PEPEquipmentTags
 	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_PresentationTarget_Body_Legs);
 
 	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_Action_Equip);
-	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_Action_Fire);
-	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_Action_Light_SetActive);
-	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_Action_Laser_SetActive);
-	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_Action_Laser_SetTarget);
 
 	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_Event_Changed);
-	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_Event_Fire);
 
 	/** Semantic state tags for animation or ability systems mirroring the public projection. */
 	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_State_Hand_Left_Occupied);
 	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_State_Hand_Right_Occupied);
-	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_State_Light_Active);
-	PEPEQUIPMENT_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Equipment_State_Laser_Active);
 }

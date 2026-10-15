@@ -155,6 +155,8 @@ bool FPEPEquipmentPresentationSeparationTest::RunTest(const FString& Parameters)
 		EquipmentPresentation->FindPropertyByName(TEXT("bSupportsLight")));
 	TestNull(TEXT("equipment presentation does not own laser support"),
 		EquipmentPresentation->FindPropertyByName(TEXT("bSupportsLaser")));
+	TestNull(TEXT("equipment presentation does not own weapon aim offsets"),
+		EquipmentPresentation->FindPropertyByName(TEXT("RightHandAimLocationOverride")));
 
 	FPEPEquipmentPresentationFragment Presentation;
 	Presentation.Visual = FInstancedStruct::Make(FPEPNoEquipmentVisual());

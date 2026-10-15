@@ -26,8 +26,9 @@ bool FPEPEquipmentNativeTagsTest::RunTest(const FString& Parameters)
 			&& PEPEquipmentTags::Equipment_PresentationTarget_Body_Arms.GetTag().IsValid()
 			&& PEPEquipmentTags::Equipment_PresentationTarget_Body_Hands.GetTag().IsValid()
 			&& PEPEquipmentTags::Equipment_PresentationTarget_Body_Legs.GetTag().IsValid());
-	TestTrue(TEXT("equipment visual state tags are registered"),
-		PEPEquipmentTags::Equipment_State_Laser_Active.GetTag().IsValid());
+	TestTrue(TEXT("hand occupancy state tags are registered"),
+		PEPEquipmentTags::Equipment_State_Hand_Left_Occupied.GetTag().IsValid()
+			&& PEPEquipmentTags::Equipment_State_Hand_Right_Occupied.GetTag().IsValid());
 
 	return true;
 }
