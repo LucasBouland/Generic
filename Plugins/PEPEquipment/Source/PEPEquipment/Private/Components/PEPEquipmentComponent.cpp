@@ -1,5 +1,6 @@
 #include "Components/PEPEquipmentComponent.h"
 
+#include "Algo/Sort.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Core/PEPCoreLogChannels.h"
@@ -8,6 +9,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StreamableManager.h"
+#include "Equipment/PEPEquipmentEligibilityProvider.h"
 #include "Equipment/PEPEquipmentPresentationFragment.h"
 #include "Equipment/PEPEquipmentProfile.h"
 #include "Equipment/PEPEquipmentTags.h"
@@ -46,11 +48,21 @@ namespace
 		const FPEPEquippedItemPublic& A,
 		const FPEPEquippedItemPublic& B)
 	{
-		return A.ItemId == B.ItemId
-			&& A.DefinitionId == B.DefinitionId
-			&& A.SlotTag == B.SlotTag
-			&& A.ParentItemId == B.ParentItemId
-			&& A.ParentSlotName == B.ParentSlotName;
+		return PEPEquipmentEvents::IsSameEquippedNode(A, B);
+	}
+
+	/** A refusal always says why and names the item, whoever produced it. */
+	FPEPItemResult NormalizeEligibilityFailure(FPEPItemResult Result, const FPEPItemId ItemId)
+	{
+		if (!Result.ReasonTag.IsValid())
+		{
+			Result.ReasonTag = PEPCoreTags::Reason_BlockedByState;
+		}
+		if (!Result.ItemId.IsValid())
+		{
+			Result.ItemId = ItemId;
+		}
+		return Result;
 	}
 
 	/**
@@ -713,17 +725,96 @@ FPEPItemResult UPEPEquipmentComponent::ValidateEquipmentLocation(
 	const FPEPItemInstance& Item,
 	const FPEPItemLocation& Location) const
 {
-	const FPEPEquipmentSlotDefinition* Slot = FindSlotDefinition(Location.LocationTag);
+	/*
+	 * The store calls this for every write into one of the claimed slots — an equip request, a
+	 * swap's displaced item, a drag from an inventory UI, an automatic pickup — so the full rule
+	 * lives here and not only behind RequestEquipItem.
+	 */
+	return CheckEquipEligibility(Item, Location.LocationTag);
+}
+
+FPEPItemResult UPEPEquipmentComponent::CheckEquipEligibility(
+	const FPEPItemInstance& Item,
+	const FGameplayTag SlotTag) const
+{
+	const FPEPEquipmentSlotDefinition* Slot = FindSlotDefinition(SlotTag);
 	if (!Slot)
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, Item.ItemId);
 	}
-	return PEPItemQuery::DoesItemMatchRequiredBlockedTags(
+	if (!PEPItemQuery::DoesItemMatchRequiredBlockedTags(
 		Item,
 		Slot->RequiredItemTags,
-		Slot->BlockedItemTags)
-		? FPEPItemResult::Success(Item.ItemId)
-		: FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
+		Slot->BlockedItemTags))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Item.ItemId);
+	}
+
+	/* Never loads: eligibility runs inside store writes and on clients for previews. */
+	const UPEPItemDefinition* Definition = ResolveLoadedDefinition(Item.DefinitionId);
+	const FPEPItemResult HookResult = CanEquipItemInSlot(Item, Definition, SlotTag);
+	if (!HookResult.bSuccess)
+	{
+		return NormalizeEligibilityFailure(HookResult, Item.ItemId);
+	}
+
+	TArray<const UObject*> Providers;
+	GatherEligibilityProviders(Providers);
+	for (const UObject* Provider : Providers)
+	{
+		const FPEPItemResult ProviderResult = IPEPEquipmentEligibilityProvider::Execute_CanEquipItem(
+			Provider,
+			this,
+			Item,
+			Definition,
+			SlotTag);
+		if (!ProviderResult.bSuccess)
+		{
+			return NormalizeEligibilityFailure(ProviderResult, Item.ItemId);
+		}
+	}
+	return FPEPItemResult::Success(Item.ItemId);
+}
+
+FPEPItemResult UPEPEquipmentComponent::CanEquipItemInSlot_Implementation(
+	const FPEPItemInstance& Item,
+	const UPEPItemDefinition* Definition,
+	const FGameplayTag SlotTag) const
+{
+	(void)Definition;
+	(void)SlotTag;
+	return FPEPItemResult::Success(Item.ItemId);
+}
+
+void UPEPEquipmentComponent::GatherEligibilityProviders(
+	TArray<const UObject*>& OutProviders) const
+{
+	OutProviders.Reset();
+	AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return;
+	}
+	if (Owner->GetClass()->ImplementsInterface(UPEPEquipmentEligibilityProvider::StaticClass()))
+	{
+		OutProviders.Add(Owner);
+	}
+
+	TInlineComponentArray<UActorComponent*> Components(Owner);
+	/* Component storage order is a set's; the name gives one first failure per configuration. */
+	Algo::Sort(Components, [](const UActorComponent* A, const UActorComponent* B)
+	{
+		return A && B ? A->GetFName().LexicalLess(B->GetFName()) : A != nullptr;
+	});
+	for (const UActorComponent* Component : Components)
+	{
+		if (Component
+			&& Component->GetClass()->ImplementsInterface(
+				UPEPEquipmentEligibilityProvider::StaticClass()))
+		{
+			OutProviders.Add(Component);
+		}
+	}
 }
 
 const FPEPEquipmentSlotDefinition* UPEPEquipmentComponent::FindSlotDefinition(
@@ -845,8 +936,50 @@ void UPEPEquipmentComponent::RefreshPublicProjection()
 	}
 
 	ReconcileLocalPresentations();
+	BroadcastEquipmentItemChanges();
 	OnPublicEquipmentChanged.Broadcast();
-	GetOwner()->ForceNetUpdate();
+	if (AActor* Owner = GetOwner())
+	{
+		Owner->ForceNetUpdate();
+	}
+}
+
+void UPEPEquipmentComponent::BroadcastEquipmentItemChanges()
+{
+	/*
+	 * A listener may itself change equipment — unequip the offhand when a two-hander lands. Its
+	 * nested change is folded into another pass once this one has finished announcing, so no
+	 * listener sees an Equipped of the new state in the middle of the old state's Unequipped.
+	 */
+	if (bBroadcastingEquipmentItemChanges)
+	{
+		bEquipmentItemChangesPending = true;
+		return;
+	}
+	TGuardValue<bool> BroadcastGuard(bBroadcastingEquipmentItemChanges, true);
+	do
+	{
+		bEquipmentItemChangesPending = false;
+		TArray<FPEPEquippedItemPublic> Previous = MoveTemp(AnnouncedEquipmentNodes);
+		AnnouncedEquipmentNodes = PublicEquipmentView.Entries;
+
+		TArray<FPEPEquipmentChange> Unequipped;
+		TArray<FPEPEquipmentChange> Equipped;
+		PEPEquipmentEvents::DiffPublicProjection(
+			Previous,
+			AnnouncedEquipmentNodes,
+			Unequipped,
+			Equipped);
+		for (const FPEPEquipmentChange& Change : Unequipped)
+		{
+			OnItemUnequipped.Broadcast(Change);
+		}
+		for (const FPEPEquipmentChange& Change : Equipped)
+		{
+			OnItemEquipped.Broadcast(Change);
+		}
+	}
+	while (bEquipmentItemChangesPending);
 }
 
 void UPEPEquipmentComponent::AppendPublicAttachmentEntries(
@@ -1018,13 +1151,7 @@ EPEPRequestResult UPEPEquipmentComponent::RequestEquipItem(
 	OutRequestId = AllocateRequestId();
 	if (Owner->HasAuthority())
 	{
-		const FPEPItemLocation Destination = FPEPItemLocation::MakeNamedSlot(SlotTag);
-		FPEPItemId OccupantId;
-		const bool bSwap = ItemStore->FindItemAtLocation(Destination, OccupantId)
-			&& OccupantId != ItemId;
-		const FPEPItemResult Result = bSwap
-			? ItemStore->SwapItems(ItemId, OccupantId, GetOwnerRequestContext())
-			: ItemStore->MoveItem(ItemId, Destination, GetOwnerRequestContext());
+		const FPEPItemResult Result = ExecuteEquipItem(ItemId, SlotTag);
 		ResolveEquipRequest(OutRequestId, Result);
 		return Result.bSuccess ? EPEPRequestResult::Executed : EPEPRequestResult::Failed;
 	}
@@ -1055,11 +1182,56 @@ FPEPItemResult UPEPEquipmentComponent::PreviewEquipItem(
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
 	}
 
+	const FPEPItemInstance* Item = ItemStore->FindItem(ItemId);
+	if (!Item)
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+	}
+	/* Asked up front as well as through the store's validator: a preview must not depend on it. */
+	const FPEPItemResult Eligibility = CheckEquipEligibility(*Item, SlotTag);
+	if (!Eligibility.bSuccess)
+	{
+		return Eligibility;
+	}
+
 	const FPEPItemLocation Destination = FPEPItemLocation::MakeNamedSlot(SlotTag);
 	FPEPItemId OccupantId;
 	return ItemStore->FindItemAtLocation(Destination, OccupantId) && OccupantId != ItemId
 		? ItemStore->CanSwapItems(ItemId, OccupantId, GetOwnerRequestContext())
 		: ItemStore->CanMoveItem(ItemId, Destination, GetOwnerRequestContext());
+}
+
+FPEPItemResult UPEPEquipmentComponent::ExecuteEquipItem(
+	const FPEPItemId ItemId,
+	const FGameplayTag SlotTag)
+{
+	IPEPItemStore* ItemStore = GetItemStore();
+	if (!ItemStore || !ItemId.IsValid() || !FindSlotDefinition(SlotTag)
+		|| !ItemStore->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Equip))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+	}
+	const FPEPItemInstance* Item = ItemStore->FindItem(ItemId);
+	if (!Item)
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+	}
+	/*
+	 * Checked before the store is asked, so the refusal is the same whether or not a given store
+	 * honours its validators. A conforming store asks the same question again through
+	 * ValidateEquipmentLocation; eligibility is a pure query, so asking twice is only a cost.
+	 */
+	const FPEPItemResult Eligibility = CheckEquipEligibility(*Item, SlotTag);
+	if (!Eligibility.bSuccess)
+	{
+		return Eligibility;
+	}
+
+	const FPEPItemLocation Destination = FPEPItemLocation::MakeNamedSlot(SlotTag);
+	FPEPItemId OccupantId;
+	return ItemStore->FindItemAtLocation(Destination, OccupantId) && OccupantId != ItemId
+		? ItemStore->SwapItems(ItemId, OccupantId, GetOwnerRequestContext())
+		: ItemStore->MoveItem(ItemId, Destination, GetOwnerRequestContext());
 }
 
 bool UPEPEquipmentComponent::Server_RequestEquipItem_Validate(
@@ -1075,18 +1247,139 @@ void UPEPEquipmentComponent::Server_RequestEquipItem_Implementation(
 	const FGameplayTag SlotTag,
 	const int32 RequestId)
 {
-	IPEPItemStore* ItemStore = GetItemStore();
-	FPEPItemResult Result = FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
-	if (ItemStore && FindSlotDefinition(SlotTag)
-		&& ItemStore->HasGrantedGameplayAccess(ItemId, PEPItemTags::GameplayAccess_Equip))
+	ResolveEquipRequest(RequestId, ExecuteEquipItem(ItemId, SlotTag));
+}
+
+EPEPRequestResult UPEPEquipmentComponent::RequestUnequipItem(
+	const FPEPItemId ItemId,
+	const FPEPItemLocation TargetLocation,
+	int32& OutRequestId)
+{
+	OutRequestId = 0;
+	AActor* Owner = GetOwner();
+	if (!Owner || !ItemId.IsValid())
 	{
-		const FPEPItemLocation Destination = FPEPItemLocation::MakeNamedSlot(SlotTag);
-		FPEPItemId OccupantId;
-		Result = ItemStore->FindItemAtLocation(Destination, OccupantId) && OccupantId != ItemId
-			? ItemStore->SwapItems(ItemId, OccupantId, GetOwnerRequestContext())
-			: ItemStore->MoveItem(ItemId, Destination, GetOwnerRequestContext());
+		return EPEPRequestResult::Failed;
 	}
-	ResolveEquipRequest(RequestId, Result);
+
+	if (Owner->HasAuthority())
+	{
+		OutRequestId = AllocateRequestId();
+		const FPEPItemResult Result = ExecuteUnequipItem(ItemId, TargetLocation);
+		ResolveEquipRequest(OutRequestId, Result);
+		return Result.bSuccess ? EPEPRequestResult::Executed : EPEPRequestResult::Failed;
+	}
+
+	/*
+	 * A client refuses early only for what it can be sure of without the store: a store copy on
+	 * the client may be partial, and a slot hidden from the projection is still a slot. The server
+	 * runs the full check.
+	 */
+	if (!Owner->HasLocalNetOwner()
+		|| !TargetLocation.IsStructurallyValid()
+		|| (TargetLocation.Type == EPEPItemLocationType::NamedSlot
+			&& FindSlotDefinition(TargetLocation.LocationTag)))
+	{
+		return EPEPRequestResult::Failed;
+	}
+
+	OutRequestId = AllocateRequestId();
+	Server_RequestUnequipItem(ItemId, TargetLocation, OutRequestId);
+	return EPEPRequestResult::Submitted;
+}
+
+FPEPEquipmentRequestResult UPEPEquipmentComponent::UnequipItem(
+	const FPEPItemId ItemId,
+	const FPEPItemLocation TargetLocation)
+{
+	FPEPEquipmentRequestResult RequestResult;
+	const AActor* Owner = GetOwner();
+	RequestResult.Result = Owner && Owner->HasAuthority()
+		? ExecuteUnequipItem(ItemId, TargetLocation)
+		: FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, ItemId);
+	return RequestResult;
+}
+
+FPEPItemResult UPEPEquipmentComponent::PreviewUnequipItem(
+	const FPEPItemId ItemId,
+	const FPEPItemLocation TargetLocation) const
+{
+	const FPEPItemResult Validation = ValidateUnequipRequest(ItemId, TargetLocation);
+	if (!Validation.bSuccess)
+	{
+		return Validation;
+	}
+	return GetItemStoreConst()->CanMoveItem(ItemId, TargetLocation, GetOwnerRequestContext());
+}
+
+FPEPItemResult UPEPEquipmentComponent::ValidateUnequipRequest(
+	const FPEPItemId ItemId,
+	const FPEPItemLocation& TargetLocation) const
+{
+	const IPEPItemStore* ItemStore = GetItemStoreConst();
+	FPEPItemLocation CurrentLocation;
+	if (!ItemStore || !ItemId.IsValid() || !ItemStore->FindItemLocation(ItemId, CurrentLocation))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+	}
+	/* Only a direct occupant of one of this component's slots is equipped here. */
+	if (CurrentLocation.Type != EPEPItemLocationType::NamedSlot
+		|| !FindSlotDefinition(CurrentLocation.LocationTag))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_StateMismatch, ItemId);
+	}
+	/*
+	 * IPEPItemStore has no automatic placement: AddItem and MoveItem both take an explicit
+	 * destination, and the placement search some stores have (PEPInventory's MoveItemAuto) is not
+	 * part of the contract — and may answer with another equipment slot. Equipment does not guess.
+	 */
+	if (TargetLocation.Type == EPEPItemLocationType::None)
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_UnsupportedMode, ItemId);
+	}
+	if (!TargetLocation.IsStructurallyValid()
+		|| (TargetLocation.Type == EPEPItemLocationType::ItemContainer
+			&& TargetLocation.ParentItemId == ItemId))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+	}
+	/* Slot to slot is an equip, with its swap and eligibility rules. */
+	if (TargetLocation.Type == EPEPItemLocationType::NamedSlot
+		&& FindSlotDefinition(TargetLocation.LocationTag))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+	}
+	return FPEPItemResult::Success(ItemId);
+}
+
+FPEPItemResult UPEPEquipmentComponent::ExecuteUnequipItem(
+	const FPEPItemId ItemId,
+	const FPEPItemLocation& TargetLocation)
+{
+	const FPEPItemResult Validation = ValidateUnequipRequest(ItemId, TargetLocation);
+	if (!Validation.bSuccess)
+	{
+		return Validation;
+	}
+	/* A move, never a swap: displacing the target's occupant into this slot would be an equip. */
+	return GetItemStore()->MoveItem(ItemId, TargetLocation, GetOwnerRequestContext());
+}
+
+bool UPEPEquipmentComponent::Server_RequestUnequipItem_Validate(
+	const FPEPItemId ItemId,
+	const FPEPItemLocation TargetLocation,
+	const int32 RequestId)
+{
+	(void)TargetLocation;
+	return ItemId.IsValid() && RequestId > 0;
+}
+
+void UPEPEquipmentComponent::Server_RequestUnequipItem_Implementation(
+	const FPEPItemId ItemId,
+	const FPEPItemLocation TargetLocation,
+	const int32 RequestId)
+{
+	ResolveEquipRequest(RequestId, ExecuteUnequipItem(ItemId, TargetLocation));
 }
 
 
@@ -1156,6 +1449,12 @@ void UPEPEquipmentComponent::ResolveEquipRequest(
 void UPEPEquipmentComponent::HandlePublicEquipmentReplicated()
 {
 	ReconcileLocalPresentations();
+	/*
+	 * Clients only: the authority never receives its own Fast Array, so a listen server announces
+	 * once from RefreshPublicProjection and each client once from here. A receive that changed
+	 * nothing announces nothing, since the diff is against what this machine last announced.
+	 */
+	BroadcastEquipmentItemChanges();
 	OnPublicEquipmentChanged.Broadcast();
 }
 

@@ -3,9 +3,12 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Core/PEPTypes.h"
+#include "Equipment/PEPEquipmentEventTypes.h"
 #include "Equipment/PEPEquipmentNetTypes.h"
 #include "Equipment/PEPEquipmentPresentationTypes.h"
 #include "Equipment/PEPEquipmentTypes.h"
+#include "Item/PEPItemInstance.h"
+#include "Item/PEPItemLocation.h"
 #include "Item/PEPItemResultTypes.h"
 
 #include "PEPEquipmentComponent.generated.h"
@@ -17,9 +20,8 @@ class UPEPEquipmentProfile;
 class USceneComponent;
 class USkeletalMesh;
 class USkeletalMeshComponent;
+class UPEPItemDefinition;
 struct FPEPItemAccessContext;
-struct FPEPItemInstance;
-struct FPEPItemLocation;
 struct FPEPItemStoreChange;
 class IPEPItemStore;
 
@@ -29,6 +31,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
 	FOnPEPEquipmentRequestResolved,
 	const FPEPEquipmentRequestResult&,
 	RequestResult);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+	FOnPEPEquipmentItemChanged,
+	const FPEPEquipmentChange&,
+	Change);
 
 /**
  * Bridges an authoritative item store to a small public equipment projection. Presentation actors
@@ -132,8 +138,51 @@ public:
 	UFUNCTION(BlueprintCallable, Category="PEP|Equipment|Preview")
 	FPEPItemResult PreviewEquipItem(FPEPItemId ItemId, FGameplayTag SlotTag) const;
 
+	/**
+	 * Asks for an item occupying one of this component's slots to be moved to TargetLocation.
+	 *
+	 * TargetLocation is required: IPEPItemStore offers no automatic placement, so an unset
+	 * location fails with Reason.UnsupportedMode instead of guessing, and a malformed one with
+	 * Reason.InvalidTarget. A target that is itself one of this component's slots fails with
+	 * Reason.InvalidTarget: that is an equip. The item must directly occupy one of this
+	 * component's slots (Reason.StateMismatch otherwise).
+	 *
+	 * Authority: executed at once and resolved through OnEquipmentRequestResolved, sharing the
+	 * equip request ids. Owning client: a target it can already tell is wrong returns Failed with
+	 * no request; anything else is Submitted and resolved by the server.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Equipment")
+	EPEPRequestResult RequestUnequipItem(
+		FPEPItemId ItemId,
+		FPEPItemLocation TargetLocation,
+		int32& OutRequestId);
+
+	/** Authority executor behind RequestUnequipItem. Raises no request resolution. */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="PEP|Equipment")
+	FPEPEquipmentRequestResult UnequipItem(FPEPItemId ItemId, FPEPItemLocation TargetLocation);
+
+	/** Local validation only, symmetric with PreviewEquipItem. */
+	UFUNCTION(BlueprintCallable, Category="PEP|Equipment|Preview")
+	FPEPItemResult PreviewUnequipItem(FPEPItemId ItemId, FPEPItemLocation TargetLocation) const;
+
 	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment")
 	FOnPEPPublicEquipmentChanged OnPublicEquipmentChanged;
+
+	/**
+	 * A public node entered the projection, on every machine that sees it — the authority when it
+	 * rebuilds, each client when the replicated view lands. Attachments included. Within one
+	 * change every Unequipped is raised before any Equipped, so an item moving between slots reads
+	 * Unequipped(old slot) then Equipped(new slot). Raised before OnPublicEquipmentChanged.
+	 *
+	 * Raised as the projection changes, which may be before a listener's BeginPlay on a freshly
+	 * replicated pawn: read GetPublicPresentationNodes() when binding to catch up.
+	 */
+	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Event")
+	FOnPEPEquipmentItemChanged OnItemEquipped;
+
+	/** A public node left the projection, or changed slot or parent. See OnItemEquipped. */
+	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Event")
+	FOnPEPEquipmentItemChanged OnItemUnequipped;
 
 	UPROPERTY(BlueprintAssignable, Category="PEP|Equipment|Request")
 	FOnPEPEquipmentRequestResolved OnEquipmentRequestResolved;
@@ -165,6 +214,12 @@ protected:
 	void Server_RequestEquipItem(FPEPItemId ItemId, FGameplayTag SlotTag, int32 RequestId);
 
 	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_RequestUnequipItem(
+		FPEPItemId ItemId,
+		FPEPItemLocation TargetLocation,
+		int32 RequestId);
+
+	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_ShowTemporaryItemPresentation(
 		FPEPItemId ItemId,
 		FName PresentationKey,
@@ -174,8 +229,24 @@ protected:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_HideTemporaryItemPresentation(FName PresentationKey);
 
+	/** Resolves equip and unequip requests alike: they share one request id sequence. */
 	UFUNCTION(Client, Reliable)
 	void Client_ResolveEquipRequest(FPEPEquipmentRequestResult RequestResult);
+
+	/**
+	 * Subclass hook, asked after the slot's item tags and before any
+	 * IPEPEquipmentEligibilityProvider on the owner. Same contract as a provider: a pure query,
+	 * Definition null when not resident. Allows by default.
+	 */
+	UFUNCTION(BlueprintNativeEvent, Category="PEP|Equipment|Eligibility")
+	FPEPItemResult CanEquipItemInSlot(
+		const FPEPItemInstance& Item,
+		const UPEPItemDefinition* Definition,
+		FGameplayTag SlotTag) const;
+	virtual FPEPItemResult CanEquipItemInSlot_Implementation(
+		const FPEPItemInstance& Item,
+		const UPEPItemDefinition* Definition,
+		FGameplayTag SlotTag) const;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Equipment|Slots")
 	TObjectPtr<UPEPEquipmentProfile> EquipmentProfile;
@@ -203,8 +274,6 @@ protected:
 	UPROPERTY(Replicated)
 	FPEPPublicEquipmentView PublicEquipmentView;
 
-	/** Logical home of the item currently occupying Equipment.Slot.Hand.Right. */
-
 private:
 	void InitializeItemStoreIntegration();
 	void UninitializeItemStoreIntegration();
@@ -216,9 +285,26 @@ private:
 	FPEPItemResult ValidateEquipmentLocation(
 		const FPEPItemInstance& Item,
 		const FPEPItemLocation& Location) const;
+	/** Slot item tags, then CanEquipItemInSlot, then every provider on the owner. First failure wins. */
+	FPEPItemResult CheckEquipEligibility(
+		const FPEPItemInstance& Item,
+		FGameplayTag SlotTag) const;
+	/** The owner actor first, then its components ordered by name: stable on one machine. */
+	void GatherEligibilityProviders(TArray<const UObject*>& OutProviders) const;
+	FPEPItemResult ExecuteEquipItem(FPEPItemId ItemId, FGameplayTag SlotTag);
+	/** Everything an unequip can be refused for without asking the store to move anything. */
+	FPEPItemResult ValidateUnequipRequest(
+		FPEPItemId ItemId,
+		const FPEPItemLocation& TargetLocation) const;
+	FPEPItemResult ExecuteUnequipItem(FPEPItemId ItemId, const FPEPItemLocation& TargetLocation);
 	const FPEPEquipmentSlotDefinition* FindSlotDefinition(FGameplayTag SlotTag) const;
 
 	void RefreshPublicProjection();
+	/**
+	 * Diffs the projection against what this machine last announced and raises OnItemUnequipped
+	 * then OnItemEquipped. The one place both events come from, on authority and clients alike.
+	 */
+	void BroadcastEquipmentItemChanges();
 	void AppendPublicAttachmentEntries(
 		const IPEPItemStore& ItemStore,
 		FPEPItemId ParentItemId,
@@ -336,4 +422,9 @@ private:
 	TMap<FPEPItemId, FPEPLocalPresentationTarget> LocalPresentationTargets;
 	/** The public node each local presentation was built from: what a reconcile diffs against. */
 	TMap<FPEPItemId, FPEPEquippedItemPublic> PresentedNodes;
+
+	/** The projection as of the last OnItemEquipped/OnItemUnequipped this machine raised. */
+	TArray<FPEPEquippedItemPublic> AnnouncedEquipmentNodes;
+	bool bBroadcastingEquipmentItemChanges = false;
+	bool bEquipmentItemChangesPending = false;
 };

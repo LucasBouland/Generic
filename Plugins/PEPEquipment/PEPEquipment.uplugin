@@ -19,6 +19,11 @@
       "LoadingPhase": "Default"
     },
     {
+      "Name": "PEPEquipmentGMAS",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
       "Name": "PEPEquipmentEditor",
       "Type": "Editor",
       "LoadingPhase": "Default"
@@ -29,6 +34,7 @@
     { "Name": "PEPItems", "Enabled": true },
     { "Name": "PEPInventory", "Enabled": true, "TargetAllowList": [ "Editor" ] },
     { "Name": "PEPCoreUI", "Enabled": true },
+    { "Name": "GMCAbilitySystem", "Enabled": true },
     {
       "Name": "DataValidation",
       "Enabled": true,
