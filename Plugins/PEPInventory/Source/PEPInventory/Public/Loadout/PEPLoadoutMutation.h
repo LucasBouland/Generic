@@ -26,8 +26,15 @@ namespace PEPLoadoutMutation
 	 *
 	 * A missing definition is established against the asset registry, never against whether the
 	 * asset happens to be loaded — those are different questions, and answering the second one
-	 * would let a streaming hiccup delete a stash. When the registry cannot be consulted at all
-	 * nothing is pruned, because absence of proof is not proof of absence.
+	 * would let a streaming hiccup delete a stash. Whenever the question cannot be answered —
+	 * no asset manager yet, a primary asset type the asset manager was never told about, an asset
+	 * registry still scanning — the item is kept, because absence of proof is not proof of absence.
+	 *
+	 * An item whose definition id is not even valid names nothing and is pruned; that invalid id is
+	 * listed in OutReport.MissingDefinitions like any other, so the loss is still reported.
+	 *
+	 * Linear in the size of the forest: each definition is resolved once, and a dead item's
+	 * descendants are found through a parent index rather than by rescanning the tree.
 	 */
 	PEPINVENTORY_API void PruneMissingDefinitions(
 		TArray<FPEPInventoryTreePlacement>& Placements,

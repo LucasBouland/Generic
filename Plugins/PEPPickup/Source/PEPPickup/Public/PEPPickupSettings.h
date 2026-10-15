@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Engine/DeveloperSettings.h"
 #include "GameplayTagContainer.h"
+#include "UObject/ObjectKey.h"
 
 #include "PEPPickupSettings.generated.h"
 
@@ -44,12 +45,22 @@ class PEPPICKUP_API UPEPPickupSettings : public UDeveloperSettings
 public:
 	UPEPPickupSettings();
 
+	virtual void PostInitProperties() override;
+	virtual void BeginDestroy() override;
+	virtual void PostReloadConfig(FProperty* PropertyThatWasLoaded) override;
+#if WITH_EDITOR
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
+	/** Whether items offer Pickup when no tag below decides otherwise. */
 	UPROPERTY(Config, EditAnywhere, Category="Pickup", meta=(DisplayName="Pickup By Default"))
 	bool bDefaultCanPickup = true;
 
+	/** When not empty, only items owning all these tags can be picked up. */
 	UPROPERTY(Config, EditAnywhere, Category="Pickup", meta=(Categories="Item"))
 	FGameplayTagContainer RequiredPickupTags;
 
+	/** Items owning any of these tags can never be picked up. */
 	UPROPERTY(Config, EditAnywhere, Category="Pickup", meta=(Categories="Item"))
 	FGameplayTagContainer BlockedPickupTags;
 
@@ -63,17 +74,39 @@ public:
 
 	/**
 	 * An item's final option list is the union of every row whose ItemTag it owns (hierarchy-aware:
-	 * an item tagged Item.Type.Weapon.Rifle matches a row keyed Item.Type.Weapon). Pickup itself is
-	 * never read from here: APEPPickupItemActor guarantees it regardless of what this configures.
+	 * an item tagged Item.Type.Weapon.Rifle matches a row keyed Item.Type.Weapon). Pickup is never
+	 * read from here: the pickup actors offer it exactly when CanPickupDefinition allows it (the
+	 * Pickup category above), and ignore a Pickup entry in this table.
 	 */
 	UPROPERTY(Config, EditAnywhere, Category="Interaction Options")
 	TArray<FPEPDefaultInteractionOptionsEntry> DefaultInteractionOptionsByItemTag;
 
-	/** Unions the configured option tags for every owned tag of Definition that matches a key. */
+	/**
+	 * Unions the configured option tags for every owned tag of Definition that matches a key.
+	 * Cached per definition: the table is walked once per definition until the settings, or in
+	 * the editor any item definition, change. Game thread only.
+	 */
 	void GetDefaultInteractionOptionTags(
 		const UPEPItemDefinition* Definition,
 		TArray<FGameplayTag>& OutOptionTags) const;
 
 	/** Applies project pickup tag policy to a definition; missing definitions fail closed. */
 	bool CanPickupDefinition(const UPEPItemDefinition* Definition) const;
+
+	/**
+	 * Forgets the cached option lists. Automatic when the settings are edited or reloaded; call it
+	 * after changing DefaultInteractionOptionsByItemTag, or a definition's owned tags, at runtime.
+	 */
+	void InvalidateInteractionOptionCache() const;
+
+private:
+	/* Option lists already resolved, by definition. Never serialized. */
+	mutable TMap<FObjectKey, TArray<FGameplayTag>> DefaultInteractionOptionCache;
+
+#if WITH_EDITOR
+	/* An edited item definition may own different tags now. */
+	void HandleObjectPropertyChanged(UObject* Object, FPropertyChangedEvent& PropertyChangedEvent);
+
+	FDelegateHandle ObjectPropertyChangedHandle;
+#endif
 };

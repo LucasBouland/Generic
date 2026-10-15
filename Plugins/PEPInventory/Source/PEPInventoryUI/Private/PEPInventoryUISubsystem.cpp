@@ -10,8 +10,10 @@
 #include "Components/PEPInventorySessionComponent.h"
 #include "Core/PEPCoreTags.h"
 #include "Inventory/PEPInventoryTags.h"
-#include "Actors/PEPPlayerController.h"
+#include "Player/PEPPlayerMenuHost.h"
+#include "Engine/AssetManager.h"
 #include "Engine/LocalPlayer.h"
+#include "Engine/StreamableManager.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
@@ -21,27 +23,46 @@ void UPEPInventoryUISubsystem::Deinitialize()
 {
 	if (APlayerController* PC = ObservedController.Get())
 		PC->OnPossessedPawnChanged.RemoveDynamic(this, &ThisClass::HandlePawnChanged);
-	if (APEPPlayerController* PEPController = Cast<APEPPlayerController>(ObservedController.Get()))
-		PEPController->OnPlayerInputStateChanged.RemoveDynamic(this, &ThisClass::HandlePlayerInputStateChanged);
-	DetachSession();
+	if (IPEPPlayerMenuHost* MenuHost = Cast<IPEPPlayerMenuHost>(ObservedController.Get()))
+		MenuHost->GetOnPlayerInputStateChanged().RemoveDynamic(this, &ThisClass::HandlePlayerInputStateChanged);
+	CancelSessionWindowLoad();
+	// The inventory first: detaching it re-reads the session presentation, through the controller.
 	DetachInventory();
+	DetachSession();
+	// Forgotten too, or a late GetSessionComponent would find and bind its component again.
+	ObservedController.Reset();
 	InventoryScreen = nullptr;
 	Super::Deinitialize();
 }
 
 void UPEPInventoryUISubsystem::PlayerControllerChanged(APlayerController* NewPlayerController)
 {
+	const bool bControllerChanged = NewPlayerController != ObservedController.Get();
 	if (APlayerController* Previous = ObservedController.Get())
 		Previous->OnPossessedPawnChanged.RemoveDynamic(this, &ThisClass::HandlePawnChanged);
-	if (APEPPlayerController* Previous = Cast<APEPPlayerController>(ObservedController.Get()))
-		Previous->OnPlayerInputStateChanged.RemoveDynamic(this, &ThisClass::HandlePlayerInputStateChanged);
+	if (IPEPPlayerMenuHost* Previous = Cast<IPEPPlayerMenuHost>(ObservedController.Get()))
+		Previous->GetOnPlayerInputStateChanged().RemoveDynamic(this, &ThisClass::HandlePlayerInputStateChanged);
 	DetachSession();
 	ObservedController = NewPlayerController;
 	AttachSession(NewPlayerController);
+	if (bControllerChanged)
+	{
+		/*
+		 * Whatever was presented belonged to the previous controller's session. Withdrawn, so the
+		 * loot side hides and the new controller's next session is presented as new, not skipped
+		 * as the one already on screen.
+		 */
+		CancelSessionWindowLoad();
+		if (PresentedSessionId.IsValid())
+		{
+			PresentedSessionId.Invalidate();
+			OnTransferSessionPresented.Broadcast(FPEPInventoryUIContext());
+		}
+	}
 	if (NewPlayerController)
 		NewPlayerController->OnPossessedPawnChanged.AddUniqueDynamic(this, &ThisClass::HandlePawnChanged);
-	if (APEPPlayerController* PEPController = Cast<APEPPlayerController>(NewPlayerController))
-		PEPController->OnPlayerInputStateChanged.AddUniqueDynamic(this, &ThisClass::HandlePlayerInputStateChanged);
+	if (IPEPPlayerMenuHost* MenuHost = Cast<IPEPPlayerMenuHost>(NewPlayerController))
+		MenuHost->GetOnPlayerInputStateChanged().AddUniqueDynamic(this, &ThisClass::HandlePlayerInputStateChanged);
 
 	Super::PlayerControllerChanged(NewPlayerController);
 	// The initial controller notification can arrive after Blueprint registered the inventory.
@@ -122,19 +143,37 @@ UPEPInventoryComponent* UPEPInventoryUISubsystem::GetInventoryComponent() const
 
 UPEPInventorySessionComponent* UPEPInventoryUISubsystem::GetSessionComponent() const
 {
-	UPEPInventorySessionComponent* Session = ObservedSession.Get();
-	if (!IsValid(Session))
+	if (UPEPInventorySessionComponent* Session = ObservedSession.Get(); IsValid(Session))
 	{
-		const APlayerController* PC = ObservedController.Get();
-		Session = PC ? PC->FindComponentByClass<UPEPInventorySessionComponent>() : nullptr;
+		return Session;
 	}
-	return IsValid(Session) ? Session : nullptr;
+	const APlayerController* PC = ObservedController.Get();
+	UPEPInventorySessionComponent* Found = PC ? PC->FindComponentByClass<UPEPInventorySessionComponent>() : nullptr;
+	if (!IsValid(Found))
+	{
+		return nullptr;
+	}
+	/*
+	 * Added after the controller was announced: by a Blueprint at BeginPlay, a game feature, a
+	 * replicated component arriving late. Bound now, or the sessions it opens would never reach
+	 * this subsystem's events. Binding changes no answer a caller can read, so a reader may do it.
+	 */
+	const_cast<ThisClass*>(this)->BindSession(Found);
+	return Found;
 }
 
 void UPEPInventoryUISubsystem::AttachSession(APlayerController* Controller)
 {
-	UPEPInventorySessionComponent* Session =
-		Controller ? Controller->FindComponentByClass<UPEPInventorySessionComponent>() : nullptr;
+	BindSession(Controller ? Controller->FindComponentByClass<UPEPInventorySessionComponent>() : nullptr);
+}
+
+void UPEPInventoryUISubsystem::BindSession(UPEPInventorySessionComponent* Session)
+{
+	if (ObservedSession.Get() == Session)
+	{
+		return;
+	}
+	DetachSession();
 	ObservedSession = Session;
 	if (Session)
 	{
@@ -397,83 +436,114 @@ void UPEPInventoryUISubsystem::HandleRequestResolved(const FPEPInventoryRequestR
 	OnRequestResolved.Broadcast(RequestResult);
 }
 
-void UPEPInventoryUISubsystem::GetEntriesInContainerSlot(const FPEPInventoryUIContext& Context,
-    FPEPItemId ParentItemId, FName SlotName, TArray<FPEPInventoryEntry>& OutEntries) const
+namespace PEPInventoryUISubsystemPrivate
 {
-    OutEntries.Reset();
-    if (!IsContextCurrent(Context)) return;
-    if (Context.Type == EPEPInventoryUIContextType::PlayerInventory)
-    {
-        GetInventoryComponent()->GetEntriesInContainerSlot(ParentItemId, SlotName, OutEntries);
-        return;
-    }
-    const UPEPInventorySessionComponent* Session = GetSessionComponent();
-    TArray<FPEPItemId> Ids;
-    Session->GetSessionItemIds(Ids);
-    for (FPEPItemId Id : Ids)
-    {
-        FPEPInventoryEntry Entry;
-        if (Session->FindSessionEntry(Id, Entry)
-            && Entry.Location.Type == EPEPItemLocationType::ItemContainer
-            && Entry.Location.ParentItemId == ParentItemId && Entry.Location.ContainerSlotName == SlotName)
-        {
-            OutEntries.Add(MoveTemp(Entry));
-        }
-    }
+	/** The world item a transfer session was opened on: the mirror's occupant of the world-item slot. */
+	const FPEPInventoryEntry* FindWorldItemRootEntry(const UPEPInventorySessionComponent& Session)
+	{
+		for (const FPEPInventoryEntry& Entry : Session.GetSessionEntries())
+		{
+			if (Entry.Location.Type == EPEPItemLocationType::NamedSlot
+				&& Entry.Location.LocationTag == PEPInventoryTags::Inventory_Location_WorldItem)
+			{
+				return &Entry;
+			}
+		}
+		return nullptr;
+	}
+}
+
+void UPEPInventoryUISubsystem::GetEntriesInContainerSlot(const FPEPInventoryUIContext& Context,
+	FPEPItemId ParentItemId, FName SlotName, TArray<FPEPInventoryEntry>& OutEntries) const
+{
+	OutEntries.Reset();
+	if (!IsContextCurrent(Context))
+	{
+		return;
+	}
+	if (Context.Type == EPEPInventoryUIContextType::PlayerInventory)
+	{
+		GetInventoryComponent()->GetEntriesInContainerSlot(ParentItemId, SlotName, OutEntries);
+		return;
+	}
+	const UPEPInventorySessionComponent* Session = GetSessionComponent();
+	if (!Session)
+	{
+		return;
+	}
+	// One pass over the mirror; only the occupants are copied, once each.
+	for (const FPEPInventoryEntry& Entry : Session->GetSessionEntries())
+	{
+		const FPEPItemLocation& Location = Entry.Location;
+		if (Location.Type == EPEPItemLocationType::ItemContainer
+			&& Location.ParentItemId == ParentItemId && Location.ContainerSlotName == SlotName)
+		{
+			OutEntries.Add(Entry);
+		}
+	}
 }
 
 bool UPEPInventoryUISubsystem::FindEntryInNamedSlot(const FPEPInventoryUIContext& Context,
-    FGameplayTag SlotTag, FPEPInventoryEntry& OutEntry) const
+	FGameplayTag SlotTag, FPEPInventoryEntry& OutEntry) const
 {
-    OutEntry = FPEPInventoryEntry();
-    if (!SlotTag.IsValid() || !IsContextCurrent(Context)) return false;
-    const UPEPInventoryComponent* Inventory = GetInventoryComponent();
-    const UPEPInventorySessionComponent* Session = GetSessionComponent();
-    const bool bSession = Context.Type == EPEPInventoryUIContextType::TransferSession;
-    TArray<FPEPItemId> Ids;
-    if (bSession) Session->GetSessionItemIds(Ids);
-    else Inventory->GetInventoryItemIds(Ids);
-    for (FPEPItemId Id : Ids)
-    {
-        FPEPInventoryEntry Entry;
-        const bool bFound = bSession ? Session->FindSessionEntry(Id, Entry) : Inventory->FindInventoryEntry(Id, Entry);
-        if (bFound && Entry.Location.Type == EPEPItemLocationType::NamedSlot && Entry.Location.LocationTag == SlotTag)
-        {
-            OutEntry = MoveTemp(Entry);
-            return true;
-        }
-    }
-    return false;
+	OutEntry = FPEPInventoryEntry();
+	if (!SlotTag.IsValid() || !IsContextCurrent(Context))
+	{
+		return false;
+	}
+	const FPEPInventoryEntry* Found = nullptr;
+	if (Context.Type == EPEPInventoryUIContextType::TransferSession)
+	{
+		const UPEPInventorySessionComponent* Session = GetSessionComponent();
+		if (!Session)
+		{
+			return false;
+		}
+		for (const FPEPInventoryEntry& Entry : Session->GetSessionEntries())
+		{
+			if (Entry.Location.Type == EPEPItemLocationType::NamedSlot && Entry.Location.LocationTag == SlotTag)
+			{
+				Found = &Entry;
+				break;
+			}
+		}
+	}
+	else
+	{
+		// The store answers a named slot from its own slot index.
+		const UPEPInventoryComponent* Inventory = GetInventoryComponent();
+		FPEPItemId ItemId;
+		if (Inventory && Inventory->FindItemAtLocation(FPEPItemLocation::MakeNamedSlot(SlotTag), ItemId))
+		{
+			Found = Inventory->FindEntry(ItemId);
+		}
+	}
+	if (!Found)
+	{
+		return false;
+	}
+	OutEntry = *Found;
+	return true;
 }
 
 bool UPEPInventoryUISubsystem::GetTransferSessionRootItem(FPEPItemInstance& OutRootItem) const
 {
-    OutRootItem = FPEPItemInstance();
-    const UPEPInventorySessionComponent* Session = GetSessionComponent();
-    if (!Session || !IsContextCurrent(GetTransferSessionContext())) return false;
-	if (Session->IsTransferSessionReadOnly())
+	OutRootItem = FPEPItemInstance();
+	const UPEPInventorySessionComponent* Session = GetSessionComponent();
+	if (!Session || !IsContextCurrent(GetTransferSessionContext()))
 	{
-		FPEPInventoryEntry RootEntry;
-		if (Session->FindSessionEntry(Session->GetTransferSessionRootItemId(), RootEntry))
-		{
-			OutRootItem = RootEntry.Item;
-			return true;
-		}
 		return false;
 	}
-    TArray<FPEPItemId> Ids;
-    Session->GetSessionItemIds(Ids);
-    for (FPEPItemId Id : Ids)
-    {
-        FPEPInventoryEntry Entry;
-        if (Session->FindSessionEntry(Id, Entry) && Entry.Location.Type == EPEPItemLocationType::NamedSlot
-            && Entry.Location.LocationTag == PEPInventoryTags::Inventory_Location_WorldItem)
-        {
-            OutRootItem = Entry.Item;
-            return true;
-        }
-    }
-    return false;
+	// An inspection names its root; a transfer session's root is whatever holds the world-item slot.
+	const FPEPInventoryEntry* RootEntry = Session->IsTransferSessionReadOnly()
+		? Session->FindSessionEntryPtr(Session->GetTransferSessionRootItemId())
+		: PEPInventoryUISubsystemPrivate::FindWorldItemRootEntry(*Session);
+	if (!RootEntry)
+	{
+		return false;
+	}
+	OutRootItem = RootEntry->Item;
+	return true;
 }
 
 void UPEPInventoryUISubsystem::UpdateSessionMenu()
@@ -485,15 +555,15 @@ void UPEPInventoryUISubsystem::UpdateSessionMenu()
     PresentedSessionId = SessionId;
     // Announced before the menu opens, so the screen it reveals is already showing the loot side.
     OnTransferSessionPresented.Broadcast(SessionId.IsValid() ? Context : FPEPInventoryUIContext());
-    APEPPlayerController* PC = Cast<APEPPlayerController>(ObservedController.Get());
+    IPEPPlayerMenuHost* MenuHost = Cast<IPEPPlayerMenuHost>(ObservedController.Get());
     if (!SessionId.IsValid())
     {
         // The container went away (picked up, destroyed, out of range): leave the menu as a toggle
         // would. A no-op when closing the menu is what ended the session.
-        if (bEndedPresentedSession) PC->CloseMenu();
+        if (bEndedPresentedSession && MenuHost) MenuHost->CloseMenu();
         return;
     }
-    if (!PC->OpenMenu())
+    if (!MenuHost || !MenuHost->OpenMenu())
     {
         // A session nobody can see would only hold the container open until the player walks off.
         PresentedSessionId.Invalidate();
@@ -535,59 +605,129 @@ void UPEPInventoryUISubsystem::HandlePlayerInputStateChanged(const EPEPPlayerInp
 
 void UPEPInventoryUISubsystem::UpdateSessionWindow()
 {
-    // Only a PEP controller has a player menu; anything else keeps the floating window.
-    if (GetUISettings()->bPresentSessionInPlayerMenu && Cast<APEPPlayerController>(ObservedController.Get()))
-    {
-        UpdateSessionMenu();
-        return;
-    }
-    const FPEPInventoryUIContext Context = GetTransferSessionContext();
-    if (SessionWindow && SessionWindow->InventoryContext.TransferSessionId == Context.TransferSessionId
-        && IsContextCurrent(Context)) return;
-    if (SessionWindow)
-    {
-        UPEPInventoryWindow* Previous = SessionWindow;
-        SessionWindow = nullptr;
-        Previous->RemoveFromParent();
-        if (SessionLayer)
-        {
-            SessionLayer->RemoveFromParent();
-            SessionLayer = nullptr;
-        }
-    }
-    const UPEPInventorySessionComponent* Session = GetSessionComponent();
-    const UPEPInventoryUISettings* Settings = GetUISettings();
-    if (!Session || !IsContextCurrent(Context) || Settings->SessionWindowClass.IsNull()) return;
-    TArray<FPEPItemId> Ids;
-    Session->GetSessionItemIds(Ids);
-    for (FPEPItemId Id : Ids)
-    {
-        FPEPInventoryEntry Entry;
-        if (!Session->FindSessionEntry(Id, Entry) || Entry.Location.Type != EPEPItemLocationType::NamedSlot
-            || Entry.Location.LocationTag != PEPInventoryTags::Inventory_Location_WorldItem) continue;
-        UClass* WindowClass = Settings->SessionWindowClass.LoadSynchronous();
-        APlayerController* PC = GetLocalPlayer()->GetPlayerController(GetWorld());
-        if (!WindowClass || !PC) return;
-        SessionWindow = CreateWidget<UPEPInventoryWindow>(PC, WindowClass);
-        if (!SessionWindow) return;
-        SessionWindow->bManageTransferSession = true;
-        SessionWindow->OwnerItem = Entry.Item;
-        SessionWindow->InventoryContext = Context;
-        SessionLayer = CreateWidget<UPEPInventorySessionLayer>(PC);
-        if (!SessionLayer)
-        {
-            SessionWindow = nullptr;
-            return;
-        }
-        SessionLayer->SetWindow(SessionWindow);
-        SessionLayer->AddToViewport(20);
-        return;
-    }
+	// Only a player menu host (APEPPlayerController) has a player menu; anything else keeps the floating window.
+	if (GetUISettings()->bPresentSessionInPlayerMenu && Cast<IPEPPlayerMenuHost>(ObservedController.Get()))
+	{
+		CancelSessionWindowLoad();
+		UpdateSessionMenu();
+		return;
+	}
+	const FPEPInventoryUIContext Context = GetTransferSessionContext();
+	if (SessionWindow && SessionWindow->InventoryContext.TransferSessionId == Context.TransferSessionId
+		&& IsContextCurrent(Context))
+	{
+		return;
+	}
+	RemoveSessionWindow();
+	const UPEPInventorySessionComponent* Session = GetSessionComponent();
+	const UPEPInventoryUISettings* Settings = GetUISettings();
+	const FPEPInventoryEntry* RootEntry = Session && IsContextCurrent(Context) && !Settings->SessionWindowClass.IsNull()
+		? PEPInventoryUISubsystemPrivate::FindWorldItemRootEntry(*Session)
+		: nullptr;
+	if (!RootEntry)
+	{
+		// Nothing to show, so nothing to wait for: a session that closed mid-load ends here.
+		CancelSessionWindowLoad();
+		return;
+	}
+	if (UClass* WindowClass = Settings->SessionWindowClass.Get())
+	{
+		CancelSessionWindowLoad();
+		// Copied: widget construction runs Blueprint code, which may change the mirror under a pointer.
+		const FPEPItemInstance RootItem = RootEntry->Item;
+		CreateSessionWindow(WindowClass, Context, RootItem);
+		return;
+	}
+	// A load in flight for this session is waited for; one that failed is not retried until the next.
+	if (SessionWindowLoadSessionId == Context.TransferSessionId)
+	{
+		return;
+	}
+	CancelSessionWindowLoad();
+	if (!UAssetManager::IsInitialized())
+	{
+		return;
+	}
+	SessionWindowLoadSessionId = Context.TransferSessionId;
+	SessionWindowClassHandle = UAssetManager::GetStreamableManager().RequestAsyncLoad(
+		Settings->SessionWindowClass.ToSoftObjectPath(),
+		FStreamableDelegate::CreateWeakLambda(this, [this]()
+		{
+			HandleSessionWindowClassLoaded();
+		}));
+}
+
+void UPEPInventoryUISubsystem::HandleSessionWindowClassLoaded()
+{
+	SessionWindowClassHandle.Reset();
+	if (!GetUISettings()->SessionWindowClass.Get())
+	{
+		// Failed. SessionWindowLoadSessionId stays, so this session does not ask again on every change.
+		return;
+	}
+	SessionWindowLoadSessionId.Invalidate();
+	// Whatever happened while loading (the session closed, changed, or the menu took over) is read now.
+	UpdateSessionWindow();
+}
+
+void UPEPInventoryUISubsystem::CancelSessionWindowLoad()
+{
+	if (SessionWindowClassHandle.IsValid())
+	{
+		SessionWindowClassHandle->CancelHandle();
+		SessionWindowClassHandle.Reset();
+	}
+	SessionWindowLoadSessionId.Invalidate();
+}
+
+void UPEPInventoryUISubsystem::CreateSessionWindow(UClass* WindowClass, const FPEPInventoryUIContext& Context,
+	const FPEPItemInstance& RootItem)
+{
+	ULocalPlayer* LocalPlayer = GetLocalPlayer();
+	APlayerController* PC = LocalPlayer ? LocalPlayer->GetPlayerController(GetWorld()) : nullptr;
+	if (!WindowClass || !PC)
+	{
+		return;
+	}
+	SessionWindow = CreateWidget<UPEPInventoryWindow>(PC, WindowClass);
+	if (!SessionWindow)
+	{
+		return;
+	}
+	SessionWindow->bManageTransferSession = true;
+	SessionWindow->OwnerItem = RootItem;
+	SessionWindow->InventoryContext = Context;
+	SessionLayer = CreateWidget<UPEPInventorySessionLayer>(PC);
+	if (!SessionLayer)
+	{
+		SessionWindow = nullptr;
+		return;
+	}
+	SessionLayer->SetWindow(SessionWindow);
+	SessionLayer->AddToViewport(20);
+}
+
+void UPEPInventoryUISubsystem::RemoveSessionWindow()
+{
+	if (!SessionWindow)
+	{
+		return;
+	}
+	UPEPInventoryWindow* Previous = SessionWindow;
+	SessionWindow = nullptr;
+	Previous->RemoveFromParent();
+	if (SessionLayer)
+	{
+		SessionLayer->RemoveFromParent();
+		SessionLayer = nullptr;
+	}
 }
 
 void UPEPInventoryUISubsystem::HandlePawnChanged(APawn* OldPawn, APawn* NewPawn)
 {
     APlayerController* PC = ObservedController.Get();
+    // A session component added since the controller was announced is picked up here too.
+    if (PC && !ObservedSession.IsValid()) AttachSession(PC);
     UPEPInventoryComponent* Inventory = NewPawn ? NewPawn->FindComponentByClass<UPEPInventoryComponent>() : nullptr;
     if (!Inventory && PC) Inventory = PC->FindComponentByClass<UPEPInventoryComponent>();
     if (Inventory) RegisterInventoryComponent(Inventory);

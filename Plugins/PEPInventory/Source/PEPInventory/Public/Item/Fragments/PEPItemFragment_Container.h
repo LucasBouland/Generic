@@ -11,7 +11,13 @@ struct PEPINVENTORY_API FPEPItemState_ContainerRuntime : public FPEPItemStateFra
 	GENERATED_BODY()
 
 public:
-	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadWrite, Category="PEP|Item|Container")
+	/**
+	 * EditAnywhere so a preset can author a container that starts locked, or unlocked against its
+	 * definition's default. Read-only to Blueprint: locking goes through PEPItemContainerMutation on
+	 * the owning store, which checks the rules and announces the change; a struct edited in a graph
+	 * would do neither.
+	 */
+	UPROPERTY(SaveGame, EditAnywhere, BlueprintReadOnly, Category="PEP|Item|Container")
 	bool bLocked = false;
 };
 
@@ -101,9 +107,9 @@ public:
 
 /**
  * A reusable bundle of slot policy — access rules, visibility, item tags — with no name or size
- * of its own. Authored once in UPEPItemSettings::SlotPresets and applied to as many slots as
- * share the same policy, so a jacket with six pockets that all behave the same way doesn't need
- * those ~10 fields retyped six times.
+ * of its own. Authored once in UPEPInventorySettings::SlotPresets (Project Settings > PEP Inventory
+ * > Container Slots) and applied to as many slots as share the same policy, so a jacket with six
+ * pockets that all behave the same way doesn't need those ~10 fields retyped six times.
  *
  * Deliberately excludes SlotName, Mode, GridSize and Purpose: those are what makes one slot a
  * different *place* from another, not a different *policy*, and a preset should never overwrite

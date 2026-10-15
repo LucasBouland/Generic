@@ -29,16 +29,24 @@ TArray<FGameplayTag> APEPPickupItemActor::GetInteractOptionTags_Implementation(
 	AActor* Interactor) const
 {
 	TArray<FGameplayTag> OptionTags;
-	if (const UPEPItemDefinition* Definition = GetItemDefinition())
+
+	/* Read once: on the authority each read copies the private item instance. */
+	const UPEPItemDefinition* Definition = GetItemDefinition();
+	if (!Definition)
 	{
-		GetDefault<UPEPPickupSettings>()->GetDefaultInteractionOptionTags(Definition, OptionTags);
+		return OptionTags;
 	}
 
+	const UPEPPickupSettings* Settings = GetDefault<UPEPPickupSettings>();
+	Settings->GetDefaultInteractionOptionTags(Definition, OptionTags);
+
+	/* Structural options belong to containers; Pickup follows the pickup policy, never the table. */
 	OptionTags.Remove(PEPInteractionTags::Open);
 	OptionTags.Remove(PEPInteractionTags::Inspect);
-	if (GetDefault<UPEPPickupSettings>()->CanPickupDefinition(GetItemDefinition()))
+	OptionTags.Remove(PEPInteractionTags::Pickup);
+	if (Settings->CanPickupDefinition(Definition))
 	{
-		OptionTags.AddUnique(PEPInteractionTags::Pickup);
+		OptionTags.Add(PEPInteractionTags::Pickup);
 	}
 	return OptionTags;
 }

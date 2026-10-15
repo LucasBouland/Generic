@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/LocalPlayerSubsystem.h"
-#include "Actors/PEPPlayerController.h"
+#include "Player/PEPPlayerMenuHost.h"
 #include "Components/PEPInventoryRequest.h"
 #include "Components/PEPInventoryTypes.h"
 #include "PEPInventoryUISubsystem.generated.h"
@@ -15,6 +15,7 @@ class UUserWidget;
 class UPEPInventoryWindow;
 class UPEPInventorySessionLayer;
 class APawn;
+struct FStreamableHandle;
 
 UENUM(BlueprintType)
 enum class EPEPInventoryUIContextType : uint8
@@ -74,7 +75,11 @@ public:
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory|UI")
 	UPEPInventoryComponent* GetInventoryComponent() const;
 
-	/** The session component on the observed controller; null without one, or without a controller. */
+	/**
+	 * The session component on the observed controller; null without one, or without a controller.
+	 * A component added to the controller after it was announced is found here and bound then, so
+	 * its session events reach this subsystem from that point on.
+	 */
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory|UI")
 	UPEPInventorySessionComponent* GetSessionComponent() const;
 
@@ -105,8 +110,11 @@ public:
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory|UI")
 	bool GetTransferSessionRootItem(FPEPItemInstance& OutRootItem) const;
 
-	/** Read only the selected local/session view; stale contexts return no entries. */
-	UFUNCTION(BlueprintPure, Category="PEP|Inventory|UI")
+	/**
+	 * Read only the selected local/session view; stale contexts return no entries. Callable rather
+	 * than pure: it copies every occupant, and a pure node would copy them again for each pin read.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Inventory|UI")
 	void GetEntriesInContainerSlot(const FPEPInventoryUIContext& Context,
 		FPEPItemId ParentItemId, FName SlotName, TArray<FPEPInventoryEntry>& OutEntries) const;
 
@@ -186,6 +194,21 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UPEPInventorySessionLayer> SessionLayer;
 	void UpdateSessionWindow();
+	void CreateSessionWindow(UClass* WindowClass, const FPEPInventoryUIContext& Context,
+		const FPEPItemInstance& RootItem);
+	void RemoveSessionWindow();
+
+	/**
+	 * SessionWindowClass is loaded asynchronously the first time a floating window is needed, so
+	 * opening a container never hitches on a blocking load. The window opens when the load lands,
+	 * if the session it was requested for is still the one shown; anything that happened meanwhile
+	 * is read afresh rather than replayed.
+	 */
+	TSharedPtr<FStreamableHandle> SessionWindowClassHandle;
+	/** Session the load was asked for. Kept after a failed load, so one session asks only once. */
+	FGuid SessionWindowLoadSessionId;
+	void CancelSessionWindowLoad();
+	void HandleSessionWindowClassLoaded();
 
 	/**
 	 * Last PreviewPlacement answer. A drag asks on every mouse move, nearly always about the cell
@@ -225,6 +248,8 @@ private:
 	UPROPERTY(Transient)
 	TWeakObjectPtr<UPEPInventorySessionComponent> ObservedSession;
 	void AttachSession(APlayerController* Controller);
+	/** Binds Session's events in place of the current component's; a no-op when already bound. */
+	void BindSession(UPEPInventorySessionComponent* Session);
 	void DetachSession();
 
 	FGuid InventoryBindingId;

@@ -90,6 +90,8 @@ bool FPEPWorldItemStorageTest::RunTest(const FString& Parameters)
     TestFalse(TEXT("world contents component does not replicate"), Actor->Inventory->GetIsReplicated());
     TestEqual(TEXT("root and attachment have one store"), Actor->Inventory->GetInventoryView().Entries.Num(), 2);
     TestEqual(TEXT("attachment is projected"), Actor->GetPublicPresentationNodes().Num(), 2);
+    TestTrue(TEXT("container offers Pickup under the default pickup policy"),
+        Actor->GetInteractOptionTags_Implementation(Player).Contains(PEPInteractionTags::Pickup));
     TestFalse(TEXT("attachment-only object cannot be opened"),
         Actor->ExecuteInteraction_Implementation(Player, PEPInteractionTags::Open).bSuccess);
     TestTrue(TEXT("Inspect through interaction"),
@@ -101,7 +103,8 @@ bool FPEPWorldItemStorageTest::RunTest(const FString& Parameters)
     TestFalse(TEXT("pickup without room fails"), Actor->ExecuteInteraction_Implementation(Player, PEPInteractionTags::Pickup).bSuccess);
     TestTrue(TEXT("failed pickup preserves source"), Actor->Inventory->ContainsItem(ChildId));
     Inventory->RegisterLocationValidator(TAG_TestWorldItemDestination, FPEPItemLocationValidator::CreateLambda(
-        [](const FPEPItemInstance& Item, const FPEPItemLocation&) { return FPEPItemResult::Success(Item.ItemId); }));
+        [](const FPEPItemInstance& Item, const FPEPItemLocation&) { return FPEPItemResult::Success(Item.ItemId); }),
+        /*bAllowAutoPlacement*/ true);
     const FPEPItemLocation Destination = FPEPItemLocation::MakeNamedSlot(TAG_TestWorldItemDestination);
     TestTrue(TEXT("take attachment"), Actor->Inventory->TransferItemToInventory(Inventory, ChildId,
         Destination, FPEPItemAccessContext::From(Player)).bSuccess);
@@ -111,6 +114,7 @@ bool FPEPWorldItemStorageTest::RunTest(const FString& Parameters)
         Child.Location, FPEPItemAccessContext::From(Player)).bSuccess);
     TestEqual(TEXT("restored attachment reappears"), Actor->GetPublicPresentationNodes().Num(), 2);
     TestTrue(TEXT("pickup transfers entire tree"), Actor->ExecuteInteraction_Implementation(Player, PEPInteractionTags::Pickup).bSuccess);
+    TestFalse(TEXT("picked-up container goes through HandlePickedUp"), IsValid(Actor));
     TestTrue(TEXT("root reaches player"), Inventory->ContainsItem(Tree.RootItem.ItemId));
     TestTrue(TEXT("attachment reaches player"), Inventory->ContainsItem(ChildId));
     TestEqual(TEXT("source store is empty"), Actor->Inventory->GetInventoryView().Entries.Num(), 0);

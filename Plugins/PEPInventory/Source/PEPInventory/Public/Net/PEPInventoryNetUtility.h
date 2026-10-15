@@ -45,13 +45,29 @@ struct PEPINVENTORY_API FPEPInventoryEntry
     void PostReplicatedChange(const FPEPInventoryView& Serializer);
 };
 
-USTRUCT(BlueprintType)
+/**
+ * The fast array itself. Not a Blueprint type: nothing reflected hands it out, and Blueprint reads
+ * a store through the component's accessors, never through its replication payload.
+ */
+USTRUCT()
 struct PEPINVENTORY_API FPEPInventoryView
     : public FFastArraySerializer
 {
     GENERATED_BODY()
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Inventory")
+    /*
+     * The callback targets decide which component a received delta is announced on. Only the two
+     * components that own a view bind them, and only the entries read them: anything else able to
+     * point a view at a store could make that store announce changes no delta made.
+     */
+    friend struct FPEPInventoryEntry;
+    friend class UPEPInventoryComponent;
+    friend class UPEPInventorySessionComponent;
+    /* Defined by the automation tests alone, which drive the callbacks on a detached view. */
+    friend struct FPEPInventoryViewTestAccess;
+
+public:
+    UPROPERTY(VisibleAnywhere, Category="PEP|Inventory")
     TArray<FPEPInventoryEntry> Entries;
 
     bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParams)
@@ -61,13 +77,30 @@ struct PEPINVENTORY_API FPEPInventoryView
             FPEPInventoryView>(Entries, DeltaParams, *this);
     }
 
+    void PostReplicatedReceive(
+        const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
+
+    /* Read-only views of the binding, for code that has to confirm it rather than set it. */
+    const UPEPInventoryComponent* GetOwnerComponent() const
+    {
+        return OwnerComponent;
+    }
+
+    const UPEPInventorySessionComponent* GetSessionOwner() const
+    {
+        return SessionOwner;
+    }
+
+    bool IsSessionView() const
+    {
+        return bIsSessionView;
+    }
+
+private:
     /* Local-only callback targets: the store this array is, or the session it mirrors. */
     UPEPInventoryComponent* OwnerComponent = nullptr;
     UPEPInventorySessionComponent* SessionOwner = nullptr;
     bool bIsSessionView = false;
-
-    void PostReplicatedReceive(
-        const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
 };
 
 template<>

@@ -4,6 +4,7 @@
 #include "IDetailChildrenBuilder.h"
 #include "Item/Fragments/PEPItemFragment_Container.h"
 #include "PropertyHandle.h"
+#include "ScopedTransaction.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SNumericEntryBox.h"
@@ -123,6 +124,9 @@ FReply FPEPItemFragmentContainerCustomization::OnAddSlotsClicked()
 
 	const FString Prefix = PendingPrefix.IsEmpty() ? TEXT("Slot") : PendingPrefix;
 	const int32 Count = FMath::Max(1, PendingCount);
+
+	/* One undo step for the whole batch, rather than one per slot added and per name set. */
+	const FScopedTransaction Transaction(LOCTEXT("AddSlotsTransaction", "Add Container Slots"));
 
 	uint32 NumBefore = 0;
 	ArrayHandle->GetNumElements(NumBefore);

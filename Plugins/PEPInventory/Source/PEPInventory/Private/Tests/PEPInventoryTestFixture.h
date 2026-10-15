@@ -16,6 +16,21 @@
 #include "Item/PEPItemTags.h"
 #include "StructUtils/InstancedStruct.h"
 
+/**
+ * The tests' one way into a view's callback targets, which nothing else may set: the replication
+ * tests drive the entry callbacks by hand on a detached view, and it has to name the store they
+ * report to. Global, because that is where FPEPInventoryView's friend declaration looks for it.
+ */
+struct FPEPInventoryViewTestAccess
+{
+	static void BindToInventory(FPEPInventoryView& View, UPEPInventoryComponent* Inventory)
+	{
+		View.OwnerComponent = Inventory;
+		View.SessionOwner = nullptr;
+		View.bIsSessionView = false;
+	}
+};
+
 namespace PEPInventoryTest
 {
 	/**
@@ -80,7 +95,8 @@ namespace PEPInventoryTest
 					[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 					{
 						return FPEPItemResult::Success(Item.ItemId);
-					}));
+					}),
+				/*bAllowAutoPlacement*/ true);
 		}
 
 		static FGameplayTag RootSlotTag()

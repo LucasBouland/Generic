@@ -19,6 +19,7 @@ public class PEPInventory : ModuleRules
                 "PEPItemCore"
             });
 
-        PrivateDependencyModuleNames.AddRange(new string[] { });
+        /* PEPLoadoutMutation asks the asset registry whether its initial scan is still running. */
+        PrivateDependencyModuleNames.AddRange(new string[] { "AssetRegistry" });
     }
 }

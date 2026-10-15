@@ -28,10 +28,12 @@ class PEPPICKUP_API APEPPickupItemActor
 
 public:
 	/**
-	 * Pickup when allowed by UPEPPickupSettings tag policy, plus whatever
-	 * DefaultInteractionOptionsByItemTag configures for this item's owned tags. Works identically on every machine: the interface
-	 * separates what a thing could offer from what it will allow right now, and only the second
-	 * question needs the store — GetItemDefinition() itself is safe without authority.
+	 * Pickup when allowed by UPEPPickupSettings::CanPickupDefinition, plus whatever
+	 * DefaultInteractionOptionsByItemTag configures for this item's owned tags (except Open and
+	 * Inspect, which need container slots, and Pickup, which only the pickup policy grants).
+	 * Works identically on every machine: the interface separates what a thing could offer from
+	 * what it will allow right now, and only the second question needs the store —
+	 * GetItemDefinition() itself is safe without authority.
 	 */
 	virtual TArray<FGameplayTag> GetInteractOptionTags_Implementation(
 		AActor* Interactor) const override;
@@ -54,9 +56,10 @@ protected:
 	virtual UPEPInventoryComponent* ResolveInteractorInventory(AActor* Interactor) const;
 
 	/**
-	 * Called on the authority once the item is in the store and this actor is about to go. The
-	 * default destroys it: the item now exists in the inventory, and an actor still holding a copy
-	 * of it is a duplicate waiting to be picked up twice.
+	 * Called on the authority once the item is in the store. The pickup already emptied this actor
+	 * (the item exists in one place only), so GetItemDefinition() and the authority item are no
+	 * longer available here. The default destroys the empty actor; an override may play effects or
+	 * keep it around, but it holds nothing to pick up twice.
 	 */
 	UFUNCTION(BlueprintNativeEvent, Category="PEP|Interaction")
 	void HandlePickedUp(AActor* Interactor);

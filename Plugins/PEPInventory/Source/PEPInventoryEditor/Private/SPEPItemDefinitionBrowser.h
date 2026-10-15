@@ -59,6 +59,7 @@ private:
 	FReply OnOpenDetailsClicked();
 	FReply OnOpenAssetEditorClicked();
 	void OpenDetailsWindow();
+	FText GetDetailsWindowTitle() const;
 	void OnDetailsWindowClosed(const TSharedRef<SWindow>& Window);
 	void OnDefinitionPropertiesChanged(const FPropertyChangedEvent& Event);
 	void UpdateDetailsWindow();

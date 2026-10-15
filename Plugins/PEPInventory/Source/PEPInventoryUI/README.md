@@ -27,6 +27,12 @@ binding change, rebuild the relevant local views. **Get Inventory Component** le
 the existing inventory/session query APIs. A session-view event can indicate either content or
 session identity changes: compare the context identity before retaining a remote window.
 
+A controller change also withdraws whatever session was presented: **On Transfer Session
+Presented** fires once with a None context, and the new controller's next session is presented as
+new. A session component added to the controller after it was announced (by a Blueprint at
+BeginPlay, a game feature, or late replication) is bound the first time it is found, by
+**Get Session Component** or by any getter that reads the session, and relays from then on.
+
 ## Container and drag contexts
 
 Add **DestinationContext : PEPInventoryUIContext** to your container. At initialization, capture
@@ -60,7 +66,10 @@ grid geometry, CellSize, and the drag's grab offset/preview rotation.
 - Destination = calculated PEPItemLocation
 
 Break the returned **PEPItemResult** and use **Success** to choose green/red. Context mismatches
-return `Reason_StateMismatch`. Structurally invalid inputs return `Reason_InvalidTarget`.
+return `Reason_StateMismatch`. Structurally invalid inputs return `Reason_InvalidTarget`, and so
+does naming a remote item, or a remote container as the destination, that the session view does
+not hold: the server refuses exactly the same ids, whether the request comes from a client RPC or
+from the listen server's own player.
 
 **OnDrop** recalculates Destination and calls **Request Placement** with the same inputs. This
 repeats the local preview before sending a request. OutRequestId is zero if rejected before
@@ -84,11 +93,33 @@ ReasonTag to explain it if needed.
 
 Multiple remote inventories are not supported by this subsystem. Remote sessions are opened
 server-side through the existing interaction flow, on the `UPEPInventorySessionComponent` carried by
-the player's PlayerController; the subsystem binds to that component when the controller changes and
-exposes it through **Get Session Component**. Session requests resolve on that component's
-`OnRequestResolved`, relayed here like the inventory's own. The binding ID is a local UI check. The session
-ID is also carried by remote-operation RPCs as a stale-context guard; it does not replace
-server-side permission, ownership, or distance checks.
+the player's PlayerController; the subsystem binds to that component when the controller changes (or
+when it first finds one added later) and exposes it through **Get Session Component**. Session
+requests resolve on that component's `OnRequestResolved`, relayed here like the inventory's own. The
+binding ID is a local UI check. The session ID is also carried by remote-operation RPCs as a
+stale-context guard; it does not replace server-side permission, ownership, or distance checks.
+
+Server-side, every Take, Put and Move is judged against the session's mirror (the entries the
+looter was actually sent): a remote item id, or a destination container, that the mirror lacks is
+refused before the remote store is asked. Requests are made as the session component's controller,
+never as the owner of the local store; **Set Local Inventory** is authority-only and only chooses
+which store items move into and out of. Session distance is measured from the possessed pawn, then
+from the local store's carrier only if it is a pawn or a placed actor: a store kept on the controller
+or the player state no longer measures from wherever that actor spawned. Only a controller with no
+pawn at all still falls back to its own transform.
+
+## Reading a session view
+
+**Get Entries In Container Slot** is BlueprintCallable, not pure, because it copies every occupant
+of the slot: call it once from an exec chain, store the array, and read that. The session
+component's **Get Session Item Ids** is callable for the same reason. **Find Session Entry**,
+**Find Entry In Named Slot** and **Get Transfer Session Root Item** stay pure; they answer from an id
+index or a single pass and copy one entry. Native code reads the mirror without copies through
+`UPEPInventorySessionComponent::GetSessionEntries()` and `FindSessionEntryPtr()`; the pointer lasts
+until the mirror next changes. **Get Session Item Definition By Id** returns a const definition.
+
+The session view keeps each entry's replication identity across refreshes: only entries that
+actually changed are resent to the looter.
 
 ## Widget ownership
 
@@ -98,9 +129,14 @@ calculate their own grid geometry and render the preview. The item widget/payloa
 but it does not decide whether an inventory destination accepts the item.
 
 `UPEPInventoryWindow` and `UPEPInventorySessionLayer` belong here because they carry inventory
-context and manage the presentation of a transfer session. A future reusable floating-panel shell
-may be supplied by `PEPCoreUI`; its inventory contents, store identity, and session lifetime stay
-in this module. A future equipment slot drop target belongs to the equipment UI module, which
+context and manage the presentation of a transfer session. When the floating presenter is used
+(`bPresentSessionInPlayerMenu` off, or a controller that is not a PEP player controller),
+`SessionWindowClass` is loaded asynchronously the first time it is needed: the window opens once the
+class arrives, provided the session is still the one shown. A session that closes or changes while
+loading is simply re-read; a class that fails to load is not requested again for that session.
+
+A future reusable floating-panel shell may be supplied by `PEPCoreUI`; its inventory contents,
+store identity, and session lifetime stay in this module. A future equipment slot drop target belongs to the equipment UI module, which
 validates and requests equipment operations through its own domain API.
 
 ## Verification
@@ -108,6 +144,11 @@ validates and requests equipment operations through its own domain API.
 Automation test: `PEP.Inventory.UI.RoutingAndContexts`. Exercises preview non-mutation, local
 movement, taking/putting remote items, unavailable/foreign registrations, invalid placements,
 stale contexts after reopen/unregister, controller changes, and subscription cleanup.
+
+`PEP.Inventory.UI.SessionMirrorGate` binds a session component added after the controller change,
+checks that hidden items stay out of the session view and its slot/named-slot readers, that a
+reconciliation keeps replication ids, and that Take, Move and Put naming ids absent from the mirror
+are refused while a mirrored take still executes.
 
 `PEP.Inventory.UI.ReplicatedCallbackTarget` verifies the receiving path using the component's
 actual InventoryView after creation from a template. PostInitProperties and OnRegister restore

@@ -37,7 +37,7 @@ namespace
 				[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 				{
 					return FPEPItemResult::Success(Item.ItemId);
-				}));
+				}), /*bAllowAutoPlacement*/ true);
 	}
 }
 

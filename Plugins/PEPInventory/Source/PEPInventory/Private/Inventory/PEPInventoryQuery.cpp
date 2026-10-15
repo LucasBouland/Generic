@@ -17,14 +17,13 @@ namespace PEPInventoryQuery
 
 		const FPEPItemFragment_InventoryShape* Shape =
 			Item.GetDefinitionFragment<FPEPItemFragment_InventoryShape>();
-		PEPInventorySettings().GetEffectiveInventoryShape(Shape, OutData.Size, OutData.bCanRotate);
-		OutData.bUsesDefaultShape = Shape == nullptr;
-		if (OutData.Size.X <= 0 || OutData.Size.Y <= 0)
+		if (!PEPInventorySettings().GetEffectiveInventoryShape(Shape, OutData.Size, OutData.bCanRotate))
 		{
 			OutData = FPEPItemInventoryShapeData();
 			return false;
 		}
 
+		OutData.bUsesDefaultShape = Shape == nullptr;
 		OutData.bValid = true;
 		return true;
 	}
@@ -42,8 +41,16 @@ bool UPEPInventoryQueryLibrary::GetDefinitionInventoryShapeData(
 	FIntPoint& OutSize,
 	bool& bOutCanRotate)
 {
+	/* No definition is no item, which has no footprint — not the project default one. */
+	if (!Definition)
+	{
+		OutSize = FIntPoint::ZeroValue;
+		bOutCanRotate = false;
+		return false;
+	}
+
 	return PEPInventorySettings().GetEffectiveInventoryShape(
-		Definition ? Definition->GetDefinitionFragment<FPEPItemFragment_InventoryShape>() : nullptr,
+		Definition->GetDefinitionFragment<FPEPItemFragment_InventoryShape>(),
 		OutSize,
 		bOutCanRotate);
 }

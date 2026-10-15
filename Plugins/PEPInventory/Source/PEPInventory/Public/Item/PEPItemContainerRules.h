@@ -3,7 +3,6 @@
 #include "CoreMinimal.h"
 #include "Core/PEPTypes.h"
 #include "Item/PEPItemResultTypes.h"
-#include "Engine/AssetManagerTypes.h"
 #include "Item/PEPItemAccess.h"
 #include "Item/PEPItemInstance.h"
 #include "Item/Fragments/PEPItemFragment_Container.h"
@@ -21,6 +20,14 @@ namespace PEPItemContainerRules
 
 	PEPINVENTORY_API FPEPItemResult CanLockContainer(
 		const FPEPItemInstance& ContainerItem);
+
+	/**
+	 * The slots Definition's container fragment declares, read in place: empty when it has none.
+	 * Valid for as long as the definition is loaded and unedited — what a menu or a validation pass
+	 * needs, without the copy UPEPItemContainerRulesLibrary::GetContainerSlots makes for Blueprint.
+	 */
+	PEPINVENTORY_API TConstArrayView<FPEPContainerSlotDefinition> FindContainerSlots(
+		const UPEPItemDefinition* Definition);
 
 	/*
 	 * Seeing and taking are different questions, and the container vocabulary has always answered
@@ -74,8 +81,15 @@ public:
 	static FPEPItemResult CanLockContainer(
 		const FPEPItemInstance& ContainerItem);
 
-	/** Slots declared on Definition's container fragment, or empty if it has none. For editor tooling: a slot dropdown does not need to know the fragment exists. */
-	UFUNCTION(BlueprintPure, Category="PEP|Item|Container|Rules")
+	/**
+	 * Slots declared on Definition's container fragment, or empty if it has none. For editor
+	 * tooling: a slot dropdown does not need to know the fragment exists.
+	 *
+	 * Returns a copy of every slot, so it is an executed node rather than a pure one that a graph
+	 * would re-run for each pin reading it. C++ reads them in place through
+	 * PEPItemContainerRules::FindContainerSlots.
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure=false, Category="PEP|Item|Container|Rules")
 	static TArray<FPEPContainerSlotDefinition> GetContainerSlots(const UPEPItemDefinition* Definition);
 
 	/**

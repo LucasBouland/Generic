@@ -48,6 +48,13 @@ public:
 	TSubclassOf<APEPItemWorldActor> ResolveWorldItemActorClassForDefinition(
 		const UPEPItemDefinition* Definition) const;
 	TSubclassOf<APEPItemWorldActor> ResolveWorldItemActorClass() const;
+
+	/**
+	 * The footprint an item occupies: its InventoryShape fragment, or the project default when it
+	 * has none. False, with a zero size, when that shape has a non-positive dimension — reported
+	 * rather than quietly turned into 1x1, so a misauthored item fails placement where it can be
+	 * seen instead of occupying a cell it was never given.
+	 */
 	bool GetEffectiveInventoryShape(
 		const FPEPItemFragment_InventoryShape* Fragment,
 		FIntPoint& OutSize,

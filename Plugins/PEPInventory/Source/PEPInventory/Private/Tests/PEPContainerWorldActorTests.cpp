@@ -4,7 +4,7 @@
 
 #include "Engine/Engine.h"
 #include "Engine/World.h"
-#include "Item/PEPContainerItemWorldActor.h"
+#include "Item/Actor/PEPContainerItemWorldActor.h"
 #include "Item/Fragments/PEPItemFragment_Container.h"
 #include "Item/Fragments/PEPItemFragment_WorldPresentation.h"
 #include "Item/PEPItemDefinition.h"

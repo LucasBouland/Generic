@@ -51,9 +51,16 @@ bool UPEPInventorySettings::GetEffectiveInventoryShape(
 		OutSize = DefaultInventorySize;
 		bOutCanRotate = bDefaultInventoryCanRotate;
 	}
+
+	/*
+	 * Reported, not repaired. This used to substitute 1x1 and then test the substitute, so it could
+	 * never return false and every caller's failure branch was dead code.
+	 */
 	if (OutSize.X <= 0 || OutSize.Y <= 0)
 	{
-		OutSize = FIntPoint(1, 1);
+		OutSize = FIntPoint::ZeroValue;
+		bOutCanRotate = false;
+		return false;
 	}
-	return OutSize.X > 0 && OutSize.Y > 0;
+	return true;
 }

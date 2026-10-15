@@ -10,7 +10,6 @@
 #include "Logging/TokenizedMessage.h"
 #include "MessageLogModule.h"
 #include "Misc/CoreDelegates.h"
-#include "Misc/Paths.h"
 #include "PEPContainerSlotDefinitionCustomization.h"
 #include "PEPItemFragmentContainerCustomization.h"
 #include "PEPItemPresetChildCustomization.h"
@@ -66,8 +65,18 @@ namespace PEPInventoryEditorPrivate
 				false, false, MoveTemp(Directories), TArray<FSoftObjectPath>());
 		}
 
-		const FString DefaultGameIni = FPaths::Combine(FPaths::ProjectConfigDir(), TEXT("DefaultGame.ini"));
-		Settings->SaveConfig(CPF_Config, *DefaultGameIni);
+		/*
+		 * Written to the settings' own default config file the way Project Settings writes it,
+		 * checked out or made writable as needed. SaveConfig to a hand-built path wrote the
+		 * section without regard to what the base ini files already provide.
+		 */
+		if (!Settings->TryUpdateDefaultConfigFile())
+		{
+			FMessageLog(AssetManagerLogName).Error(LOCTEXT(
+				"PresetScanNotSaved",
+				"Could not write the PEP ItemPreset scan to the project's DefaultGame.ini. Check that the file is writable or checked out."));
+			return;
+		}
 		FMessageLog(AssetManagerLogName).Info(LOCTEXT(
 			"PresetScanAdded",
 			"Added the PEP ItemPreset scan to Config/DefaultGame.ini. Restart the editor for Asset Manager to apply it."));

@@ -393,15 +393,12 @@ void SPEPItemDefinitionBrowser::OpenDetailsWindow()
 
 	SAssignNew(PreviewContainer, SBox);
 
+	/*
+	 * Bound through the shared pointer rather than a lambda capturing this: the window is its own
+	 * top-level object, and its destruction is only requested when the browser goes away.
+	 */
 	SAssignNew(DetailsWindow, SWindow)
-		.Title_Lambda(
-			[this]
-			{
-				const UPEPItemDefinition* Definition = SelectedItem.Get();
-				return Definition
-					? FText::Format(LOCTEXT("DetailsWindowTitle", "Item Definition — {0}"), Definition->DisplayName)
-					: LOCTEXT("DetailsWindowTitleEmpty", "Item Definition Details");
-			})
+		.Title(this, &SPEPItemDefinitionBrowser::GetDetailsWindowTitle)
 		.ClientSize(FVector2D(820.f, 720.f))
 		.MinWidth(520.f)
 		.MinHeight(400.f)
@@ -451,6 +448,14 @@ void SPEPItemDefinitionBrowser::OpenDetailsWindow()
 	{
 		SlateApplication.AddWindow(DetailsWindow.ToSharedRef(), true);
 	}
+}
+
+FText SPEPItemDefinitionBrowser::GetDetailsWindowTitle() const
+{
+	const UPEPItemDefinition* Definition = SelectedItem.Get();
+	return Definition
+		? FText::Format(LOCTEXT("DetailsWindowTitle", "Item Definition — {0}"), Definition->DisplayName)
+		: LOCTEXT("DetailsWindowTitleEmpty", "Item Definition Details");
 }
 
 void SPEPItemDefinitionBrowser::OnDetailsWindowClosed(const TSharedRef<SWindow>& Window)

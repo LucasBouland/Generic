@@ -18,6 +18,8 @@ class APEPItemWorldActor;
 class UPEPLoadoutPreset;
 class UPEPItemDefinition;
 struct FPEPContainerSlotDefinition;
+/* Defined beside the only code that plans or reads one; see PEPInventoryComponent.cpp. */
+struct FPEPInventoryStackMerge;
 
 /**
  * A container-tree store of items, for anything that must be lootable.
@@ -119,10 +121,16 @@ public:
 		const FPEPItemStoreMutation& Mutation,
 		const FPEPItemAccessContext& Access) override;
 
+	/**
+	 * Claims RootLocationTag for Validator. A tag already claimed by a live delegate bound to a
+	 * different object is refused and left as it is: two domains answering for one slot is a setup
+	 * fault, and the second silently replacing the first would hide it. The object that holds the
+	 * claim may register again, which replaces its own binding — a component re-initializing.
+	 */
 	virtual bool RegisterLocationValidator(
 		FGameplayTag RootLocationTag,
 		FPEPItemLocationValidator Validator,
-		bool bAllowAutoPlacement = true) override;
+		bool bAllowAutoPlacement) override;
 
 	virtual void UnregisterLocationValidator(
 		FGameplayTag RootLocationTag,
@@ -159,9 +167,16 @@ public:
 	/**
 	 * How ResolveAccessRole treats everyone but the owner. Server policy: clients never read it
 	 * from the remote store, only through the session's replicated copy.
+	 *
+	 * Read-only to Blueprint: a client-side script flipping it would change nothing the server
+	 * decides, and a server-side one goes through SetExternalAccess, which says it is authority-only.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Inventory|Access")
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Inventory|Access")
 	EPEPExternalAccessMode ExternalAccess = EPEPExternalAccessMode::SlotRules;
+
+	/** Changes the store's outsider policy. A session already open keeps the mode it sampled. */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="PEP|Inventory|Access")
+	void SetExternalAccess(EPEPExternalAccessMode InExternalAccess);
 
 	/**
 	 * Presentation hint this inventory hands to whoever opens it: which loot panel the UI should
@@ -173,10 +188,15 @@ public:
 	FGameplayTag LootPanelTag;
 
 	/**
-	 * The requester behind a call that reached this component through its own owner: a server RPC
-	 * the engine only routes from the connection owning this actor, or a listen server's local
-	 * player. It names that controller as a fact about how the call arrived, not as an assumption
-	 * about who asked, which is why it is never taken from the caller.
+	 * The requester behind a call made through this store's own owner: a listen server's local
+	 * player, or server code acting for the store. It names the owning controller as a fact about
+	 * how the call arrived, not as an assumption about who asked, which is why it is never taken
+	 * from the caller.
+	 *
+	 * With no owning controller, the authority is the store acting for itself — a world container
+	 * running its own pickup — and gets System(). A client in that position is nobody and gets a
+	 * null requester, which resolves to External. Requests that arrived over the wire never take
+	 * the System branch; see the server RPC implementations.
 	 */
 	FPEPItemAccessContext GetOwnerRequestContext() const;
 
@@ -216,6 +236,7 @@ public:
 		const FPEPItemInstance& Item,
 		const FPEPItemAccessContext& Access) const;
 
+	/** Validates the pickup in full — identity, instance, catalogue, placement — before any write. */
 	FPEPItemResult AddPickupItem(
 		FPEPItemInstance Item,
 		const FPEPItemAccessContext& Access);
@@ -268,9 +289,22 @@ public:
 	 * the location its root occupies. The exact inverse of AddItemTrees: exported from one store and
 	 * added to an empty one, entries and locations come back as they were. This is what a save
 	 * writes; the id allocator state is saved beside it so restored ids stay unique.
+	 *
+	 * Copies every entry, so it is an executed node rather than a pure one a graph would re-run.
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="PEP|Inventory|Tree")
+	UFUNCTION(BlueprintCallable, BlueprintPure=false, BlueprintAuthorityOnly, Category="PEP|Inventory|Tree")
 	void ExportItemTrees(TArray<FPEPInventoryTreePlacement>& OutPlacements) const;
+
+	/**
+	 * Whether this store could wear the whole kit, without wearing any of it.
+	 *
+	 * Answers two different questions with one call, and says which: a recipe that cannot be built
+	 * at all is a content fault, while a kit that builds but does not fit is a store answer. Both
+	 * come back as a failure, so a caller checking before offering a loadout needs neither.
+	 */
+	FPEPItemResult CanApplyLoadout(
+		const UPEPLoadoutPreset* Loadout,
+		const FPEPItemAccessContext& Access) const;
 
 	/**
 	 * Outfits this store from a designer-authored loadout. Fresh instances every time, so the same
@@ -284,17 +318,6 @@ public:
 	 * them has registered — equipment does that when it initializes. Applied before, every root
 	 * fails as an invalid location, and nothing says the slot simply was not there yet.
 	 */
-	/**
-	 * Whether this store could wear the whole kit, without wearing any of it.
-	 *
-	 * Answers two different questions with one call, and says which: a recipe that cannot be built
-	 * at all is a content fault, while a kit that builds but does not fit is a store answer. Both
-	 * come back as a failure, so a caller checking before offering a loadout needs neither.
-	 */
-	FPEPItemResult CanApplyLoadout(
-		const UPEPLoadoutPreset* Loadout,
-		const FPEPItemAccessContext& Access) const;
-
 	FPEPItemResult ApplyLoadout(
 		const UPEPLoadoutPreset* Loadout,
 		const FPEPItemAccessContext& Access);
@@ -332,7 +355,11 @@ public:
 
 	const FPEPInventoryEntry* FindEntry(FPEPItemId ItemId) const;
 
-	/* Inventory entries for direct children. Returned pointers remain valid until mutation. */
+	/**
+	 * Inventory entries for direct children, in the order they entered the parent. Answered from
+	 * the parent-to-children index, so it costs what the parent holds rather than what the store
+	 * does. Returned pointers remain valid until mutation.
+	 */
 	void GetDirectChildEntries(
 		FPEPItemId ParentItemId,
 		TArray<const FPEPInventoryEntry*>& OutChildren) const;
@@ -355,28 +382,27 @@ public:
 	/**
 	 * Ids carry no nested allocation; entries do. Enumerating a store this way and resolving what
 	 * is actually drawn costs one array, where copying the entries costs one allocation per item.
+	 *
+	 * Still one array the size of the store, so it is an executed node: a pure one is re-run for
+	 * every pin that reads it.
 	 */
-	UFUNCTION(BlueprintPure, Category="PEP|Inventory")
+	UFUNCTION(BlueprintCallable, BlueprintPure=false, Category="PEP|Inventory")
 	virtual void GetItemIds(TArray<FPEPItemId>& OutItemIds) const override;
 
-	UFUNCTION(BlueprintPure, Category="PEP|Inventory", meta=(DisplayName="Get Inventory Item Ids"))
-	void GetInventoryItemIds(TArray<FPEPItemId>& OutItemIds) const
-	{
-		GetItemIds(OutItemIds);
-	}
-
-	UFUNCTION(BlueprintPure, Category="PEP|Inventory")
+	/** Copies the entry, nested state included; executed rather than pure for the same reason. */
+	UFUNCTION(BlueprintCallable, BlueprintPure=false, Category="PEP|Inventory")
 	bool FindInventoryEntry(FPEPItemId ItemId, FPEPInventoryEntry& OutEntry) const;
 
 	/** Returns the loaded definition of a local inventory item, or null if absent/unloaded. Never loads assets. */
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory", meta=(DisplayName="Get Item Definition By Id"))
-	UPEPItemDefinition* GetItemDefinitionById(FPEPItemId ItemId) const;
+	const UPEPItemDefinition* GetItemDefinitionById(FPEPItemId ItemId) const;
 
 	/**
 	 * The occupants of one container slot — what a single panel draws. Answered from the slot
-	 * index, so it costs what the slot holds rather than what the store does.
+	 * index, so it costs what the slot holds rather than what the store does. Ordered by cell,
+	 * row first, so a panel drawing them twice draws them the same way.
 	 */
-	UFUNCTION(BlueprintPure, Category="PEP|Inventory")
+	UFUNCTION(BlueprintCallable, BlueprintPure=false, Category="PEP|Inventory")
 	void GetEntriesInContainerSlot(
 		FPEPItemId ParentItemId,
 		FName SlotName,
@@ -402,6 +428,7 @@ public:
 		FPEPItemLocation Destination,
 		int32& OutRequestId);
 
+	/** Allocates no id: the would-be stack carries PEPItemMutation's reserved preview id. */
 	UFUNCTION(BlueprintCallable, Category="PEP|Inventory|Preview")
 	FPEPItemResult PreviewSplitStack(
 		FPEPItemId SourceItemId,
@@ -421,6 +448,7 @@ public:
 		FPEPItemId TargetItemId,
 		int32 TransferCount) const;
 
+	/** Allocates no id; the result names the source stack. Only SplitStack allocates one. */
 	FPEPItemResult CanSplitStack(
 		FPEPItemId SourceItemId,
 		int32 SplitCount,
@@ -474,17 +502,6 @@ public:
 		const FPEPItemAccessContext& Access);
 
 	/**
-	 * Takes an item and everything it holds out of the store and puts it into the world.
-	 *
-	 * The carrier class comes from UPEPItemSettings unless one is named here — a corpse bag or a
-	 * quest crate is a different actor, the item inside it is not.
-	 *
-	 * Ordered so that a failure cannot eat the item: the class, the world and the whole subtree are
-	 * checked, then the actor is spawned, and only then does the store give the item up. A spawn
-	 * that fails leaves the inventory untouched; an extraction that somehow fails after it destroys
-	 * the actor rather than the items.
-	 */
-	/**
 	 * Everything a drop needs, decided without spawning anything: a carrier class to resolve, a
 	 * world to put it in, and a subtree this requester may take.
 	 *
@@ -496,6 +513,17 @@ public:
 		const FPEPItemAccessContext& Access,
 		TSubclassOf<APEPItemWorldActor> OverrideActorClass = nullptr) const;
 
+	/**
+	 * Takes an item and everything it holds out of the store and puts it into the world.
+	 *
+	 * The carrier class comes from UPEPInventorySettings unless one is named here — a corpse bag or a
+	 * quest crate is a different actor, the item inside it is not.
+	 *
+	 * Ordered so that a failure cannot eat the item: the class, the world and the whole subtree are
+	 * checked, then the actor is spawned, and only then does the store give the item up. A spawn
+	 * that fails leaves the inventory untouched; an extraction that somehow fails after it destroys
+	 * the actor rather than the items.
+	 */
 	FPEPItemResult DropItemTree(
 		FPEPItemId ItemId,
 		const FTransform& WorldTransform,
@@ -558,7 +586,7 @@ public:
 		const FPEPItemAccessContext& Access);
 
 protected:
-	UFUNCTION(Server, Reliable)
+	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_RequestMoveItem(
 		FPEPItemId ItemId,
 		FPEPItemLocation Destination,
@@ -581,13 +609,192 @@ protected:
 	UFUNCTION(Client, Reliable)
 	void Client_ResolveInventoryRequest(FPEPInventoryRequestResult RequestResult);
 
+	/*
+	 * Everything below is implementation. Nothing in the repository derives from this component,
+	 * and the types that need to reach in — the fast array, the session, the world container — are
+	 * named friends at the top of the class; a subclass would otherwise inherit the ability to
+	 * write the store without validating, which is exactly what the Commit functions are.
+	 */
+private:
+	// ---- Storage and the indices over it ----------------------------------------------------
+
+	/**
+	 * Authoritative store and replication payload at once. Replicated to the owner only; other
+	 * viewers are served by PEPEquipment's public projection, or by an explicit loot session.
+	 */
+	UPROPERTY(Replicated)
+	FPEPInventoryView InventoryView;
+
+	/*
+	 * The indices are maintained write by write on the authority: an add, a move and a removal each
+	 * touch the handful of index entries the item appears in, so a subtree of K items costs K small
+	 * updates rather than K rebuilds of everything. Only the location indices are keyed by
+	 * location; everything that names an entry names it by id, so a removal that swaps the last
+	 * entry into the hole has exactly one position to repair — in EntryIndex.
+	 *
+	 * The two flags are the wholesale fallback: whatever rewrites Entries without passing through
+	 * the writers below — a replication receive, a scratch copy, a reset — sets them, and the next
+	 * read rebuilds from scratch. While a flag is set the writers leave its indices alone.
+	 */
+
+	/** ItemId to position in InventoryView.Entries. */
+	mutable TMap<FPEPItemId, int32> EntryIndex;
+
+	/**
+	 * Occupants of each container slot. Placement asks "what else is in this slot" for every
+	 * candidate cell, which would otherwise walk the whole store each time.
+	 */
+	mutable TMap<FPEPContainerSlotKey, TArray<FPEPItemId>> ContainerSlotIndex;
+
+	/**
+	 * Occupants of each named slot. Equipment asks "what is in this slot" for every slot on every
+	 * store change, and every placement onto a named slot asks whether it is free. An array per
+	 * tag, so a slot that ever holds two items still answers right.
+	 */
+	mutable TMap<FGameplayTag, TArray<FPEPItemId>> NamedSlotIndex;
+
+	/**
+	 * Direct children of each container item, in the order they entered it. Trees are walked
+	 * downwards — snapshots, exports, transfers, drops — and each step asks only this.
+	 */
+	mutable TMap<FPEPItemId, TArray<FPEPItemId>> ChildIndex;
+
+	/**
+	 * Which item sits on each cell of a grid slot. Placement asks "is this footprint free" once
+	 * per candidate cell, and reading cells beats re-deriving every occupant's shape for each one.
+	 *
+	 * Built per slot on first use and dropped whenever that slot's occupants change, so a write
+	 * costs nothing here and the next read rebuilds one slot, never the store.
+	 *
+	 * Unknown when an occupant's shape could not be resolved: the caller then falls back to the
+	 * overlap test, which re-resolves on every call and fails the way it always did.
+	 */
+	struct FPEPGridOccupancy
+	{
+		FIntPoint GridSize = FIntPoint::ZeroValue;
+		/** Occupant per cell, row-major; an invalid id when free. */
+		TArray<FPEPItemId> CellOccupants;
+		int32 FreeCells = 0;
+		bool bUnknown = false;
+
+		FPEPItemId OccupantAt(const FIntPoint Cell) const
+		{
+			return CellOccupants[Cell.Y * GridSize.X + Cell.X];
+		}
+	};
+	mutable TMap<FPEPContainerSlotKey, FPEPGridOccupancy> GridOccupancy;
+
+	/**
+	 * The slot's cell map, built on demand. Null for a slot with no occupants, or one that is not a
+	 * grid. The pointer is valid until the next call for a different slot or the next write.
+	 */
+	const FPEPGridOccupancy* FindGridOccupancy(FPEPItemId ParentItemId, FName SlotName) const;
+
+	/** Whether Size at Position lies inside the map and covers no cell held by anyone not ignored. */
+	static bool IsGridFootprintFree(
+		const FPEPGridOccupancy& Occupancy,
+		FIntPoint Position,
+		FIntPoint Size,
+		FPEPItemId IgnoredItemId,
+		FPEPItemId AlsoIgnoredItemId);
+
+	/** Named slots open to automatic placement, sorted. Changes only when a validator does. */
+	mutable TArray<FGameplayTag> AutoPlacementSlotTags;
+	mutable bool bAutoPlacementSlotTagsDirty = true;
+	const TArray<FGameplayTag>& GetAutoPlacementSlotTags() const;
+
+	mutable bool bEntryIndexDirty = true;
+	mutable bool bContainerSlotIndexDirty = true;
+
+	/*
+	 * Entries.Num() as the indices last saw it. A store whose size changed without the writers
+	 * hearing of it — a delta applied in an order the receive batch did not expect — is rebuilt
+	 * rather than trusted, the way the session guards its own mirror.
+	 */
+	mutable int32 IndexedEntryCount = 0;
+
+	/** Rebuilds whichever indices are flagged, in a single pass over the store. */
+	void RefreshIndices() const;
+
+	/** Flags every index for a rebuild. For writes that bypass the writers below. */
+	void MarkAllIndicesDirty() const;
+
+	/** EntryIndex lookup without the freshness check; for loops that have already refreshed. */
+	const FPEPInventoryEntry* FindIndexedEntry(FPEPItemId ItemId) const;
+
+	/*
+	 * The location indices, raw. The Index/Unindex pair below is what writers call: it does nothing
+	 * while a rebuild is pending, since the rebuild will see the write anyway.
+	 */
+	void AddToLocationIndices(FPEPItemId ItemId, const FPEPItemLocation& Location) const;
+	void RemoveFromLocationIndices(FPEPItemId ItemId, const FPEPItemLocation& Location) const;
+	void IndexEntryLocation(FPEPItemId ItemId, const FPEPItemLocation& Location) const;
+	void UnindexEntryLocation(FPEPItemId ItemId, const FPEPItemLocation& Location) const;
+
+	/*
+	 * The ways the store is written, and the only ones. Anything that reaches Entries or an entry's
+	 * location outside these leaves an index describing a store that no longer exists.
+	 */
+
+	/** Appends an entry and indexes it. The reference is valid until the next write. */
+	FPEPInventoryEntry& AppendEntry(FPEPInventoryEntry&& Entry);
+
+	/** Removes the entry at Index by swapping the last one into its place, and repairs the indices. */
+	void RemoveEntryAtSwap(int32 Index, FPEPInventoryEntry& OutEntry);
+
+	/** Empties the store wholesale. */
+	void ResetEntries();
+
+	/** Moves an entry. Separate from a state write, which invalidates no index at all. */
+	void SetEntryLocation(FPEPInventoryEntry& Entry, const FPEPItemLocation& Location);
+
+	/** Entries sharing a container slot, by id, in no particular order. Null when the slot is free. */
+	const TArray<FPEPItemId>* FindContainerSlotOccupants(
+		FPEPItemId ParentItemId,
+		FName SlotName) const;
+
+	FPEPInventoryEntry* FindMutableEntry(FPEPItemId ItemId);
+
+	TArray<FPEPLocationValidatorBinding> LocationValidators;
+
+	// ---- Requests and replication -----------------------------------------------------------
+
 	bool HasMutationAuthority() const;
 	int32 AllocateRequestId();
+
+	/**
+	 * The requester behind a server RPC. The engine routes those only from the connection owning
+	 * this actor, so the owning controller is who sent it — and when there is none, the sender is
+	 * nobody this store answers to. Unlike GetOwnerRequestContext it never falls back to System():
+	 * a request that crossed the wire is a player's, never the server's own.
+	 */
+	FPEPItemAccessContext GetRemoteRequestContext() const;
+
+	/**
+	 * Answers a request: by Client RPC when this component has an owning connection to answer on,
+	 * by local broadcast otherwise — a standalone game, or an unowned store whose RPC would be
+	 * dropped for want of a connection and leave the caller waiting.
+	 */
 	void ResolveInventoryRequest(
 		int32 RequestId,
 		EPEPInventoryRequestKind Kind,
 		const FPEPItemResult& Result);
-	/* Reached only by the fast array, through the friendship declared at the top of this class. */
+
+	/*
+	 * Reached only by the fast array, through the friendship declared at the top of this class.
+	 *
+	 * A receive applies the whole delta to Entries before the first callback runs, and nothing
+	 * changes them again until the removals are applied after the last one. So the indices are
+	 * flagged once, on the first callback of a receive, rebuilt by whichever read comes first, and
+	 * read as they are by every callback after it; the receive closes in PostReplicatedReceive,
+	 * once the removals have reshaped the array. Flagging on every callback was a full rebuild per
+	 * entry — quadratic on the initial join of a full inventory.
+	 */
+	void BeginReplicatedReceive();
+	bool bReplicatedReceiveOpen = false;
+	/* Frame the receive opened on; a receive left open by a lost PostReplicatedReceive expires. */
+	uint64 ReplicatedReceiveFrame = 0;
+
 	void HandleReplicatedEntryAdded(const FPEPInventoryEntry& Entry);
 
 	void HandleReplicatedEntryChanged(
@@ -598,6 +805,22 @@ protected:
 	void QueueReplicatedEntryRemoved(const FPEPInventoryEntry& Entry);
 	void FlushReplicatedEntryRemovals();
 
+	int32 NextRequestId = 1;
+	TArray<FPEPInventoryEntry> PendingReplicatedRemovals;
+	TMap<FPEPItemId, FGameplayTag> PendingRemovedRootSlotTags;
+	// Previous complete replication graph; refreshed after the delta's callbacks finish.
+	TMap<FPEPItemId, FPEPItemLocation> LastReplicatedLocations;
+
+	FOnPEPItemStoreChanged ItemStoreChanged;
+
+	// ---- Plans: decide everything, write nothing ---------------------------------------------
+
+	/**
+	 * Never allocates an id: the would-be stack is built by PEPItemMutation::PreviewSplitStack and
+	 * carries the reserved preview id, so a preview, a hover or a refused request consumes nothing.
+	 * The result names the source stack. SplitStack alone performs the allocating split, after
+	 * this has approved it.
+	 */
 	FPEPItemResult BuildSplitStackPlan(
 		FPEPItemId SourceItemId,
 		int32 SplitCount,
@@ -614,6 +837,54 @@ protected:
 		FPEPItemInstance& OutSourceItem,
 		FPEPItemInstance& OutTargetItem,
 		int32& OutTransferredCount) const;
+
+	/**
+	 * The whole pickup decision, shared by CanAddPickupItem and AddPickupItem so the two cannot
+	 * disagree: the item itself (valid, well-formed, not already stored, catalogue ready), then an
+	 * attachment mount, then stack top-ups, then a place for whatever is left.
+	 *
+	 * @param OutRemainder      What would enter the store as a new entry.
+	 * @param OutDestination    Where it would go; meaningful only when bOutAddRemainder.
+	 * @param bOutAddRemainder  False when the merges absorb the pickup whole.
+	 */
+	FPEPItemResult PlanPickupItem(
+		const FPEPItemInstance& Item,
+		EPEPAccessRole Role,
+		FPEPItemInstance& OutRemainder,
+		TArray<FPEPInventoryStackMerge>& OutMerges,
+		FPEPItemLocation& OutDestination,
+		bool& bOutAddRemainder) const;
+
+	/**
+	 * Fills existing compatible stacks from Item, writing nothing. Item is left holding whatever no
+	 * stack could take, so a caller that finds it depleted knows the pickup needs no room at all.
+	 * Stacks are offered in item-id order, so the same store tops up the same stacks every time.
+	 */
+	void PlanPickupStackMerges(
+		FPEPItemInstance& Item,
+		EPEPAccessRole Role,
+		TArray<FPEPInventoryStackMerge>& OutMerges) const;
+
+	/**
+	 * CanTransferItemToInventory, keeping the subtree it validated so the commit that follows moves
+	 * exactly that and need not take a second snapshot.
+	 */
+	FPEPItemResult ValidateTransfer(
+		const UPEPInventoryComponent* TargetInventory,
+		FPEPItemId ItemId,
+		const FPEPItemLocation& Destination,
+		const FPEPItemAccessContext& Access,
+		TArray<FPEPInventoryEntry>* OutItemTree) const;
+
+	/** The pickup placement in TargetInventory, resolved once, and the transfer to it validated. */
+	FPEPItemResult ResolvePickupTransfer(
+		const UPEPInventoryComponent* TargetInventory,
+		FPEPItemId ItemId,
+		const FPEPItemAccessContext& Access,
+		FPEPItemLocation& OutDestination,
+		TArray<FPEPInventoryEntry>* OutItemTree) const;
+
+	// ---- Validation -------------------------------------------------------------------------
 
 	FPEPItemResult ValidateMoveSourceAccess(
 		const FPEPInventoryEntry& Entry,
@@ -644,6 +915,21 @@ protected:
 		bool& bOutLocked) const;
 
 	FPEPItemResult ValidateCanTakeFromLocation(
+		const FPEPInventoryEntry& Entry,
+		EPEPAccessRole Role) const;
+
+	/**
+	 * Whether an outsider can reach Entry at all: every container above it shows its contents to
+	 * Role, every slot on the way shows its occupants, and none of those containers is locked.
+	 * The slot rules only ever looked at the slot an item sits in, so an item in a hidden pocket,
+	 * or in an open pouch inside a locked backpack, was takeable by a looter who could not even
+	 * see it. Owners are not restricted here; their access is the slot rules alone.
+	 *
+	 * Walked once, upwards, bounded by the store size so a corrupt cycle ends rather than hangs.
+	 * Invisible answers InvalidTarget, so a refusal does not confirm the item exists; locked
+	 * answers BlockedByState.
+	 */
+	FPEPItemResult ValidateExternalReach(
 		const FPEPInventoryEntry& Entry,
 		EPEPAccessRole Role) const;
 
@@ -691,15 +977,6 @@ protected:
 		FPEPItemLocation& OutLocation,
 		EPEPAccessRole Role) const;
 
-	/**
-	 * Fills existing compatible stacks from Item, writing nothing. Item is left holding whatever no
-	 * stack could take, so a caller that finds it depleted knows the pickup needs no room at all.
-	 */
-	void PlanPickupStackMerges(
-		FPEPItemInstance& Item,
-		EPEPAccessRole Role,
-		TArray<FPEPInventoryStackMerge>& OutMerges) const;
-
 	/** Named-slot occupants, ordered by slot tag: where an automatic placement starts looking. */
 	void AppendOrderedNamedSlotItems(TArray<FPEPItemId>& OutItemIds) const;
 
@@ -714,6 +991,11 @@ protected:
 
 	bool HasChildren(FPEPItemId ParentItemId) const;
 
+	/**
+	 * Every descendant of ParentItemId, depth-first with each parent before its children. Walked
+	 * with an explicit stack and bounded by the store size, so neither a deep tree nor a corrupt
+	 * cycle can exhaust anything.
+	 */
 	void AppendDescendantEntries(
 		FPEPItemId ParentItemId,
 		TArray<const FPEPInventoryEntry*>& OutEntries) const;
@@ -727,7 +1009,11 @@ protected:
 		FPEPItemLocation& OutRootLocation,
 		const FPEPItemAccessContext& Access) const;
 
-	/** Validates a complete tree while replacing only its root location. Never mutates this store. */
+	/**
+	 * Validates a complete tree while replacing only its root location. Never mutates this store.
+	 * A tree of one is decided against the live store directly — with no siblings or children to
+	 * simulate, a copy would answer exactly the same — so only a real tree pays for a scratch.
+	 */
 	FPEPItemResult ValidateItemTreeAtRootLocation(
 		const TArray<FPEPInventoryEntry>& ItemTree,
 		const FPEPItemLocation& RootLocation,
@@ -740,8 +1026,17 @@ protected:
 	 * can resolve no access role of its own, which is why callers resolve the role here and pass it
 	 * in. Held through a strong pointer by every caller — an unreferenced UObject is collectable,
 	 * and one that lives across several validations would eventually be collected mid-use.
+	 *
+	 * One per operation at most; a forest shares one. It stays a full copy rather than an overlay
+	 * of pending entries on the live store, deliberately. The location validators are domain
+	 * callbacks this store cannot see into, and every placement query — cycles, slot occupancy,
+	 * cell maps, named slots — would need an overlay-aware twin, a second implementation of the
+	 * validation it exists to reuse. A copy runs the one implementation on a store that simply
+	 * holds more; the cost is paid only by trees, never by single items.
+	 *
+	 * @param bCopyEntries  False for an empty simulation that keeps only the validators.
 	 */
-	UPEPInventoryComponent* CreateValidationScratch() const;
+	UPEPInventoryComponent* CreateValidationScratch(bool bCopyEntries = true) const;
 
 	/**
 	 * The tree validation proper, against a caller-owned simulation. Reusing one scratch across
@@ -755,6 +1050,28 @@ protected:
 		const FPEPItemLocation& RootLocation,
 		EPEPAccessRole Role,
 		bool bValidateChildPlacement) const;
+
+	/**
+	 * Whether Item could enter Store as a new entry at all, before any placement: a valid,
+	 * well-formed instance whose id Store does not already hold. Shared by the tree paths so a
+	 * lone item and a tree member are judged alike.
+	 */
+	static FPEPItemResult ValidateIncomingItem(
+		const UPEPInventoryComponent& Store,
+		const FPEPItemInstance& Item);
+
+	bool IsNamedSlotOccupied(
+		FGameplayTag SlotTag,
+		FPEPItemId IgnoredItemId,
+		FPEPItemId AlsoIgnoredItemId = FPEPItemId()) const;
+
+	bool IsItemContainerSlotOccupied(
+		FPEPItemId ParentItemId,
+		FName SlotName,
+		FPEPItemId IgnoredItemId,
+		FPEPItemId AlsoIgnoredItemId = FPEPItemId()) const;
+
+	// ---- Commits: write what a plan approved -------------------------------------------------
 
 	/**
 	 * Writes an already-validated tree, parents before children. Validates nothing: the caller has
@@ -772,6 +1089,18 @@ protected:
 	void EmitAddedEntries(
 		const TArray<TPair<FPEPItemId, FPEPItemLocation>>& Added);
 
+	/** The move half of MoveItem, MoveItemAuto and a same-store transfer, once one has validated it. */
+	FPEPItemResult CommitValidatedMove(
+		FPEPItemId ItemId,
+		const FPEPItemLocation& Destination);
+
+	/** Moves an already-validated subtree, as snapshotted by ValidateTransfer, into TargetInventory. */
+	FPEPItemResult CommitValidatedTransfer(
+		UPEPInventoryComponent* TargetInventory,
+		FPEPItemId ItemId,
+		const FPEPItemLocation& Destination,
+		TArray<FPEPInventoryEntry>&& ItemTree);
+
 	/** Flattens a store-agnostic tree into entries, root first. */
 	static TArray<FPEPInventoryEntry> FlattenItemTree(FPEPItemInstanceTree&& Tree);
 
@@ -780,17 +1109,6 @@ protected:
 	 * has no store location, which is exactly what makes it something a world actor can hold.
 	 */
 	static FPEPItemInstanceTree MakeItemTreeFromEntries(TArray<FPEPInventoryEntry>&& Entries);
-
-	bool IsNamedSlotOccupied(
-		FGameplayTag SlotTag,
-		FPEPItemId IgnoredItemId,
-		FPEPItemId AlsoIgnoredItemId = FPEPItemId()) const;
-
-	bool IsItemContainerSlotOccupied(
-		FPEPItemId ParentItemId,
-		FName SlotName,
-		FPEPItemId IgnoredItemId,
-		FPEPItemId AlsoIgnoredItemId = FPEPItemId()) const;
 
 	/*
 	 * The only places an item-store change is raised. An authoritative mutation and a replication
@@ -825,16 +1143,20 @@ protected:
 
 	void BroadcastChange(const FPEPItemStoreChange& Change);
 
-	/* Post-validation mutations. They never broadcast. */
-	void CommitAddItem(
+	/*
+	 * Post-validation mutations. They never broadcast. Each refuses rather than asserts when the
+	 * invariant its caller established does not hold: a check() is compiled out of a shipping
+	 * server, which would then store the same id twice instead of stopping.
+	 */
+	bool CommitAddItem(
 		FPEPItemInstance&& Item,
 		const FPEPItemLocation& Location);
 
-	void CommitMoveItem(
+	bool CommitMoveItem(
 		FPEPItemId ItemId,
 		const FPEPItemLocation& Destination);
 
-	void CommitExtractItem(
+	bool CommitExtractItem(
 		FPEPItemId ItemId,
 		FPEPInventoryEntry& OutEntry);
 
@@ -850,102 +1172,4 @@ protected:
 	bool CommitExtractItemTree(
 		FPEPItemId RootItemId,
 		TArray<FPEPInventoryEntry>& OutEntries);
-
-	FPEPInventoryEntry* FindMutableEntry(FPEPItemId ItemId);
-
-	/**
-	 * Authoritative store and replication payload at once. Replicated to the owner only; other
-	 * viewers are served by PEPEquipment's public projection, or by an explicit loot session.
-	 */
-	UPROPERTY(Replicated)
-	FPEPInventoryView InventoryView;
-
-	/*
-	 * Both caches hold positions into InventoryView.Entries, and each is invalidated by a different
-	 * thing. Keeping one flag for both is what let a move — which shifts no position and so leaves
-	 * the id map perfectly valid — quietly rot the slot map, which is keyed by the very thing a
-	 * move changes. A flag now names exactly the cache it guards, so answering "does this need
-	 * setting?" cannot be right about one cache and wrong about the other.
-	 */
-
-	/** ItemId to index. Only the array changing shape moves an entry, so only that invalidates it. */
-	mutable TMap<FPEPItemId, int32> EntryIndex;
-
-	/**
-	 * Occupants of each container slot. Placement asks "what else is in this slot" for every
-	 * candidate cell, which would otherwise walk the whole store each time.
-	 *
-	 * Keyed by location, so a move invalidates it even though every position stays put.
-	 */
-	mutable TMap<FPEPContainerSlotKey, TArray<int32>> ContainerSlotIndex;
-
-	/**
-	 * Occupants of each named slot. Equipment asks "what is in this slot" for every slot on every
-	 * store change, and every placement onto a named slot asks whether it is free. Rebuilt with
-	 * ContainerSlotIndex under the same flag: both are keyed by location, so whatever stales one
-	 * stales the other. An array per tag, so a slot that ever holds two items still answers right.
-	 */
-	mutable TMap<FGameplayTag, TArray<int32>> NamedSlotIndex;
-
-	/**
-	 * Which entry sits on each cell of a grid slot. Placement asks "is this footprint free" once
-	 * per candidate cell, and reading cells beats re-deriving every occupant's shape for each one.
-	 * Rebuilt with the location indices, so it can never outlive a move.
-	 *
-	 * Unknown when an occupant's shape could not be resolved: the caller then falls back to the
-	 * overlap test, which re-resolves on every call and fails the way it always did.
-	 */
-	struct FPEPGridOccupancy
-	{
-		FIntPoint GridSize = FIntPoint::ZeroValue;
-		/** Entry index per cell, row-major, INDEX_NONE when free. */
-		TArray<int32> CellOccupants;
-		int32 FreeCells = 0;
-		bool bUnknown = false;
-
-		int32 OccupantAt(const FIntPoint Cell) const
-		{
-			return CellOccupants[Cell.Y * GridSize.X + Cell.X];
-		}
-	};
-	mutable TMap<FPEPContainerSlotKey, FPEPGridOccupancy> GridOccupancy;
-	void RebuildGridOccupancy() const;
-	const FPEPGridOccupancy* FindGridOccupancy(FPEPItemId ParentItemId, FName SlotName) const;
-
-	/** Named slots open to automatic placement, sorted. Changes only when a validator does. */
-	mutable TArray<FGameplayTag> AutoPlacementSlotTags;
-	mutable bool bAutoPlacementSlotTagsDirty = true;
-	const TArray<FGameplayTag>& GetAutoPlacementSlotTags() const;
-
-	mutable bool bEntryIndexDirty = true;
-	mutable bool bContainerSlotIndexDirty = true;
-
-	/** Rebuilds whichever cache is dirty, in a single pass when both are. */
-	void RefreshIndices() const;
-
-	/*
-	 * The two ways the store is written, and the only ones. Anything that reaches Entries or an
-	 * entry's location outside these will be the next bug of the kind above.
-	 */
-
-	/** Writable handle on the store. Taking it declares the array is about to change shape. */
-	TArray<FPEPInventoryEntry>& MutableEntries();
-
-	/** Moves an entry. Separate from a state write, which invalidates no cache at all. */
-	void SetEntryLocation(FPEPInventoryEntry& Entry, const FPEPItemLocation& Location);
-
-	/** Entries sharing a container slot, in no particular order. Empty when the slot is free. */
-	const TArray<int32>* FindContainerSlotOccupants(
-		FPEPItemId ParentItemId,
-		FName SlotName) const;
-
-	TArray<FPEPLocationValidatorBinding> LocationValidators;
-
-	int32 NextRequestId = 1;
-	TArray<FPEPInventoryEntry> PendingReplicatedRemovals;
-	TMap<FPEPItemId, FGameplayTag> PendingRemovedRootSlotTags;
-	// Previous complete replication graph; refreshed after the delta's callbacks finish.
-	TMap<FPEPItemId, FPEPItemLocation> LastReplicatedLocations;
-
-	FOnPEPItemStoreChanged ItemStoreChanged;
 };

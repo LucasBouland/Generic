@@ -5,7 +5,7 @@
 #include "Core/PEPCoreTags.h"
 #include "GameFramework/PlayerController.h"
 #include "Item/Actor/PEPItemWorldActor.h"
-#include "Item/PEPContainerItemWorldActor.h"
+#include "Item/Actor/PEPContainerItemWorldActor.h"
 #include "Item/Fragments/PEPItemFragment_Resource.h"
 #include "Item/PEPItemMutation.h"
 #include "Item/PEPItemPreset.h"
@@ -45,7 +45,7 @@ namespace
 	TArray<FPEPInventoryEntry> InventoryEntries(const UPEPInventoryComponent& Inventory)
 	{
 		TArray<FPEPItemId> Ids;
-		Inventory.GetInventoryItemIds(Ids);
+		Inventory.GetItemIds(Ids);
 		TArray<FPEPInventoryEntry> Entries;
 		for (const FPEPItemId Id : Ids)
 		{
@@ -90,7 +90,7 @@ namespace
 				[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 				{
 					return FPEPItemResult::Success(Item.ItemId);
-				}));
+				}), /*bAllowAutoPlacement*/ true);
 		return Inventory;
 	}
 
@@ -754,7 +754,7 @@ bool FPEPInventoryTransferSessionTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 	Remote->AddItem(
 		FFixture::MakeItem(BagDef),
 		FPEPItemLocation::MakeNamedSlot(FFixture::RootSlotTag()),
@@ -1346,7 +1346,7 @@ bool FPEPInventoryChangeEventTest::RunTest(const FString&)
 	 * delta has been applied, and that sequence is the thing under test rather than the transport.
 	 */
 	FPEPInventoryView ReceivedView;
-	ReceivedView.OwnerComponent = Fixture.Inventory;
+	FPEPInventoryViewTestAccess::BindToInventory(ReceivedView, Fixture.Inventory);
 
 	FPEPInventoryEntry Received;
 	Received.Item = FFixture::MakeItem(SmallDef);
@@ -1749,7 +1749,7 @@ bool FPEPInventoryMultiTreeRestoreTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 
 	FPEPItemInstanceTree FirstTree;
 	FirstTree.RootItem = FFixture::MakeItem(BagDef);
@@ -1830,7 +1830,7 @@ bool FPEPInventoryLoadoutTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 
 	/* A preset-built rig holding one item, and a direct loose item for the second slot. */
 	UPEPItemPreset* ContentPreset = NewObject<UPEPItemPreset>(GetTransientPackage());
@@ -1877,7 +1877,7 @@ bool FPEPInventoryLoadoutTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 
 	TestTrue(TEXT("the same loadout outfits it too"),
 		Other->ApplyLoadout(Loadout, FPEPItemAccessContext::System()).bSuccess);
@@ -1885,7 +1885,7 @@ bool FPEPInventoryLoadoutTest::RunTest(const FString&)
 		Other->GetInventoryView().Entries.Num(), 3);
 
 	TArray<FPEPItemId> FirstIds;
-	Fixture.Inventory->GetInventoryItemIds(FirstIds);
+	Fixture.Inventory->GetItemIds(FirstIds);
 	for (const FPEPItemId& Id : FirstIds)
 	{
 		TestFalse(TEXT("no item is shared between the two stores"), Other->ContainsItem(Id));
@@ -2205,11 +2205,30 @@ bool FPEPInventorySessionOwnerViewTest::RunTest(const FString&)
 	UPEPItemDefinition* TrinketDef =
 		Fixture.MakeShapedDefinition(TEXT("OwnerViewTrinketDef"), FIntPoint(1, 1));
 
-	UPEPInventoryComponent* Stash = MakeAdditionalInventory(Fixture.World);
+	/*
+	 * The player who owns the stash, looking into it: the store they carry and the stash both
+	 * answer to the same controller. It has to be a real one — a requester with no controller at
+	 * all is nobody, not the server, so the fixture's bare-actor owner would be an outsider here.
+	 */
+	UPEPInventoryComponent* Carried = MakeLooterInventory(Fixture.World);
+	AActor* Player = Carried ? Carried->GetOwner() : nullptr;
+	UPEPInventoryComponent* Stash = Player
+		? NewObject<UPEPInventoryComponent>(Player)
+		: nullptr;
 	if (!TestNotNull(TEXT("the stash exists"), Stash))
 	{
 		return false;
 	}
+
+	Stash->RegisterComponent();
+	Stash->RegisterLocationValidator(
+		FFixture::RootSlotTag(),
+		FPEPItemLocationValidator::CreateLambda(
+			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
+			{
+				return FPEPItemResult::Success(Item.ItemId);
+			}),
+		/*bAllowAutoPlacement*/ true);
 
 	FPEPItemInstance Rig = FFixture::MakeItem(RigDef);
 	const FPEPItemId RigId = Rig.ItemId;
@@ -2225,19 +2244,19 @@ bool FPEPInventorySessionOwnerViewTest::RunTest(const FString&)
 		SlotAt(RigId, SealedSlotName, 0, 0),
 		FPEPItemAccessContext::System());
 
-	/* This fixture's owner carries no controller, so the stash resolves it as itself. */
+	UPEPInventorySessionComponent* OwnerSession = PEPInventoryTest::SessionFor(Carried);
 	if (!TestTrue(TEXT("the session opens"),
-		Fixture.Session->OpenTransferSession(Stash, 500.0f)))
+		OwnerSession && OwnerSession->OpenTransferSession(Stash, 500.0f)))
 	{
 		return false;
 	}
 
 	TestTrue(TEXT("the sealed pocket is mirrored to the owner"),
-		SessionMirrors(*Fixture.Inventory, ConcealedId));
+		SessionMirrors(*Carried, ConcealedId));
 	TestEqual(TEXT("along with everything else"),
-		SessionEntries(Fixture.Session).Num(), 2);
+		SessionEntries(OwnerSession).Num(), 2);
 
-	Fixture.Session->CloseTransferSession();
+	OwnerSession->CloseTransferSession();
 	return true;
 }
 
@@ -2271,7 +2290,7 @@ bool FPEPInventorySessionDeltaTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 
 	/* A container holding four items: the corpse being looted. */
 	FPEPItemInstance RemoteBag = FFixture::MakeItem(BagDef);
@@ -2412,7 +2431,7 @@ bool FPEPInventoryMoveInvalidatesOccupancyTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 
 	FPEPItemInstance Bag = FFixture::MakeItem(BagDef);
 	const FPEPItemId BagId = Bag.ItemId;
@@ -2486,7 +2505,7 @@ bool FPEPInventoryCrossSlotSwapTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 
 	FPEPItemInstance Bag = FFixture::MakeItem(BagDef);
 	const FPEPItemId BagId = Bag.ItemId;
@@ -2576,7 +2595,7 @@ bool FPEPInventoryCheapAccessorsTest::RunTest(const FString&)
 	}
 
 	TArray<FPEPItemId> Ids;
-	Fixture.Inventory->GetInventoryItemIds(Ids);
+	Fixture.Inventory->GetItemIds(Ids);
 
 	TestEqual(TEXT("every stored item is enumerated"), Ids.Num(), 4);
 	TestTrue(TEXT("including the container"), Ids.Contains(BagId));
@@ -2737,7 +2756,7 @@ bool FPEPInventoryPruneDeadRootTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Item, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Item.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 
 	TArray<FPEPInventoryTreePlacement> Placements;
 	Placements.Add(PlaceAt(
@@ -3148,7 +3167,7 @@ bool FPEPInventoryGrantedGameplayAccessTest::RunTest(const FString&)
 			[](const FPEPItemInstance& Candidate, const FPEPItemLocation&)
 			{
 				return FPEPItemResult::Success(Candidate.ItemId);
-			}));
+			}), /*bAllowAutoPlacement*/ true);
 	const FPEPItemResult MoveRig = Fixture.Inventory->MoveItem(
 		RigId,
 		FPEPItemLocation::MakeNamedSlot(PEPItemTags::Item_Slot_Content_QuickAccess),

@@ -3,8 +3,8 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Components/PEPInventoryRequest.h"
-#include "Components/PEPInventoryTransfer.h"
 #include "Components/PEPInventoryTypes.h"
+#include "Engine/TimerHandle.h"
 #include "Item/PEPContainerAccessTypes.h"
 #include "Item/PEPItemAccess.h"
 #include "Net/PEPInventoryNetUtility.h"
@@ -61,8 +61,12 @@ public:
 	 * Names the store this player takes into and puts from. Unset, it is resolved on every use:
 	 * the possessed pawn's inventory, then the controller's, then the player state's. Set it for a
 	 * store kept somewhere else, or when the component does not sit on a controller at all.
+	 *
+	 * Server decision: it chooses which store the authority moves items into and out of. It names
+	 * no identity — requests are made as this component's controller whatever store is named — so
+	 * naming another player's store earns only what that store grants an outsider.
 	 */
-	UFUNCTION(BlueprintCallable, Category="PEP|Inventory|Session")
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="PEP|Inventory|Session")
 	void SetLocalInventory(UPEPInventoryComponent* InInventory);
 
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory|Session")
@@ -113,15 +117,38 @@ public:
 
 	// ---- The mirror ---------------------------------------------------------------------
 
-	UFUNCTION(BlueprintPure, Category="PEP|Inventory|Session")
+	/**
+	 * Every mirrored id, copied out. Callable rather than pure: it costs the whole mirror, and a
+	 * pure node pays that again for every pin that reads it.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Inventory|Session")
 	void GetSessionItemIds(TArray<FPEPItemId>& OutItemIds) const;
 
+	/** Copies one mirrored entry. Constant time: answered from the mirror's id index. */
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory|Session")
 	bool FindSessionEntry(FPEPItemId ItemId, FPEPInventoryEntry& OutEntry) const;
 
-	/** Searches only the session view. Returns null if absent/unloaded; never loads assets. */
+	/**
+	 * Searches only the session view. Returns null if absent/unloaded; never loads assets.
+	 * Const, like every definition: it is shared by every instance of the item, everywhere.
+	 */
 	UFUNCTION(BlueprintPure, Category="PEP|Inventory|Session", meta=(DisplayName="Get Session Item Definition By Id"))
-	UPEPItemDefinition* GetSessionItemDefinitionById(FPEPItemId ItemId) const;
+	const UPEPItemDefinition* GetSessionItemDefinitionById(FPEPItemId ItemId) const;
+
+	/**
+	 * The mirror itself, for native readers that walk it: one pass, nothing copied. Display data,
+	 * like the mirror; on a client it is whatever the server last sent. Order is not meaningful.
+	 */
+	const TArray<FPEPInventoryEntry>& GetSessionEntries() const
+	{
+		return SessionView.Entries;
+	}
+
+	/**
+	 * The mirrored entry for ItemId, or null when the mirror does not hold it. Constant time.
+	 * The pointer is into the mirror and lasts until the mirror next changes; do not keep it.
+	 */
+	const FPEPInventoryEntry* FindSessionEntryPtr(FPEPItemId ItemId) const;
 
 	// ---- Opening and closing, server only ---------------------------------------------------
 
@@ -202,6 +229,34 @@ public:
 	FPEPItemResult PreviewMoveInSession(
 		FPEPItemId RemoteItemId, FPEPItemLocation RemoteDestination) const;
 
+	// ---- Visibility rules, shared with the stores that enforce them ----------------------------
+
+	/**
+	 * Whether Role may see this item at all in a mirror of Store.
+	 *
+	 * Walked upwards rather than down: an item is visible when the slot holding it reveals its
+	 * occupants, the container owning that slot reveals its contents, and that container is itself
+	 * visible by the same rule. One item costs its own depth, which is what lets both the whole
+	 * snapshot and a single replicated change be answered by the same function.
+	 *
+	 * An item in a named slot is visible. Named slots carry no visibility vocabulary — their
+	 * meaning belongs to whichever domain claimed the tag — and what a body was wearing is what a
+	 * looter is meant to see; equipment already projects it publicly to everyone in range.
+	 *
+	 * Public, and pure functions of the store: the remote store applies the same rule when it
+	 * judges an outsider's request, so the mirror and the authority cannot disagree about it.
+	 */
+	static bool IsItemVisibleInExternalView(
+		const UPEPInventoryComponent& Store,
+		FPEPItemId ItemId,
+		EPEPAccessRole Role);
+
+	/** Whether an entry belongs to the inspected root or an Attachment branch beneath it. */
+	static bool IsItemInInspectionProjection(
+		const UPEPInventoryComponent& Store,
+		FPEPItemId ItemId,
+		FPEPItemId InspectionRootItemId);
+
 	/** Session requests only; the local inventory resolves its own. */
 	UPROPERTY(BlueprintAssignable, Category="PEP|Inventory|Request")
 	FOnPEPInventoryRequestResolved OnRequestResolved;
@@ -238,13 +293,26 @@ private:
 	bool HasAuthority() const;
 
 	/**
-	 * The identity requests are made on behalf of: the one the local store already answers to, so
-	 * a request judged by two stores is judged against the same requester on both sides. With no
-	 * local store, the controller this component sits on.
+	 * The controller this component answers for, read from where it lives: the controller it sits
+	 * on, or the controller of the pawn or player state it sits on. Null anywhere else.
+	 */
+	const AController* GetSessionController() const;
+
+	/**
+	 * The identity requests are made on behalf of: GetSessionController. Taken from where the
+	 * component lives — the connection a server RPC can only have arrived on — and never from the
+	 * local store, which is a setting: a store named by SetLocalInventory must not lend this player
+	 * its owner's identity. With no controller it names nobody, which every store treats as an
+	 * outsider, never as the server.
 	 */
 	FPEPItemAccessContext GetRequestContext() const;
 
-	/** The actor whose position counts for distance: the player's body, not the controller. */
+	/**
+	 * The actor whose position counts for distance: the player's body, not the controller. The
+	 * possessed pawn first; then the local store's carrier, but only if it stands somewhere — a
+	 * pawn, or an actor with a root component that is not a controller or an info actor, both of
+	 * which sit wherever they spawned; then this component's own owner, as a last resort.
+	 */
 	const AActor* GetLocationActor() const;
 
 	bool IsTransferSessionValid() const;
@@ -261,6 +329,41 @@ private:
 	/** The role the remote store grants this player. Meaningless without a session. */
 	EPEPAccessRole ResolveSessionRole() const;
 
+	/**
+	 * Gate shared by every authority-side request, ranked by reason: a read-only session, then an
+	 * id that is not the open session's, then a session no longer valid (out of range, store gone).
+	 */
+	FPEPItemResult CheckSessionRequest(FGuid ExpectedSessionId, FPEPItemId ItemId) const;
+
+	/**
+	 * Whether the player may name this remote item at all: only what the mirror holds. The mirror
+	 * is exactly what was sent to them, so an id it lacks is one they were never shown — hidden,
+	 * outside the inspected branch, or simply guessed — and is refused as if it did not exist.
+	 */
+	bool IsMirroredItem(FPEPItemId ItemId) const;
+
+	/** The same rule for a destination: a container slot is only reachable through a mirrored parent. */
+	bool IsMirroredDestination(const FPEPItemLocation& Destination) const;
+
+	/*
+	 * The authority's answer to each request, whether it came from a local call or an RPC, so the
+	 * listen server's own player is held to exactly the rules a remote client is.
+	 */
+	FPEPItemResult ExecuteTakeFromSession(
+		FGuid ExpectedSessionId, FPEPItemId RemoteItemId, const FPEPItemLocation& LocalDestination);
+	FPEPItemResult ExecutePutIntoSession(
+		FGuid ExpectedSessionId, FPEPItemId LocalItemId, const FPEPItemLocation& RemoteDestination);
+	FPEPItemResult ExecuteMoveInSession(
+		FGuid ExpectedSessionId, FPEPItemId RemoteItemId, const FPEPItemLocation& RemoteDestination);
+
+	/** Whether the remote item ItemId belongs in this session's mirror: visible to Role, and in the inspected branch. */
+	bool ShouldMirror(const UPEPInventoryComponent& Remote, FPEPItemId ItemId, EPEPAccessRole Role) const;
+
+	/**
+	 * Reconciles the whole mirror with the remote store, by item id: entries that changed are
+	 * updated in place, new ones appended, vanished ones removed. Every surviving entry keeps its
+	 * replication id, so the fast array sends what differs rather than the whole mirror again.
+	 */
 	void RefreshSessionView();
 	void HandleRemoteStoreChanged(const FPEPItemStoreChange& Change);
 
@@ -271,8 +374,8 @@ private:
 	 * single item taken — the cost of looting a container becomes the container, not the item.
 	 * Touching only the entry that changed is what keeps the two proportional.
 	 *
-	 * Anything that cannot be applied falls back to the full rebuild: a snapshot that is expensive
-	 * is a great deal better than one that is wrong.
+	 * Anything that cannot be applied falls back to the full reconciliation: a snapshot that is
+	 * expensive is a great deal better than one that is wrong.
 	 */
 	void ApplySessionViewChange(const FPEPItemStoreChange& Change);
 
@@ -285,28 +388,20 @@ private:
 	UFUNCTION()
 	void HandlePossessedPawnChanged(APawn* OldPawn, APawn* NewPawn);
 
-	/**
-	 * Whether Role may see this item at all in a mirror of Store.
-	 *
-	 * Walked upwards rather than down: an item is visible when the slot holding it reveals its
-	 * occupants, the container owning that slot reveals its contents, and that container is itself
-	 * visible by the same rule. One item costs its own depth, which is what lets both the whole
-	 * snapshot and a single replicated change be answered by the same function.
-	 *
-	 * An item in a named slot is visible. Named slots carry no visibility vocabulary — their
-	 * meaning belongs to whichever domain claimed the tag — and what a body was wearing is what a
-	 * looter is meant to see; equipment already projects it publicly to everyone in range.
+	/*
+	 * Every write to SessionView.Entries goes through these, so the id index below stays exact on
+	 * the authority without a rebuild. A client's mirror is written by replication instead, which
+	 * is why a receive marks the index dirty.
 	 */
-	static bool IsItemVisibleInExternalView(
-		const UPEPInventoryComponent& Store,
-		FPEPItemId ItemId,
-		EPEPAccessRole Role);
+	void AddSessionSnapshot(const FPEPInventoryEntry& RemoteEntry);
+	/** @return false when the snapshot already matched, and nothing was marked for replication. */
+	bool UpdateSessionSnapshot(int32 Index, const FPEPInventoryEntry& RemoteEntry);
+	void RemoveSessionSnapshotAt(int32 Index);
+	void ResetSessionSnapshots();
 
-	/** Whether an entry belongs to the inspected root or an Attachment branch beneath it. */
-	static bool IsItemInInspectionProjection(
-		const UPEPInventoryComponent& Store,
-		FPEPItemId ItemId,
-		FPEPItemId InspectionRootItemId);
+	/** Position of ItemId in SessionView.Entries, or INDEX_NONE. */
+	int32 FindSessionEntryIndex(FPEPItemId ItemId) const;
+	void RebuildSessionEntryIndex() const;
 
 	/* Reached only by the fast array, through the friendship declared at the top of this class. */
 	void HandleReplicatedSessionViewChanged();
@@ -362,7 +457,62 @@ private:
 	mutable TObjectPtr<UPEPInventoryComponent> SessionPreviewScratch;
 	mutable bool bSessionPreviewScratchDirty = true;
 
+	/**
+	 * ItemId to position in SessionView.Entries: every lookup the UI and the request gates make is
+	 * one hash probe instead of a walk of the mirror. Maintained in place by the authority's writes;
+	 * rebuilt once after a replication receive, or whenever the array's size disagrees with it.
+	 */
+	mutable TMap<FPEPItemId, int32> SessionEntryIndex;
+	mutable int32 SessionEntryIndexArrayNum = 0;
+	mutable bool bSessionEntryIndexDirty = true;
+
+	/**
+	 * The server's half of an open loot session: which remote store this one may reach, how far it
+	 * may be, and what has to be undone to close it.
+	 *
+	 * Gathered here because these were kept as loose members and had to be set and cleared in step;
+	 * a session that kept its timer but dropped its delegate, or the reverse, is not a state anything
+	 * should be able to reach by forgetting a line.
+	 *
+	 * Plain C++, nested and private: none of this belongs on the wire, in an editor or in anyone
+	 * else's API, and a delegate handle could not be a UPROPERTY in any case. The client's half —
+	 * the mirror and the flag saying a session exists — stays on the component, where it replicates.
+	 */
+	struct FTransferSession
+	{
+		/** Weak: the corpse being looted can be destroyed while someone is looking into it. */
+		TWeakObjectPtr<UPEPInventoryComponent> RemoteInventory;
+
+		/** Actor whose OnEndPlay ends the session; kept to unbind from it even once it is unreachable. */
+		TWeakObjectPtr<AActor> RemoteOwner;
+
+		float MaxDistance = 0.0f;
+
+		/** Subscription on the remote store, so its changes reach the mirror. */
+		FDelegateHandle RemoteChangeHandle;
+
+		/**
+		 * Re-checks the distance, the one condition with no event behind it: nothing announces a
+		 * pawn crossing a radius. A session is not something the looter can be trusted to end.
+		 */
+		FTimerHandle ValidationTimer;
+
+		UPEPInventoryComponent* GetRemote() const
+		{
+			return RemoteInventory.Get();
+		}
+
+		void Reset()
+		{
+			RemoteInventory.Reset();
+			RemoteOwner.Reset();
+			MaxDistance = 0.0f;
+			RemoteChangeHandle.Reset();
+			ValidationTimer.Invalidate();
+		}
+	};
+
 	/** Authority-side only. Its replicated counterparts are SessionView and the flag. */
-	FPEPInventoryTransferSession TransferSession;
+	FTransferSession TransferSession;
 	int32 NextRequestId = 1;
 };

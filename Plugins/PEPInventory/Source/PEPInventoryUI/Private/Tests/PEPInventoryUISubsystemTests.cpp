@@ -87,7 +87,8 @@ bool FPEPInventoryUIRoutingTest::RunTest(const FString& Parameters)
 		FPEPItemLocationValidator::CreateLambda([](const FPEPItemInstance& Item, const FPEPItemLocation&)
 		{
 			return FPEPItemResult::Success(Item.ItemId);
-		}));
+		}),
+		/*bAllowAutoPlacement*/ true);
 	UPEPInventoryUISubsystem* UI = NewObject<UPEPInventoryUISubsystem>(LocalPlayer);
 	TestFalse(TEXT("Unregistered context is invalid"), UI->IsContextCurrent(UI->GetPlayerInventoryContext()));
 	TestFalse(TEXT("Null registration rejected"), UI->RegisterInventoryComponent(nullptr));
@@ -297,7 +298,7 @@ bool FPEPInventoryUIReplicatedCallbackTest::RunTest(const FString& Parameters)
 	UPEPInventoryComponent* Inventory = NewObject<UPEPInventoryComponent>(Controller,
 		UPEPInventoryComponent::StaticClass(), NAME_None, RF_NoFlags, Template);
 	TestTrue(TEXT("PostInitProperties repairs the callback target after template copying"),
-		ViewProperty->ContainerPtrToValuePtr<FPEPInventoryView>(Inventory)->OwnerComponent == Inventory);
+		ViewProperty->ContainerPtrToValuePtr<FPEPInventoryView>(Inventory)->GetOwnerComponent() == Inventory);
 	// Model a Blueprint property/template copy before registration; OnRegister must repair it too.
 	*ViewProperty->ContainerPtrToValuePtr<FPEPInventoryView>(Inventory) =
 		*ViewProperty->ContainerPtrToValuePtr<FPEPInventoryView>(Template);
@@ -305,8 +306,8 @@ bool FPEPInventoryUIReplicatedCallbackTest::RunTest(const FString& Parameters)
 	UI->RegisterInventoryComponent(Inventory);
 	FPEPInventoryView* View = ViewProperty->ContainerPtrToValuePtr<FPEPInventoryView>(Inventory);
 	TestTrue(TEXT("Local callbacks target the registered instance, not its template/CDO"),
-		View->OwnerComponent == Inventory);
-	TestFalse(TEXT("Local view is not a session"), View->bIsSessionView);
+		View->GetOwnerComponent() == Inventory);
+	TestFalse(TEXT("Local view is not a session"), View->IsSessionView());
 	// The same template copy, on the session component that now owns the mirror.
 	UPEPInventorySessionComponent* SessionTemplate = NewObject<UPEPInventorySessionComponent>(Controller);
 	UPEPInventorySessionComponent* SessionComponent = NewObject<UPEPInventorySessionComponent>(Controller,
@@ -315,8 +316,8 @@ bool FPEPInventoryUIReplicatedCallbackTest::RunTest(const FString& Parameters)
 		*SessionProperty->ContainerPtrToValuePtr<FPEPInventoryView>(SessionTemplate);
 	SessionComponent->RegisterComponent();
 	FPEPInventoryView* Session = SessionProperty->ContainerPtrToValuePtr<FPEPInventoryView>(SessionComponent);
-	TestTrue(TEXT("Session callbacks target the registered instance"), Session->SessionOwner == SessionComponent);
-	TestTrue(TEXT("Remote view is a session"), Session->bIsSessionView);
+	TestTrue(TEXT("Session callbacks target the registered instance"), Session->GetSessionOwner() == SessionComponent);
+	TestTrue(TEXT("Remote view is a session"), Session->IsSessionView());
 	FPEPInventoryEntry Received;
 	Received.Item = FFixture::MakeItem(Fixture.MakeShapedDefinition(TEXT("UIReceivedItem"), FIntPoint(1, 1)));
 	Received.Location = FPEPItemLocation::MakeNamedSlot(FFixture::RootSlotTag());
@@ -327,6 +328,179 @@ bool FPEPInventoryUIReplicatedCallbackTest::RunTest(const FString& Parameters)
 	Received.PostReplicatedChange(*View);
 	TestEqual(TEXT("Replicated change reaches the subsystem listener"), Listener->InventoryChangeCount, 2);
 	UI->UnregisterInventoryComponent();
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPEPInventoryUISessionMirrorGateTest,
+	"PEP.Inventory.UI.SessionMirrorGate",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPInventoryUISessionMirrorGateTest::RunTest(const FString& Parameters)
+{
+	using namespace PEPInventoryTest;
+	FFixture Fixture;
+	ULocalPlayer* LocalPlayer = NewObject<ULocalPlayer>(GEngine);
+	APlayerController* Controller = Fixture.World->SpawnActor<APlayerController>();
+	Controller->Player = LocalPlayer;
+	UPEPInventoryComponent* Inventory = NewObject<UPEPInventoryComponent>(Controller);
+	Inventory->RegisterComponent();
+	Inventory->RegisterLocationValidator(FFixture::RootSlotTag(),
+		FPEPItemLocationValidator::CreateLambda([](const FPEPItemInstance& Item, const FPEPItemLocation&)
+		{
+			return FPEPItemResult::Success(Item.ItemId);
+		}),
+		/*bAllowAutoPlacement*/ true);
+
+	// The controller is announced before it carries a session component, as when one is added late.
+	UPEPInventoryUISubsystem* UI = NewObject<UPEPInventoryUISubsystem>(LocalPlayer);
+	UI->PlayerControllerChanged(Controller);
+	TestTrue(TEXT("The controller's own inventory is registered"), UI->GetInventoryComponent() == Inventory);
+	UPEPInventorySessionComponent* Session = NewObject<UPEPInventorySessionComponent>(Controller);
+	Session->RegisterComponent();
+	TestFalse(TEXT("A component added late is not bound yet"), Session->OnSessionViewChanged.IsBound());
+	TestTrue(TEXT("The late component is found"), UI->GetSessionComponent() == Session);
+	TestTrue(TEXT("Finding it binds its session events"), Session->OnSessionViewChanged.IsBound());
+	TestTrue(TEXT("and its request results"), Session->OnRequestResolved.IsBound());
+
+	// A rig with a pocket an outsider sees into and one they do not.
+	const FName OpenSlot(TEXT("Open"));
+	const FName SealedSlot(TEXT("Sealed"));
+	const FName InnerSlot(TEXT("Inner"));
+	FPEPContainerSlotDefinition OpenPocket;
+	OpenPocket.SlotName = OpenSlot;
+	OpenPocket.Mode = EPEPContainerSlotMode::Grid;
+	OpenPocket.GridSize = FIntPoint(2, 2);
+	OpenPocket.OtherVisibility = EPEPContainerSlotVisibility::Lootable;
+	OpenPocket.bOtherCanTake = true;
+	OpenPocket.bOtherCanPut = true;
+	OpenPocket.bOtherCanMoveInside = true;
+	FPEPContainerSlotDefinition SealedPocket = OpenPocket;
+	SealedPocket.SlotName = SealedSlot;
+	SealedPocket.GridSize = FIntPoint(2, 1);
+	SealedPocket.OtherVisibility = EPEPContainerSlotVisibility::Hidden;
+	FPEPItemFragment_Container RigContainer;
+	RigContainer.Slots.Add(OpenPocket);
+	RigContainer.Slots.Add(SealedPocket);
+	FPEPContainerSlotDefinition InnerPocket = OpenPocket;
+	InnerPocket.SlotName = InnerSlot;
+	InnerPocket.GridSize = FIntPoint(1, 1);
+	FPEPItemFragment_Container BagContainer;
+	BagContainer.Slots.Add(InnerPocket);
+	FPEPItemFragment_InventoryShape OneCell;
+	OneCell.Size = FIntPoint(1, 1);
+
+	const FPEPItemInstance Rig = FFixture::MakeItem(Fixture.MakeDefinition(TEXT("GateRig"),
+		{ FInstancedStruct::Make(RigContainer), FInstancedStruct::Make(OneCell) }));
+	UPEPItemDefinition* BagDefinition = Fixture.MakeDefinition(TEXT("GateBag"),
+		{ FInstancedStruct::Make(BagContainer), FInstancedStruct::Make(OneCell) });
+	UPEPItemDefinition* TrinketDefinition = Fixture.MakeShapedDefinition(TEXT("GateTrinket"), FIntPoint(1, 1));
+	const FPEPItemInstance Visible = FFixture::MakeItem(TrinketDefinition);
+	const FPEPItemInstance VisibleBag = FFixture::MakeItem(BagDefinition);
+	const FPEPItemInstance Hidden = FFixture::MakeItem(TrinketDefinition);
+	const FPEPItemInstance HiddenBag = FFixture::MakeItem(BagDefinition);
+	const FPEPItemAccessContext System = FPEPItemAccessContext::System();
+	TestTrue(TEXT("Seed rig"), Fixture.AddToRootSlot(Rig).bSuccess);
+	TestTrue(TEXT("Seed visible item"), Fixture.Inventory->AddItem(Visible,
+		FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot), System).bSuccess);
+	TestTrue(TEXT("Seed visible bag"), Fixture.Inventory->AddItem(VisibleBag,
+		FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot, FIntPoint(0, 1)), System).bSuccess);
+	TestTrue(TEXT("Seed hidden item"), Fixture.Inventory->AddItem(Hidden,
+		FPEPItemLocation::MakeItemContainer(Rig.ItemId, SealedSlot), System).bSuccess);
+	TestTrue(TEXT("Seed hidden bag"), Fixture.Inventory->AddItem(HiddenBag,
+		FPEPItemLocation::MakeItemContainer(Rig.ItemId, SealedSlot, FIntPoint(1, 0)), System).bSuccess);
+
+	const FPEPItemInstance LocalBag = FFixture::MakeItem(
+		Fixture.MakeContainerDefinition(TEXT("GateLocalBag"), TEXT("Storage"), FIntPoint(4, 4)));
+	const FPEPItemInstance Pebble = FFixture::MakeItem(TrinketDefinition);
+	TestTrue(TEXT("Seed local bag"), Inventory->AddItem(LocalBag,
+		FPEPItemLocation::MakeNamedSlot(FFixture::RootSlotTag()), System).bSuccess);
+	TestTrue(TEXT("Seed local pebble"), Inventory->AddItem(Pebble,
+		FPEPItemLocation::MakeItemContainer(LocalBag.ItemId, TEXT("Storage")), System).bSuccess);
+
+	// Slot rules: this player is an outsider to the remote store.
+	Fixture.Inventory->ExternalAccess = EPEPExternalAccessMode::SlotRules;
+	if (!TestTrue(TEXT("Open remote session"), Session->OpenTransferSession(Fixture.Inventory)))
+	{
+		return false;
+	}
+	const FGuid SessionId = Session->GetTransferSessionId();
+	if (!TestNotNull(TEXT("Mirror holds the rig"), Session->FindSessionEntryPtr(Rig.ItemId))
+		|| !TestNotNull(TEXT("Mirror holds the visible item"), Session->FindSessionEntryPtr(Visible.ItemId))
+		|| !TestNotNull(TEXT("Mirror holds the visible bag"), Session->FindSessionEntryPtr(VisibleBag.ItemId)))
+	{
+		return false;
+	}
+	TestNull(TEXT("Mirror withholds the hidden item"), Session->FindSessionEntryPtr(Hidden.ItemId));
+	TestNull(TEXT("Mirror withholds the hidden bag"), Session->FindSessionEntryPtr(HiddenBag.ItemId));
+	TestEqual(TEXT("Mirror size"), Session->GetSessionEntries().Num(), 3);
+
+	const FPEPInventoryUIContext Remote = UI->GetTransferSessionContext();
+	TArray<FPEPInventoryEntry> SlotEntries;
+	UI->GetEntriesInContainerSlot(Remote, Rig.ItemId, OpenSlot, SlotEntries);
+	TestEqual(TEXT("Open pocket shows its two occupants"), SlotEntries.Num(), 2);
+	UI->GetEntriesInContainerSlot(Remote, Rig.ItemId, SealedSlot, SlotEntries);
+	TestEqual(TEXT("Sealed pocket shows nothing"), SlotEntries.Num(), 0);
+	FPEPInventoryEntry SlotEntry;
+	TestTrue(TEXT("Session named slot answers from the mirror"),
+		UI->FindEntryInNamedSlot(Remote, FFixture::RootSlotTag(), SlotEntry) && SlotEntry.Item.ItemId == Rig.ItemId);
+	TestTrue(TEXT("Local named slot answers from the store"),
+		UI->FindEntryInNamedSlot(UI->GetPlayerInventoryContext(), FFixture::RootSlotTag(), SlotEntry)
+			&& SlotEntry.Item.ItemId == LocalBag.ItemId);
+
+	// A moved container reconciles the whole mirror; untouched entries keep their replication ids.
+	const int32 RigReplicationId = Session->FindSessionEntryPtr(Rig.ItemId)->ReplicationID;
+	const int32 VisibleReplicationId = Session->FindSessionEntryPtr(Visible.ItemId)->ReplicationID;
+	TestTrue(TEXT("Move the visible bag"), Fixture.Inventory->MoveItem(VisibleBag.ItemId,
+		FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot, FIntPoint(1, 1)), System).bSuccess);
+	const FPEPInventoryEntry* MovedBag = Session->FindSessionEntryPtr(VisibleBag.ItemId);
+	TestTrue(TEXT("Mirror follows the moved bag"), MovedBag && MovedBag->Location.GridPosition == FIntPoint(1, 1));
+	const FPEPInventoryEntry* RigAfterMove = Session->FindSessionEntryPtr(Rig.ItemId);
+	const FPEPInventoryEntry* VisibleAfterMove = Session->FindSessionEntryPtr(Visible.ItemId);
+	TestTrue(TEXT("Reconciliation keeps the rig's replication id"),
+		RigAfterMove && RigAfterMove->ReplicationID == RigReplicationId);
+	TestTrue(TEXT("Reconciliation keeps the item's replication id"),
+		VisibleAfterMove && VisibleAfterMove->ReplicationID == VisibleReplicationId);
+	TestEqual(TEXT("Reconciliation neither adds nor drops entries"), Session->GetSessionEntries().Num(), 3);
+
+	// Ids the player was never sent are not actionable, whatever the store would have allowed.
+	int32 RequestId = 0;
+	const FPEPItemLocation LocalCell = FPEPItemLocation::MakeItemContainer(LocalBag.ItemId, TEXT("Storage"), FIntPoint(1, 1));
+	TestEqual(TEXT("Taking an unmirrored item is refused"),
+		Session->RequestTakeFromSession(SessionId, Hidden.ItemId, LocalCell, RequestId), EPEPRequestResult::Failed);
+	TestTrue(TEXT("The hidden item stays in the remote store"), Fixture.Inventory->ContainsItem(Hidden.ItemId));
+	TestFalse(TEXT("and never reaches the player"), Inventory->ContainsItem(Hidden.ItemId));
+	TestEqual(TEXT("Moving an unmirrored item is refused"),
+		Session->RequestMoveInSession(SessionId, Hidden.ItemId,
+			FPEPItemLocation::MakeItemContainer(Rig.ItemId, OpenSlot, FIntPoint(1, 0)), RequestId),
+		EPEPRequestResult::Failed);
+	FPEPItemLocation HiddenLocation;
+	Fixture.Inventory->FindItemLocation(Hidden.ItemId, HiddenLocation);
+	TestTrue(TEXT("The hidden item stays where it was"), HiddenLocation.ContainerSlotName == SealedSlot);
+	TestEqual(TEXT("Putting into an unmirrored container is refused"),
+		Session->RequestPutIntoSession(SessionId, Pebble.ItemId,
+			FPEPItemLocation::MakeItemContainer(HiddenBag.ItemId, InnerSlot), RequestId),
+		EPEPRequestResult::Failed);
+	TestTrue(TEXT("The pebble stays with the player"), Inventory->ContainsItem(Pebble.ItemId));
+	TestFalse(TEXT("Previewing a put into an unmirrored container fails too"),
+		Session->PreviewPutIntoSession(Pebble.ItemId,
+			FPEPItemLocation::MakeItemContainer(HiddenBag.ItemId, InnerSlot)).bSuccess);
+
+	// What the mirror shows is still actionable, and the index follows the removal.
+	TestEqual(TEXT("Taking a mirrored item executes"),
+		Session->RequestTakeFromSession(SessionId, Visible.ItemId, LocalCell, RequestId), EPEPRequestResult::Executed);
+	TestTrue(TEXT("The taken item reaches the player"), Inventory->ContainsItem(Visible.ItemId));
+	TestNull(TEXT("and leaves the mirror"), Session->FindSessionEntryPtr(Visible.ItemId));
+	TestEqual(TEXT("Mirror shrinks by one"), Session->GetSessionEntries().Num(), 2);
+	const FPEPInventoryEntry* RigEntry = Session->FindSessionEntryPtr(Rig.ItemId);
+	const FPEPInventoryEntry* BagEntry = Session->FindSessionEntryPtr(VisibleBag.ItemId);
+	TestTrue(TEXT("Index still resolves the rig"), RigEntry && RigEntry->Item.ItemId == Rig.ItemId);
+	TestTrue(TEXT("Index still resolves the bag"), BagEntry && BagEntry->Item.ItemId == VisibleBag.ItemId);
+
+	Session->CloseTransferSession();
+	TestEqual(TEXT("Closing empties the mirror"), Session->GetSessionEntries().Num(), 0);
+	TestNull(TEXT("and its index"), Session->FindSessionEntryPtr(Rig.ItemId));
+	UI->PlayerControllerChanged(nullptr);
+	TestFalse(TEXT("Controller change unbinds the late component"), Session->OnSessionViewChanged.IsBound());
 	return true;
 }
 #endif

@@ -18,7 +18,7 @@ bool FPEPInventoryRootSlotChangeTest::RunTest(const FString&)
         FPEPItemLocationValidator::CreateLambda([](const FPEPItemInstance& Item, const FPEPItemLocation&)
         {
             return FPEPItemResult::Success(Item.ItemId);
-        }));
+        }), /*bAllowAutoPlacement*/ true);
     const FPEPItemAccessContext Access = FPEPItemAccessContext::System();
     const FName Slot = TEXT("contents");
     UPEPItemDefinition* Container = Fixture.MakeContainerDefinition(TEXT("RootTagContainer"), Slot, FIntPoint(4, 4));
@@ -73,14 +73,14 @@ bool FPEPInventoryReplicatedRootSlotChangeTest::RunTest(const FString&)
         FPEPItemLocationValidator::CreateLambda([](const FPEPItemInstance& Item, const FPEPItemLocation&)
         {
             return FPEPItemResult::Success(Item.ItemId);
-        }));
+        }), /*bAllowAutoPlacement*/ true);
     const FPEPItemInstance Root = FFixture::MakeItem(Fixture.MakeContainerDefinition(TEXT("ReplicatedRootTagContainer"), Slot, FIntPoint(4, 4)));
     const FPEPItemInstance Leaf = FFixture::MakeItem(Fixture.MakeShapedDefinition(TEXT("ReplicatedRootTagLeaf"), FIntPoint(1, 1)));
     const FPEPItemLocation Origin = FPEPItemLocation::MakeItemContainer(Root.ItemId, Slot, FIntPoint(0, 0), false);
     TestTrue(TEXT("root seeded"), Fixture.AddToRootSlot(Root).bSuccess);
     TestTrue(TEXT("leaf seeded"), Fixture.Inventory->AddItem(Leaf, Origin, Access).bSuccess);
     FPEPInventoryView ReceivedView;
-    ReceivedView.OwnerComponent = Fixture.Inventory;
+    FPEPInventoryViewTestAccess::BindToInventory(ReceivedView, Fixture.Inventory);
     ReceivedView.PostReplicatedReceive(FFastArraySerializer::FPostReplicatedReceiveParameters{});
     // Simulate a delta whose parent has already moved when the child's callback runs.
     TestTrue(TEXT("root relocated"), Fixture.Inventory->MoveItem(Root.ItemId, FPEPItemLocation::MakeNamedSlot(SecondTag), Access).bSuccess);

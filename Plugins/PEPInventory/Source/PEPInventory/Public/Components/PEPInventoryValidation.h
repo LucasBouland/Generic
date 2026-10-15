@@ -4,12 +4,24 @@
 #include "GameplayTagContainer.h"
 #include "Item/PEPItemStore.h"
 
-/** Ties a root location tag to the domain that gave it meaning by claiming it. */
+/**
+ * Ties a root location tag to the domain that gave it meaning by claiming it.
+ *
+ * Public only because the store holds an array of them and the session copies that array into its
+ * preview store; nothing outside PEPInventory builds or reads one.
+ */
 struct FPEPLocationValidatorBinding
 {
 	FGameplayTag RootLocationTag;
 	FPEPItemLocationValidator Validator;
 	bool bAllowAutoPlacement = true;
+
+	/**
+	 * Segments in RootLocationTag, counted once when the tag is claimed. Every named-slot check
+	 * picks the deepest claim covering its tag, and deriving this from the tag's string there cost
+	 * an allocation per binding per check.
+	 */
+	int32 TagDepth = 0;
 };
 
 /**

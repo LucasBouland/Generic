@@ -1,9 +1,9 @@
 #include "Item/Actor/PEPSimpleItemWorldActor.h"
 #include "Item/Fragments/PEPItemFragment_Container.h"
 
-FPEPItemInstance APEPSimpleItemWorldActor::GetAuthorityItemInstance() const
+const FPEPItemInstance* APEPSimpleItemWorldActor::FindAuthorityItemInstance() const
 {
-	return HasAuthority() ? AuthorityItemInstance : FPEPItemInstance();
+	return HasAuthority() && AuthorityItemInstance.IsValid() ? &AuthorityItemInstance : nullptr;
 }
 void APEPSimpleItemWorldActor::ResetAuthorityStorage()
 {

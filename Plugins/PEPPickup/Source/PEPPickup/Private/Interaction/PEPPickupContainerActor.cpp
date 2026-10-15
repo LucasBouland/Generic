@@ -13,6 +13,7 @@
 TArray<FGameplayTag> APEPPickupContainerActor::GetInteractOptionTags_Implementation(AActor* Interactor) const
 {
 	TArray<FGameplayTag> OptionTags;
+	/* Read once: on the authority each read copies the root instance out of the inventory. */
 	const UPEPItemDefinition* Definition = GetItemDefinition();
 	const UPEPPickupSettings* Settings = GetDefault<UPEPPickupSettings>();
 	bool bHasContentSlots = false;
@@ -23,7 +24,9 @@ TArray<FGameplayTag> APEPPickupContainerActor::GetInteractOptionTags_Implementat
 		const auto AddSupportedOption = [&OptionTags, bHasContentSlots, bHasAttachmentSlots](
 			const FGameplayTag& Tag)
 		{
-			if ((Tag == PEPInteractionTags::Open && !bHasContentSlots)
+			/* Pickup follows the pickup policy below, never the option tables. */
+			if (Tag == PEPInteractionTags::Pickup
+				|| (Tag == PEPInteractionTags::Open && !bHasContentSlots)
 				|| (Tag == PEPInteractionTags::Inspect && !bHasAttachmentSlots))
 			{
 				return;
@@ -54,25 +57,43 @@ TArray<FGameplayTag> APEPPickupContainerActor::GetInteractOptionTags_Implementat
 		}
 	}
 
-	OptionTags.AddUnique(PEPInteractionTags::Pickup);
+	if (Settings && Settings->CanPickupDefinition(Definition))
+	{
+		OptionTags.AddUnique(PEPInteractionTags::Pickup);
+	}
 	return OptionTags;
 }
 FPEPInteractionResult APEPPickupContainerActor::CanInteract_Implementation(
 	AActor* Interactor, FGameplayTag InteractionTag) const
 {
+	ThisClass* MutableThis = const_cast<ThisClass*>(this);
+	if (!HasAuthority())
+	{
+		return FPEPInteractionResult::Failure(PEPCoreTags::Reason_NotAuthority, MutableThis, InteractionTag);
+	}
+	if (InteractionTag != PEPInteractionTags::Pickup
+		&& InteractionTag != PEPInteractionTags::Open
+		&& InteractionTag != PEPInteractionTags::Inspect)
+	{
+		return FPEPInteractionResult::Failure(PEPCoreTags::Reason_UnsupportedMode, MutableThis, InteractionTag);
+	}
+
 	UPEPInventoryComponent* PlayerInventory = PEPItemPickup::ResolveInteractorInventory(Interactor);
 	FGameplayTag Reason = PEPCoreTags::Reason_UnsupportedMode;
-	if (!HasAuthority()) Reason = PEPCoreTags::Reason_NotAuthority;
-	else if (InteractionTag == PEPInteractionTags::Pickup)
+	if (InteractionTag == PEPInteractionTags::Pickup)
 	{
+		if (!GetDefault<UPEPPickupSettings>()->CanPickupDefinition(GetItemDefinition()))
+		{
+			return FPEPInteractionResult::Failure(PEPCoreTags::Reason_BlockedByState, MutableThis, InteractionTag);
+		}
 		const FPEPItemResult Result = PEPItemPickup::CanPickupWorldItem(this, PlayerInventory,
 			PEPItemPickup::ResolveInteractorController(Interactor));
-		if (Result.bSuccess) return FPEPInteractionResult::Success(const_cast<ThisClass*>(this), InteractionTag);
+		if (Result.bSuccess) return FPEPInteractionResult::Success(MutableThis, InteractionTag);
 		Reason = Result.ReasonTag;
 	}
-	else if (InteractionTag == PEPInteractionTags::Open
-		|| InteractionTag == PEPInteractionTags::Inspect)
+	else
 	{
+		/* One copy of the private root per query: its slots and its id are read from it. */
 		const FPEPItemInstance RootItem = GetAuthorityItemInstance();
 		const FPEPItemFragment_Container* Container = RootItem.IsValid()
 			? RootItem.GetDefinitionFragment<FPEPItemFragment_Container>()
@@ -101,16 +122,18 @@ FPEPInteractionResult APEPPickupContainerActor::CanInteract_Implementation(
 				? Session->CanOpenTransferSession(Inventory, OpenDistance)
 				: Session->CanOpenInspectionSession(
 					Inventory, RootItem.ItemId, OpenDistance);
-			if (Result.bSuccess) return FPEPInteractionResult::Success(const_cast<ThisClass*>(this), InteractionTag);
+			if (Result.bSuccess) return FPEPInteractionResult::Success(MutableThis, InteractionTag);
 			Reason = Result.ReasonTag;
 		}
 	}
-	return FPEPInteractionResult::Failure(Reason, const_cast<ThisClass*>(this), InteractionTag);
+	return FPEPInteractionResult::Failure(Reason, MutableThis, InteractionTag);
 }
 FPEPInteractionResult APEPPickupContainerActor::ExecuteInteraction_Implementation(
 	AActor* Interactor, FGameplayTag InteractionTag)
 {
-	const FPEPInteractionResult Validation = CanInteract_Implementation(Interactor, InteractionTag);
+	/* Through the interface, so that a Blueprint override of CanInteract is honoured here too. */
+	const FPEPInteractionResult Validation =
+		IPEPInteractionInteractable::Execute_CanInteract(this, Interactor, InteractionTag);
 	if (!Validation.bSuccess) return Validation;
 	UPEPInventoryComponent* PlayerInventory = PEPItemPickup::ResolveInteractorInventory(Interactor);
 	UPEPInventorySessionComponent* Session = UPEPInventorySessionComponent::FindSessionComponent(Interactor);
@@ -127,9 +150,19 @@ FPEPInteractionResult APEPPickupContainerActor::ExecuteInteraction_Implementatio
 			? FPEPInteractionResult::Success(this, InteractionTag)
 			: FPEPInteractionResult::Failure(PEPCoreTags::Reason_InvalidTarget, this, InteractionTag);
 	}
+	if (InteractionTag != PEPInteractionTags::Pickup)
+	{
+		/* A Blueprint CanInteract may allow options this class does not execute. */
+		return FPEPInteractionResult::Failure(PEPCoreTags::Reason_UnsupportedMode, this, InteractionTag);
+	}
 	const FPEPItemResult Result = PEPItemPickup::ExecutePickupWorldItem(this, PlayerInventory,
 		PEPItemPickup::ResolveInteractorController(Interactor));
 	if (!Result.bSuccess) return FPEPInteractionResult::Failure(Result.ReasonTag, this, InteractionTag);
-	Destroy();
+	HandlePickedUp(Interactor);
 	return FPEPInteractionResult::Success(this, InteractionTag);
+}
+
+void APEPPickupContainerActor::HandlePickedUp_Implementation(AActor* Interactor)
+{
+	Destroy();
 }

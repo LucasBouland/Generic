@@ -53,7 +53,11 @@ class PEPINVENTORY_API UPEPItemPreset : public UPrimaryDataAsset
 public:
 	static const FPrimaryAssetType PresetAssetType;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="PEP|Item|Preset")
+	/**
+	 * Searchable so editor tooling can tell what a preset builds from the asset registry alone,
+	 * without loading every preset in the project to read it.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, AssetRegistrySearchable, Category="PEP|Item|Preset")
 	TObjectPtr<UPEPItemDefinition> RootDefinition = nullptr;
 
 	/** Replaces default state values of the same exact state type on the new root instance. */

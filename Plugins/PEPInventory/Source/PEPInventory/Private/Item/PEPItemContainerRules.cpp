@@ -3,9 +3,25 @@
 #include "Core/PEPCoreTags.h"
 
 #include "Item/Fragments/PEPItemFragment_Container.h"
-#include "Item/PEPItemContainerQuery.h"
 #include "Item/PEPItemDefinition.h"
 #include "Item/PEPItemRules.h"
+
+namespace PEPItemContainerRulesPrivate
+{
+	/*
+	 * The lock rules need two flags and a tag container. They used to go through GetContainerData,
+	 * which also copies every slot definition of the container for Blueprint's benefit — a copy
+	 * per lock check, thrown away unread.
+	 */
+	bool IsLocked(
+		const FPEPItemInstance& ContainerItem,
+		const FPEPItemFragment_Container& Fragment)
+	{
+		const FPEPItemState_ContainerRuntime* State =
+			ContainerItem.GetState<FPEPItemState_ContainerRuntime>();
+		return State ? State->bLocked : Fragment.bStartsLocked;
+	}
+}
 
 namespace PEPItemContainerRules
 {
@@ -13,20 +29,19 @@ namespace PEPItemContainerRules
 		const FPEPItemInstance& ContainerItem,
 		const FPEPItemInstance* KeyItem)
 	{
-		FPEPItemContainerData Data;
-		if (!PEPItemContainerQuery::GetContainerData(ContainerItem, Data))
+		const FPEPItemFragment_Container* Fragment =
+			ContainerItem.GetDefinitionFragment<FPEPItemFragment_Container>();
+		if (!Fragment)
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ContainerItem.ItemId);
 		}
 
-		if (!Data.bLocked)
+		if (!PEPItemContainerRulesPrivate::IsLocked(ContainerItem, *Fragment))
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, ContainerItem.ItemId);
 		}
 
-		const FPEPItemFragment_Container* Fragment = ContainerItem.GetDefinitionFragment<
-			FPEPItemFragment_Container>();
-		if (Fragment && !Fragment->RequiredUnlockKeyTags.IsEmpty())
+		if (!Fragment->RequiredUnlockKeyTags.IsEmpty())
 		{
 			if (!KeyItem || !PEPItemRules::DoesItemMatchRequiredBlockedTags(
 				*KeyItem, Fragment->RequiredUnlockKeyTags, FGameplayTagContainer()))
@@ -108,18 +123,30 @@ namespace PEPItemContainerRules
 	FPEPItemResult CanLockContainer(
 		const FPEPItemInstance& ContainerItem)
 	{
-		FPEPItemContainerData Data;
-		if (!PEPItemContainerQuery::GetContainerData(ContainerItem, Data))
+		const FPEPItemFragment_Container* Fragment =
+			ContainerItem.GetDefinitionFragment<FPEPItemFragment_Container>();
+		if (!Fragment)
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ContainerItem.ItemId);
 		}
 
-		if (Data.bLocked || !Data.bCanRelock)
+		if (!Fragment->bCanRelock || PEPItemContainerRulesPrivate::IsLocked(ContainerItem, *Fragment))
 		{
 			return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, ContainerItem.ItemId);
 		}
 
 		return FPEPItemResult::Success(ContainerItem.ItemId, PEPCoreTags::Reason_None);
+	}
+
+	TConstArrayView<FPEPContainerSlotDefinition> FindContainerSlots(
+		const UPEPItemDefinition* Definition)
+	{
+		const FPEPItemFragment_Container* Fragment = Definition
+			? Definition->GetDefinitionFragment<FPEPItemFragment_Container>()
+			: nullptr;
+		return Fragment
+			? TConstArrayView<FPEPContainerSlotDefinition>(Fragment->Slots)
+			: TConstArrayView<FPEPContainerSlotDefinition>();
 	}
 }
 
@@ -140,10 +167,9 @@ FPEPItemResult UPEPItemContainerRulesLibrary::CanLockContainer(
 TArray<FPEPContainerSlotDefinition> UPEPItemContainerRulesLibrary::GetContainerSlots(
 	const UPEPItemDefinition* Definition)
 {
-	const FPEPItemFragment_Container* Fragment = Definition
-		? Definition->GetDefinitionFragment<FPEPItemFragment_Container>()
-		: nullptr;
-	return Fragment ? Fragment->Slots : TArray<FPEPContainerSlotDefinition>();
+	const TConstArrayView<FPEPContainerSlotDefinition> Slots =
+		PEPItemContainerRules::FindContainerSlots(Definition);
+	return TArray<FPEPContainerSlotDefinition>(Slots.GetData(), Slots.Num());
 }
 
 bool UPEPItemContainerRulesLibrary::CanPlaceItemInSlot(

@@ -6,6 +6,7 @@
 #include "Item/Fragments/PEPItemFragment_Container.h"
 #include "Inventory/PEPInventorySettings.h"
 #include "PropertyHandle.h"
+#include "ScopedTransaction.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -131,7 +132,7 @@ TSharedRef<SWidget> FPEPContainerSlotDefinitionCustomization::BuildPresetMenu()
 	if (Presets.IsEmpty())
 	{
 		MenuBuilder.AddMenuEntry(
-			LOCTEXT("NoPresets", "No presets defined (Project Settings > PEP Items)"),
+			LOCTEXT("NoPresets", "No presets defined (Project Settings > PEP Inventory > Container Slots)"),
 			FText::GetEmpty(),
 			FSlateIcon(),
 			FUIAction());
@@ -174,14 +175,29 @@ void FPEPContainerSlotDefinitionCustomization::OnApplyPreset(const FName PresetN
 		return;
 	}
 
-	void* RawData = nullptr;
-	if (StructHandle->GetValueData(RawData) != FPropertyAccess::Success || !RawData)
+	/* Every selected object's copy of this slot, not only the first one's. */
+	TArray<void*> RawData;
+	StructHandle->AccessRawData(RawData);
+	RawData.RemoveAll([](const void* Data) { return Data == nullptr; });
+	if (RawData.IsEmpty())
 	{
 		return;
 	}
 
+	/*
+	 * Written straight into the struct, so no property handle opens a transaction on its behalf:
+	 * without this one the change could not be undone. NotifyPreChange marks the owners modified
+	 * inside it.
+	 */
+	const FScopedTransaction Transaction(FText::Format(
+		LOCTEXT("ApplySlotPreset", "Apply Slot Preset '{0}'"),
+		FText::FromName(PresetName)));
+
 	StructHandle->NotifyPreChange();
-	Preset->ApplyTo(*static_cast<FPEPContainerSlotDefinition*>(RawData));
+	for (void* Data : RawData)
+	{
+		Preset->ApplyTo(*static_cast<FPEPContainerSlotDefinition*>(Data));
+	}
 	StructHandle->NotifyPostChange(EPropertyChangeType::ValueSet);
 	StructHandle->NotifyFinishedChangingProperties();
 }

@@ -1,5 +1,6 @@
 #include "Components/PEPInventoryComponent.h"
 
+#include "CoreGlobals.h"
 #include "Core/PEPCoreTags.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Controller.h"
@@ -25,7 +26,29 @@
 #include "TimerManager.h"
 #include "UObject/StrongObjectPtr.h"
 
-namespace
+/**
+ * One stack a pickup would top up, and what that stack would hold afterwards.
+ *
+ * Planned before anything is written, so that deciding whether a pickup fits and performing it are
+ * the same computation. Deciding with one and committing with another is how a full inventory came
+ * to refuse ammunition it would in fact have absorbed.
+ *
+ * Plain C++ with no reflection, and defined here rather than in a public header: none of this
+ * reaches the wire, an editor or another module, and it never outlives the call that built it.
+ */
+struct FPEPInventoryStackMerge
+{
+	/** Named rather than indexed: the plan outlives the lookup, and an index would not survive it. */
+	FPEPItemId TargetItemId;
+
+	FPEPItemInstance MergedItem;
+
+	/** Where the topped-up stack sits, which is what its StateChanged has to report. */
+	FPEPItemLocation Location;
+};
+
+/* Named rather than anonymous, so a unity build cannot fold these into a neighbour's helpers. */
+namespace PEPInventoryComponentPrivate
 {
 	bool IsItemCatalogueReadyForInventoryMutation(const UPEPInventoryComponent& Inventory)
 	{
@@ -53,6 +76,113 @@ namespace
 		return ItemCore->AreItemDefinitionsLoaded()
 			|| ItemCore->GetItemDefinitionPreloadState() == EPEPItemDefinitionPreloadState::Disabled;
 	}
+
+	/** A container's lock: its runtime state when it carries one, its definition's default otherwise. */
+	bool IsContainerItemLocked(
+		const FPEPItemInstance& ContainerItem,
+		const FPEPItemFragment_Container& Container)
+	{
+		const FPEPItemState_ContainerRuntime* RuntimeState =
+			ContainerItem.GetState<FPEPItemState_ContainerRuntime>();
+
+		return RuntimeState
+			? RuntimeState->bLocked
+			: Container.bStartsLocked;
+	}
+
+	/**
+	 * Whether two locations name the same slot, the cell aside.
+	 *
+	 * A named slot holds one item, so the tag is its whole identity. A container slot holds many,
+	 * and two cells of one grid are the same place as far as putting something away goes.
+	 */
+	bool AreLocationsInSameSlot(
+		const FPEPItemLocation& First,
+		const FPEPItemLocation& Second)
+	{
+		if (First.Type != Second.Type)
+		{
+			return false;
+		}
+
+		switch (First.Type)
+		{
+		case EPEPItemLocationType::NamedSlot:
+			return First.LocationTag == Second.LocationTag;
+
+		case EPEPItemLocationType::ItemContainer:
+			return First.ParentItemId == Second.ParentItemId
+				&& First.ContainerSlotName == Second.ContainerSlotName;
+
+		default:
+			return false;
+		}
+	}
+
+	/** Drops one id from an id-list index, and the list itself once it is empty. */
+	template <typename MapType, typename KeyType>
+	void RemoveIdFromIndex(MapType& Index, const KeyType& Key, const FPEPItemId ItemId)
+	{
+		if (TArray<FPEPItemId>* Ids = Index.Find(Key))
+		{
+			/*
+			 * Order-preserving, since children are reported in the order they arrived. Searched
+			 * from the back: a subtree leaves in reverse of the order it was written, so the id
+			 * is usually the last one and nothing has to shift.
+			 */
+			const int32 Found = Ids->FindLast(ItemId);
+			if (Found != INDEX_NONE)
+			{
+				Ids->RemoveAt(Found);
+			}
+
+			if (Ids->IsEmpty())
+			{
+				Index.Remove(Key);
+			}
+		}
+	}
+
+	/** Segments in a tag's name: A.B.C is three deep. */
+	int32 CountTagDepth(const FGameplayTag Tag)
+	{
+		const FString TagString = Tag.ToString();
+		int32 Depth = TagString.IsEmpty() ? 0 : 1;
+
+		for (int32 Index = 0; Index < TagString.Len(); ++Index)
+		{
+			if (TagString[Index] == TEXT('.'))
+			{
+				++Depth;
+			}
+		}
+
+		return Depth;
+	}
+
+	/*
+	 * FPEPItemResult names one item, so a result about several can only name one of them
+	 * arbitrarily — and a caller would then be entitled to read it. It stays unset instead.
+	 * A failure is a different matter: it comes from the validator and names the item that caused
+	 * it, which is exactly what a caller needs.
+	 */
+	FPEPItemId SingleTreeItemId(const TArray<FPEPInventoryTreePlacement>& Placements)
+	{
+		return Placements.Num() == 1
+			? Placements[0].Tree.RootItem.ItemId
+			: FPEPItemId();
+	}
+
+	TArray<FPEPInventoryTreePlacement> MakeSingleTreePlacement(
+		FPEPItemInstanceTree&& Tree,
+		const FPEPItemLocation& RootLocation)
+	{
+		TArray<FPEPInventoryTreePlacement> Placements;
+		FPEPInventoryTreePlacement& Placement = Placements.AddDefaulted_GetRef();
+		Placement.RootLocation = RootLocation;
+		Placement.Tree = MoveTemp(Tree);
+		return Placements;
+	}
 }
 
 UPEPInventoryComponent::UPEPInventoryComponent()
@@ -77,6 +207,7 @@ void UPEPInventoryComponent::OnRegister()
     InventoryView.bIsSessionView = false;
     Super::OnRegister();
 }
+
 void UPEPInventoryComponent::GetLifetimeReplicatedProps(
     TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
@@ -91,22 +222,34 @@ void UPEPInventoryComponent::GetLifetimeReplicatedProps(
         UPEPInventoryComponent,
         InventoryView,
         COND_OwnerOnly);
+}
 
+// ---- Replication ----------------------------------------------------------------------------
 
+void UPEPInventoryComponent::BeginReplicatedReceive()
+{
+    /*
+     * Open already, in this frame: an earlier callback of the same receive flagged the indices,
+     * and the array has not changed since. The frame is checked as well as the flag so that a
+     * receive whose PostReplicatedReceive never arrived cannot leave the next one trusting indices
+     * built before it.
+     */
+    if (bReplicatedReceiveOpen && ReplicatedReceiveFrame == GFrameCounter)
+    {
+        return;
+    }
 
+    bReplicatedReceiveOpen = true;
+    ReplicatedReceiveFrame = GFrameCounter;
 
-
-
-
-
+    // The replicated array changed shape or content under us; nothing cached about it is trusted.
+    MarkAllIndicesDirty();
 }
 
 void UPEPInventoryComponent::HandleReplicatedEntryAdded(
     const FPEPInventoryEntry& Entry)
 {
-    // The replicated array changed shape or content under us; nothing cached about it is trusted.
-    bEntryIndexDirty = true;
-    bContainerSlotIndexDirty = true;
+    BeginReplicatedReceive();
 
     EmitAdded(Entry.Item.ItemId, Entry.Location, &Entry.Item);
 }
@@ -115,9 +258,7 @@ void UPEPInventoryComponent::HandleReplicatedEntryChanged(
     const FPEPInventoryEntry& Entry,
     const FPEPItemLocation& PreviousLocation)
 {
-    // The replicated array changed shape or content under us; nothing cached about it is trusted.
-    bEntryIndexDirty = true;
-    bContainerSlotIndexDirty = true;
+    BeginReplicatedReceive();
 
     /*
      * One callback covers both kinds of change, so the entry is asked which one it was. A single
@@ -138,9 +279,7 @@ void UPEPInventoryComponent::HandleReplicatedEntryChanged(
 void UPEPInventoryComponent::HandleReplicatedEntryRemoved(
     const FPEPInventoryEntry& Entry)
 {
-    // The replicated array changed shape or content under us; nothing cached about it is trusted.
-    bEntryIndexDirty = true;
-    bContainerSlotIndexDirty = true;
+    BeginReplicatedReceive();
 
     EmitRemoved(Entry.Item, Entry.Location);
 }
@@ -148,6 +287,8 @@ void UPEPInventoryComponent::HandleReplicatedEntryRemoved(
 void UPEPInventoryComponent::QueueReplicatedEntryRemoved(
     const FPEPInventoryEntry& Entry)
 {
+    BeginReplicatedReceive();
+
     PendingReplicatedRemovals.Add(Entry);
     PendingRemovedRootSlotTags.Add(Entry.Item.ItemId, ResolveRootSlotTag(Entry.Location,
         LastReplicatedLocations.IsEmpty() ? nullptr : &LastReplicatedLocations));
@@ -155,8 +296,14 @@ void UPEPInventoryComponent::QueueReplicatedEntryRemoved(
 
 void UPEPInventoryComponent::FlushReplicatedEntryRemovals()
 {
-    bEntryIndexDirty = true;
-    bContainerSlotIndexDirty = true;
+    /*
+     * The end of a receive: the fast array has just applied its removals, the one reshaping of
+     * Entries it performs after the callbacks. Flagged once more for that, and closed, so the next
+     * receive flags again on its first callback.
+     */
+    bReplicatedReceiveOpen = false;
+    MarkAllIndicesDirty();
+
     TArray<FPEPInventoryEntry> Removed = MoveTemp(PendingReplicatedRemovals);
     PendingReplicatedRemovals.Reset();
 
@@ -166,15 +313,14 @@ void UPEPInventoryComponent::FlushReplicatedEntryRemovals()
     }
     PendingRemovedRootSlotTags.Reset();
     LastReplicatedLocations.Reset();
+    LastReplicatedLocations.Reserve(InventoryView.Entries.Num());
     for (const FPEPInventoryEntry& Entry : InventoryView.Entries)
     {
         LastReplicatedLocations.Add(Entry.Item.ItemId, Entry.Location);
     }
 }
 
-
-
-
+// ---- Location validators --------------------------------------------------------------------
 
 bool UPEPInventoryComponent::RegisterLocationValidator(
     const FGameplayTag RootLocationTag,
@@ -186,15 +332,41 @@ bool UPEPInventoryComponent::RegisterLocationValidator(
         return false;
     }
 
+    /* Null for a delegate bound to no object, which is then its own claimant class. */
+    const UObject* const Claimant = InValidator.GetUObject();
+
     for (FPEPLocationValidatorBinding& Existing : LocationValidators)
     {
-        if (Existing.RootLocationTag == RootLocationTag)
+        if (Existing.RootLocationTag != RootLocationTag)
         {
-            Existing.Validator = MoveTemp(InValidator);
-            Existing.bAllowAutoPlacement = bAllowAutoPlacement;
-            bAutoPlacementSlotTagsDirty = true;
-            return true;
+            continue;
         }
+
+        /*
+         * A tag belongs to the domain that claimed it. A second object registering the same root
+         * would silently take over every slot beneath it, and the first would go on believing it
+         * decides them. A claim whose object has since gone is no claim at all and is replaced.
+         */
+        if (Existing.Validator.IsBound()
+            && Existing.Validator.GetUObject() != Claimant)
+        {
+            UE_LOG(
+                LogPEPItems,
+                Warning,
+                TEXT("'%s' already claims location tag '%s' on '%s'; the registration by '%s' was refused."),
+                *GetNameSafe(Existing.Validator.GetUObject()),
+                *RootLocationTag.ToString(),
+                *GetName(),
+                *GetNameSafe(Claimant));
+
+            return false;
+        }
+
+        Existing.Validator = MoveTemp(InValidator);
+        Existing.bAllowAutoPlacement = bAllowAutoPlacement;
+        Existing.TagDepth = PEPInventoryComponentPrivate::CountTagDepth(RootLocationTag);
+        bAutoPlacementSlotTagsDirty = true;
+        return true;
     }
 
     FPEPLocationValidatorBinding& Binding =
@@ -202,6 +374,7 @@ bool UPEPInventoryComponent::RegisterLocationValidator(
     Binding.RootLocationTag = RootLocationTag;
     Binding.Validator = MoveTemp(InValidator);
     Binding.bAllowAutoPlacement = bAllowAutoPlacement;
+    Binding.TagDepth = PEPInventoryComponentPrivate::CountTagDepth(RootLocationTag);
     bAutoPlacementSlotTagsDirty = true;
     return true;
 }
@@ -308,6 +481,13 @@ UPEPInventoryComponent::MoveItemAuto(
     const FPEPItemId ItemId,
     const FPEPItemAccessContext& Access)
 {
+    if (!HasMutationAuthority())
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_NotAuthority,
+            ItemId);
+    }
+
     FPEPItemLocation Destination;
 
     const FPEPItemResult Validation =
@@ -321,45 +501,52 @@ UPEPInventoryComponent::MoveItemAuto(
         return Validation;
     }
 
-    return MoveItem(
+    /* CanMoveItemAuto ended in CanMoveItem for exactly this destination, and nothing ran since. */
+    return CommitValidatedMove(
         ItemId,
-        Destination,
-        Access);
+        Destination);
 }
+
+// ---- Events ---------------------------------------------------------------------------------
 
 FGameplayTag UPEPInventoryComponent::ResolveRootSlotTag(
     const FPEPItemLocation& Location,
     const TMap<FPEPItemId, FPEPItemLocation>* Locations) const
 {
-    FPEPItemLocation Current = Location;
-    TSet<FPEPItemId> Visited;
-    while (Current.Type == EPEPItemLocationType::ItemContainer)
+    /*
+     * Bounded by the graph's size rather than by a visited set: a chain of distinct items cannot be
+     * longer than the graph holds, so a longer walk has met a cycle and names no root. Nothing is
+     * allocated, and this runs for every event raised.
+     */
+    const int32 MaxSteps = Locations ? Locations->Num() : InventoryView.Entries.Num();
+    const FPEPItemLocation* Current = &Location;
+
+    for (int32 Step = 0; Current->Type == EPEPItemLocationType::ItemContainer; ++Step)
     {
-        if (!Current.ParentItemId.IsValid() || Visited.Contains(Current.ParentItemId))
+        if (!Current->ParentItemId.IsValid() || Step > MaxSteps)
         {
             return FGameplayTag();
         }
-        Visited.Add(Current.ParentItemId);
         if (Locations)
         {
-            const FPEPItemLocation* ParentLocation = Locations->Find(Current.ParentItemId);
+            const FPEPItemLocation* ParentLocation = Locations->Find(Current->ParentItemId);
             if (!ParentLocation)
             {
                 return FGameplayTag();
             }
-            Current = *ParentLocation;
+            Current = ParentLocation;
         }
         else
         {
-            const FPEPInventoryEntry* Parent = FindEntry(Current.ParentItemId);
+            const FPEPInventoryEntry* Parent = FindEntry(Current->ParentItemId);
             if (!Parent)
             {
                 return FGameplayTag();
             }
-            Current = Parent->Location;
+            Current = &Parent->Location;
         }
     }
-    return Current.Type == EPEPItemLocationType::NamedSlot ? Current.LocationTag : FGameplayTag();
+    return Current->Type == EPEPItemLocationType::NamedSlot ? Current->LocationTag : FGameplayTag();
 }
 
 void UPEPInventoryComponent::EmitAdded(
@@ -448,6 +635,8 @@ void UPEPInventoryComponent::BroadcastChange(
     }
 }
 
+// ---- Access ---------------------------------------------------------------------------------
+
 bool UPEPInventoryComponent::HasMutationAuthority() const
 {
     const AActor* Owner = GetOwner();
@@ -488,7 +677,40 @@ const AController* UPEPInventoryComponent::GetOwningController() const
 
 FPEPItemAccessContext UPEPInventoryComponent::GetOwnerRequestContext() const
 {
+    if (const AController* OwningController = GetOwningController())
+    {
+        return FPEPItemAccessContext::From(OwningController);
+    }
+
+    /*
+     * No controller: a world container, a corpse, a stash whose player possesses nothing. On the
+     * authority, a call made through the store's own owner is the server acting for the store —
+     * a container running its own pickup — and that is what System() exists to name. A client in
+     * the same position is nobody, and a null requester resolves to External.
+     */
+    return HasMutationAuthority()
+        ? FPEPItemAccessContext::System()
+        : FPEPItemAccessContext::From(nullptr);
+}
+
+FPEPItemAccessContext UPEPInventoryComponent::GetRemoteRequestContext() const
+{
+    /*
+     * Never System(), even with no owning controller: an RPC still in flight when the pawn was
+     * unpossessed must not reach the corpse with the server's permissions.
+     */
     return FPEPItemAccessContext::From(GetOwningController());
+}
+
+void UPEPInventoryComponent::SetExternalAccess(const EPEPExternalAccessMode InExternalAccess)
+{
+    /* Server policy. BlueprintAuthorityOnly guards Blueprint callers only; this guards the rest. */
+    if (!HasMutationAuthority())
+    {
+        return;
+    }
+
+    ExternalAccess = InExternalAccess;
 }
 
 EPEPAccessRole UPEPInventoryComponent::ResolveAccessRole(
@@ -548,13 +770,9 @@ UPEPInventoryComponent::ResolveContainerSlot(
         return nullptr;
     }
 
-    const FPEPItemState_ContainerRuntime* RuntimeState =
-        ParentEntry->Item.GetState<
-            FPEPItemState_ContainerRuntime>();
-
-    bOutLocked = RuntimeState
-        ? RuntimeState->bLocked
-        : ContainerFragment->bStartsLocked;
+    bOutLocked = PEPInventoryComponentPrivate::IsContainerItemLocked(
+        ParentEntry->Item,
+        *ContainerFragment);
 
     return ContainerFragment->FindSlot(
         Location.ContainerSlotName);
@@ -594,9 +812,68 @@ UPEPInventoryComponent::ValidateCanTakeFromLocation(
             Entry.Item.ItemId);
     }
 
-    return FPEPItemResult::Success(
-        Entry.Item.ItemId,
-        PEPCoreTags::Reason_None);
+    /* The slot allows it; what holds the slot has to as well. */
+    return ValidateExternalReach(Entry, Role);
+}
+
+FPEPItemResult UPEPInventoryComponent::ValidateExternalReach(
+    const FPEPInventoryEntry& Entry,
+    const EPEPAccessRole Role) const
+{
+    if (Role != EPEPAccessRole::External)
+    {
+        return FPEPItemResult::Success(
+            Entry.Item.ItemId,
+            PEPCoreTags::Reason_None);
+    }
+
+    /*
+     * The same visibility rule the session applies when it mirrors a store, so an outsider can act
+     * on exactly what it is shown; locks are read on the way, from every container above.
+     */
+    bool bBehindLock = false;
+    const FPEPInventoryEntry* Current = &Entry;
+    const int32 MaxSteps = InventoryView.Entries.Num();
+
+    for (int32 Step = 0; Step <= MaxSteps; ++Step)
+    {
+        if (Current->Location.Type == EPEPItemLocationType::NamedSlot)
+        {
+            /* A named slot carries no visibility vocabulary; what a body wears is on show. */
+            return bBehindLock
+                ? FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Entry.Item.ItemId)
+                : FPEPItemResult::Success(Entry.Item.ItemId, PEPCoreTags::Reason_None);
+        }
+
+        if (Current->Location.Type != EPEPItemLocationType::ItemContainer)
+        {
+            break;
+        }
+
+        const FPEPInventoryEntry* Parent = FindEntry(Current->Location.ParentItemId);
+        const FPEPItemFragment_Container* Container = Parent
+            ? Parent->Item.GetDefinitionFragment<FPEPItemFragment_Container>()
+            : nullptr;
+        const FPEPContainerSlotDefinition* Slot = Container
+            ? Container->FindSlot(Current->Location.ContainerSlotName)
+            : nullptr;
+
+        if (!Slot
+            || !PEPItemContainerRules::DoesContainerRevealContents(Parent->Item, Role)
+            || !PEPItemContainerRules::DoesSlotRevealOccupants(*Slot, Role))
+        {
+            break;
+        }
+
+        bBehindLock = bBehindLock
+            || PEPInventoryComponentPrivate::IsContainerItemLocked(Parent->Item, *Container);
+        Current = Parent;
+    }
+
+    /* Hidden, orphaned, or caught in a cycle: to this requester the item is not there. */
+    return FPEPItemResult::Failure(
+        PEPCoreTags::Reason_InvalidTarget,
+        Entry.Item.ItemId);
 }
 
 bool UPEPInventoryComponent::CanDepositIntoLocation(
@@ -631,12 +908,14 @@ bool UPEPInventoryComponent::CanDepositIntoLocation(
     }
 }
 
+// ---- Create ---------------------------------------------------------------------------------
+
 FPEPItemResult UPEPInventoryComponent::CanAddItem(
     const FPEPItemInstance& Item,
     const FPEPItemLocation& Location,
     const FPEPItemAccessContext& Access) const
 {
-	if (!IsItemCatalogueReadyForInventoryMutation(*this))
+	if (!PEPInventoryComponentPrivate::IsItemCatalogueReadyForInventoryMutation(*this))
 	{
 		return FPEPItemResult::Failure(
 			PEPCoreTags::Reason_BlockedByState,
@@ -693,7 +972,12 @@ FPEPItemResult UPEPInventoryComponent::AddItem(
 
     const FPEPItemId ItemId = Item.ItemId;
     FPEPItemInstance StoredItem = Item;
-    CommitAddItem(MoveTemp(StoredItem), Location);
+    if (!CommitAddItem(MoveTemp(StoredItem), Location))
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
     EmitAdded(ItemId, Location);
 
     return FPEPItemResult::Success(
@@ -701,110 +985,142 @@ FPEPItemResult UPEPInventoryComponent::AddItem(
         PEPCoreTags::Reason_None);
 }
 
+// ---- Indices --------------------------------------------------------------------------------
+
+void UPEPInventoryComponent::MarkAllIndicesDirty() const
+{
+    bEntryIndexDirty = true;
+    bContainerSlotIndexDirty = true;
+}
+
 void UPEPInventoryComponent::RefreshIndices() const
 {
-    const bool bRebuildEntries = bEntryIndexDirty;
-    const bool bRebuildSlots = bContainerSlotIndexDirty;
+    /* A size the indices never saw means a write that bypassed the writers: rebuild, do not trust. */
+    if (IndexedEntryCount != InventoryView.Entries.Num())
+    {
+        MarkAllIndicesDirty();
+    }
 
-    if (!bRebuildEntries && !bRebuildSlots)
+    const bool bRebuildEntries = bEntryIndexDirty;
+    const bool bRebuildLocations = bContainerSlotIndexDirty;
+
+    if (!bRebuildEntries && !bRebuildLocations)
     {
         return;
     }
 
+    const TArray<FPEPInventoryEntry>& Entries = InventoryView.Entries;
+
     if (bRebuildEntries)
     {
         EntryIndex.Reset();
-        EntryIndex.Reserve(InventoryView.Entries.Num());
+        EntryIndex.Reserve(Entries.Num());
     }
 
-    if (bRebuildSlots)
+    if (bRebuildLocations)
     {
         ContainerSlotIndex.Reset();
         NamedSlotIndex.Reset();
+        ChildIndex.Reset();
+        /* Cell maps are built per slot on demand; dropping them all is their whole rebuild. */
+        GridOccupancy.Reset();
     }
 
-    for (int32 Index = 0; Index < InventoryView.Entries.Num(); ++Index)
+    for (int32 Index = 0; Index < Entries.Num(); ++Index)
     {
-        const FPEPInventoryEntry& Entry = InventoryView.Entries[Index];
+        const FPEPInventoryEntry& Entry = Entries[Index];
 
         if (bRebuildEntries)
         {
             EntryIndex.Add(Entry.Item.ItemId, Index);
         }
 
-        if (!bRebuildSlots)
+        if (bRebuildLocations)
         {
-            continue;
-        }
-        switch (Entry.Location.Type)
-        {
-        case EPEPItemLocationType::ItemContainer:
-            ContainerSlotIndex.FindOrAdd(
-                FPEPContainerSlotKey(
-                    Entry.Location.ParentItemId,
-                    Entry.Location.ContainerSlotName)).Add(Index);
-            break;
-        case EPEPItemLocationType::NamedSlot:
-            NamedSlotIndex.FindOrAdd(Entry.Location.LocationTag).Add(Index);
-            break;
-        default:
-            break;
+            AddToLocationIndices(Entry.Item.ItemId, Entry.Location);
         }
     }
 
     bEntryIndexDirty = false;
     bContainerSlotIndexDirty = false;
+    IndexedEntryCount = Entries.Num();
+}
 
-    if (bRebuildSlots)
+const FPEPInventoryEntry* UPEPInventoryComponent::FindIndexedEntry(
+    const FPEPItemId ItemId) const
+{
+    /* Confirmed rather than assumed: an index naming another entry answers nothing, never wrongly. */
+    const int32* Index = EntryIndex.Find(ItemId);
+    const TArray<FPEPInventoryEntry>& Entries = InventoryView.Entries;
+    return Index
+        && Entries.IsValidIndex(*Index)
+        && Entries[*Index].Item.ItemId == ItemId
+        ? &Entries[*Index]
+        : nullptr;
+}
+
+void UPEPInventoryComponent::AddToLocationIndices(
+    const FPEPItemId ItemId,
+    const FPEPItemLocation& Location) const
+{
+    switch (Location.Type)
     {
-        RebuildGridOccupancy();
+    case EPEPItemLocationType::ItemContainer:
+    {
+        const FPEPContainerSlotKey Key(Location.ParentItemId, Location.ContainerSlotName);
+        ContainerSlotIndex.FindOrAdd(Key).Add(ItemId);
+        ChildIndex.FindOrAdd(Location.ParentItemId).Add(ItemId);
+        /* The slot's cell map no longer describes it; the next read builds a fresh one. */
+        GridOccupancy.Remove(Key);
+        break;
+    }
+    case EPEPItemLocationType::NamedSlot:
+        NamedSlotIndex.FindOrAdd(Location.LocationTag).Add(ItemId);
+        break;
+    default:
+        break;
     }
 }
 
-void UPEPInventoryComponent::RebuildGridOccupancy() const
+void UPEPInventoryComponent::RemoveFromLocationIndices(
+    const FPEPItemId ItemId,
+    const FPEPItemLocation& Location) const
 {
-    GridOccupancy.Reset();
-    for (const TPair<FPEPContainerSlotKey, TArray<int32>>& Pair : ContainerSlotIndex)
+    switch (Location.Type)
     {
-        const int32* ParentIndex = EntryIndex.Find(Pair.Key.Key);
-        const FPEPItemFragment_Container* Container = ParentIndex
-            ? InventoryView.Entries[*ParentIndex].Item.GetDefinitionFragment<FPEPItemFragment_Container>()
-            : nullptr;
-        const FPEPContainerSlotDefinition* Slot = Container ? Container->FindSlot(Pair.Key.Value) : nullptr;
-        if (!Slot || Slot->Mode != EPEPContainerSlotMode::Grid
-            || Slot->GridSize.X <= 0 || Slot->GridSize.Y <= 0)
-        {
-            continue;
-        }
-        FPEPGridOccupancy& Occupancy = GridOccupancy.Add(Pair.Key);
-        Occupancy.GridSize = Slot->GridSize;
-        Occupancy.CellOccupants.Init(INDEX_NONE, Slot->GridSize.X * Slot->GridSize.Y);
-        Occupancy.FreeCells = Occupancy.CellOccupants.Num();
-        for (const int32 Index : Pair.Value)
-        {
-            const FPEPInventoryEntry& Entry = InventoryView.Entries[Index];
-            FPEPItemInventoryShapeData Shape;
-            if (!PEPInventoryQuery::GetInventoryShapeData(Entry.Item, Shape))
-            {
-                Occupancy.bUnknown = true;
-                continue;
-            }
-            const FIntPoint Size = PEPInventoryValidation::OrientedSize(Shape.Size, Entry.Location.bRotated);
-            const FIntPoint From = Entry.Location.GridPosition;
-            /* Clipped: an entry hanging off the grid is a corrupt store, not a reason to crash. */
-            for (int32 Y = FMath::Max(0, From.Y); Y < FMath::Min(Slot->GridSize.Y, From.Y + Size.Y); ++Y)
-            {
-                for (int32 X = FMath::Max(0, From.X); X < FMath::Min(Slot->GridSize.X, From.X + Size.X); ++X)
-                {
-                    int32& Cell = Occupancy.CellOccupants[Y * Slot->GridSize.X + X];
-                    if (Cell == INDEX_NONE)
-                    {
-                        Cell = Index;
-                        --Occupancy.FreeCells;
-                    }
-                }
-            }
-        }
+    case EPEPItemLocationType::ItemContainer:
+    {
+        const FPEPContainerSlotKey Key(Location.ParentItemId, Location.ContainerSlotName);
+        PEPInventoryComponentPrivate::RemoveIdFromIndex(ContainerSlotIndex, Key, ItemId);
+        PEPInventoryComponentPrivate::RemoveIdFromIndex(ChildIndex, Location.ParentItemId, ItemId);
+        GridOccupancy.Remove(Key);
+        break;
+    }
+    case EPEPItemLocationType::NamedSlot:
+        PEPInventoryComponentPrivate::RemoveIdFromIndex(NamedSlotIndex, Location.LocationTag, ItemId);
+        break;
+    default:
+        break;
+    }
+}
+
+void UPEPInventoryComponent::IndexEntryLocation(
+    const FPEPItemId ItemId,
+    const FPEPItemLocation& Location) const
+{
+    if (!bContainerSlotIndexDirty)
+    {
+        AddToLocationIndices(ItemId, Location);
+    }
+}
+
+void UPEPInventoryComponent::UnindexEntryLocation(
+    const FPEPItemId ItemId,
+    const FPEPItemLocation& Location) const
+{
+    if (!bContainerSlotIndexDirty)
+    {
+        RemoveFromLocationIndices(ItemId, Location);
     }
 }
 
@@ -813,32 +1129,167 @@ const UPEPInventoryComponent::FPEPGridOccupancy* UPEPInventoryComponent::FindGri
     const FName SlotName) const
 {
     RefreshIndices();
-    return GridOccupancy.Find(FPEPContainerSlotKey(ParentItemId, SlotName));
+
+    const FPEPContainerSlotKey Key(ParentItemId, SlotName);
+    if (const FPEPGridOccupancy* Cached = GridOccupancy.Find(Key))
+    {
+        return Cached;
+    }
+
+    /* An empty slot has nothing to map; callers fall back to an overlap test with no occupants. */
+    const TArray<FPEPItemId>* Occupants = ContainerSlotIndex.Find(Key);
+    const FPEPInventoryEntry* ParentEntry = Occupants ? FindIndexedEntry(ParentItemId) : nullptr;
+    const FPEPItemFragment_Container* Container = ParentEntry
+        ? ParentEntry->Item.GetDefinitionFragment<FPEPItemFragment_Container>()
+        : nullptr;
+    const FPEPContainerSlotDefinition* Slot = Container ? Container->FindSlot(SlotName) : nullptr;
+    if (!Slot || Slot->Mode != EPEPContainerSlotMode::Grid
+        || Slot->GridSize.X <= 0 || Slot->GridSize.Y <= 0)
+    {
+        return nullptr;
+    }
+
+    FPEPGridOccupancy Occupancy;
+    Occupancy.GridSize = Slot->GridSize;
+    Occupancy.CellOccupants.Init(FPEPItemId(), Slot->GridSize.X * Slot->GridSize.Y);
+    Occupancy.FreeCells = Occupancy.CellOccupants.Num();
+
+    for (const FPEPItemId OccupantId : *Occupants)
+    {
+        const FPEPInventoryEntry* Entry = FindIndexedEntry(OccupantId);
+        FPEPItemInventoryShapeData Shape;
+        if (!Entry || !PEPInventoryQuery::GetInventoryShapeData(Entry->Item, Shape))
+        {
+            Occupancy.bUnknown = true;
+            continue;
+        }
+        const FIntPoint Size = PEPInventoryValidation::OrientedSize(Shape.Size, Entry->Location.bRotated);
+        const FIntPoint From = Entry->Location.GridPosition;
+        /* Clipped: an entry hanging off the grid is a corrupt store, not a reason to crash. */
+        for (int32 Y = FMath::Max(0, From.Y); Y < FMath::Min(Slot->GridSize.Y, From.Y + Size.Y); ++Y)
+        {
+            for (int32 X = FMath::Max(0, From.X); X < FMath::Min(Slot->GridSize.X, From.X + Size.X); ++X)
+            {
+                FPEPItemId& Cell = Occupancy.CellOccupants[Y * Slot->GridSize.X + X];
+                if (!Cell.IsValid())
+                {
+                    Cell = OccupantId;
+                    --Occupancy.FreeCells;
+                }
+            }
+        }
+    }
+
+    return &GridOccupancy.Add(Key, MoveTemp(Occupancy));
 }
 
-TArray<FPEPInventoryEntry>& UPEPInventoryComponent::MutableEntries()
+bool UPEPInventoryComponent::IsGridFootprintFree(
+    const FPEPGridOccupancy& Occupancy,
+    const FIntPoint Position,
+    const FIntPoint Size,
+    const FPEPItemId IgnoredItemId,
+    const FPEPItemId AlsoIgnoredItemId)
 {
-    /*
-     * A change of shape moves entries, so it invalidates both: the id map because positions shift,
-     * and the slot map because it holds those same positions.
-     */
-    bEntryIndexDirty = true;
-    bContainerSlotIndexDirty = true;
+    if (!PEPInventoryValidation::IsFootprintInsideGrid(Position, Size, Occupancy.GridSize))
+    {
+        return false;
+    }
 
-    return InventoryView.Entries;
+    for (int32 Y = Position.Y; Y < Position.Y + Size.Y; ++Y)
+    {
+        for (int32 X = Position.X; X < Position.X + Size.X; ++X)
+        {
+            const FPEPItemId OccupantId = Occupancy.OccupantAt(FIntPoint(X, Y));
+            if (OccupantId.IsValid()
+                && OccupantId != IgnoredItemId
+                && OccupantId != AlsoIgnoredItemId)
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+FPEPInventoryEntry& UPEPInventoryComponent::AppendEntry(FPEPInventoryEntry&& Entry)
+{
+    const int32 NewIndex = InventoryView.Entries.Add(MoveTemp(Entry));
+    FPEPInventoryEntry& Added = InventoryView.Entries[NewIndex];
+
+    if (!bEntryIndexDirty)
+    {
+        EntryIndex.Add(Added.Item.ItemId, NewIndex);
+        IndexedEntryCount = InventoryView.Entries.Num();
+    }
+    IndexEntryLocation(Added.Item.ItemId, Added.Location);
+
+    return Added;
+}
+
+void UPEPInventoryComponent::RemoveEntryAtSwap(
+    const int32 Index,
+    FPEPInventoryEntry& OutEntry)
+{
+    TArray<FPEPInventoryEntry>& Entries = InventoryView.Entries;
+    FPEPInventoryEntry& Removed = Entries[Index];
+    const FPEPItemId RemovedId = Removed.Item.ItemId;
+
+    UnindexEntryLocation(RemovedId, Removed.Location);
+
+    /* Cell maps of the item's own slots would otherwise outlive the parent they describe. */
+    if (!bContainerSlotIndexDirty)
+    {
+        if (const FPEPItemFragment_Container* Container =
+            Removed.Item.GetDefinitionFragment<FPEPItemFragment_Container>())
+        {
+            for (const FPEPContainerSlotDefinition& Slot : Container->Slots)
+            {
+                GridOccupancy.Remove(FPEPContainerSlotKey(RemovedId, Slot.SlotName));
+            }
+        }
+    }
+
+    OutEntry = MoveTemp(Removed);
+
+    const int32 LastIndex = Entries.Num() - 1;
+
+    // RemoveAtSwap is safe: the fast array keys entries by replication id, not by position.
+    Entries.RemoveAtSwap(Index);
+    InventoryView.MarkArrayDirty();
+
+    if (!bEntryIndexDirty)
+    {
+        EntryIndex.Remove(RemovedId);
+
+        /* The last entry filled the hole, and is the only one whose position changed. */
+        if (Index != LastIndex && Entries.IsValidIndex(Index))
+        {
+            EntryIndex.Add(Entries[Index].Item.ItemId, Index);
+        }
+
+        IndexedEntryCount = Entries.Num();
+    }
+}
+
+void UPEPInventoryComponent::ResetEntries()
+{
+    InventoryView.Entries.Reset();
+    InventoryView.MarkArrayDirty();
+    MarkAllIndicesDirty();
 }
 
 void UPEPInventoryComponent::SetEntryLocation(
     FPEPInventoryEntry& Entry,
     const FPEPItemLocation& Location)
 {
+    /* The entry keeps its position in the array; only the indices keyed by location change. */
+    UnindexEntryLocation(Entry.Item.ItemId, Entry.Location);
     Entry.Location = Location;
-
-    /* The entry has not moved in the array, so only the cache keyed by location is stale. */
-    bContainerSlotIndexDirty = true;
+    IndexEntryLocation(Entry.Item.ItemId, Entry.Location);
 }
 
-const TArray<int32>* UPEPInventoryComponent::FindContainerSlotOccupants(
+const TArray<FPEPItemId>* UPEPInventoryComponent::FindContainerSlotOccupants(
     const FPEPItemId ParentItemId,
     const FName SlotName) const
 {
@@ -847,6 +1298,8 @@ const TArray<int32>* UPEPInventoryComponent::FindContainerSlotOccupants(
     return ContainerSlotIndex.Find(
         FPEPContainerSlotKey(ParentItemId, SlotName));
 }
+
+// ---- Read -----------------------------------------------------------------------------------
 
 bool UPEPInventoryComponent::ContainsItem(
     const FPEPItemId ItemId) const
@@ -859,8 +1312,7 @@ const FPEPInventoryEntry* UPEPInventoryComponent::FindEntry(
 {
     RefreshIndices();
 
-    const int32* Index = EntryIndex.Find(ItemId);
-    return Index ? &InventoryView.Entries[*Index] : nullptr;
+    return FindIndexedEntry(ItemId);
 }
 
 FPEPInventoryEntry* UPEPInventoryComponent::FindMutableEntry(
@@ -907,7 +1359,7 @@ bool UPEPInventoryComponent::FindItemAtLocation(
      * and the whole store is neither. Equipment asks this once per slot per store change.
      */
     RefreshIndices();
-    const TArray<int32>* Candidates = Location.Type == EPEPItemLocationType::NamedSlot
+    const TArray<FPEPItemId>* Candidates = Location.Type == EPEPItemLocationType::NamedSlot
         ? NamedSlotIndex.Find(Location.LocationTag)
         : ContainerSlotIndex.Find(
             FPEPContainerSlotKey(Location.ParentItemId, Location.ContainerSlotName));
@@ -915,12 +1367,12 @@ bool UPEPInventoryComponent::FindItemAtLocation(
     {
         return false;
     }
-    for (const int32 Index : *Candidates)
+    for (const FPEPItemId CandidateId : *Candidates)
     {
-        const FPEPInventoryEntry& Pair = InventoryView.Entries[Index];
-        if (Pair.Location == Location)
+        const FPEPInventoryEntry* Candidate = FindIndexedEntry(CandidateId);
+        if (Candidate && Candidate->Location == Location)
         {
-            OutItemId = Pair.Item.ItemId;
+            OutItemId = CandidateId;
             return true;
         }
     }
@@ -941,14 +1393,10 @@ void UPEPInventoryComponent::GetDirectChildren(
 {
     OutChildItemIds.Reset();
 
-    for (const FPEPInventoryEntry& Pair : InventoryView.Entries)
+    RefreshIndices();
+    if (const TArray<FPEPItemId>* Children = ChildIndex.Find(ParentItemId))
     {
-        const FPEPItemLocation& Location = Pair.Location;
-        if (Location.Type == EPEPItemLocationType::ItemContainer
-            && Location.ParentItemId == ParentItemId)
-        {
-            OutChildItemIds.Add(Pair.Item.ItemId);
-        }
+        OutChildItemIds.Append(*Children);
     }
 }
 
@@ -988,15 +1436,15 @@ bool UPEPInventoryComponent::HasGrantedGameplayAccess(
 		return false;
 	}
 
-	TSet<FPEPItemId> Visited;
-	while (Entry->Location.Type == EPEPItemLocationType::ItemContainer)
+	/* Bounded by the store size instead of a visited set: a longer chain has met a cycle. */
+	const int32 MaxSteps = InventoryView.Entries.Num();
+	for (int32 Step = 0; Entry->Location.Type == EPEPItemLocationType::ItemContainer; ++Step)
 	{
 		const FPEPItemId ParentItemId = Entry->Location.ParentItemId;
-		if (!ParentItemId.IsValid() || Visited.Contains(ParentItemId))
+		if (!ParentItemId.IsValid() || Step > MaxSteps)
 		{
 			return false;
 		}
-		Visited.Add(ParentItemId);
 
 		const FPEPInventoryEntry* ParentEntry = FindEntry(ParentItemId);
 		const FPEPItemFragment_Container* Container = ParentEntry
@@ -1017,13 +1465,19 @@ void UPEPInventoryComponent::GetDirectChildEntries(
 {
     OutChildren.Reset();
 
-    for (const FPEPInventoryEntry& Pair : InventoryView.Entries)
+    RefreshIndices();
+    const TArray<FPEPItemId>* Children = ChildIndex.Find(ParentItemId);
+    if (!Children)
     {
-        const FPEPItemLocation& Location = Pair.Location;
-        if (Location.Type == EPEPItemLocationType::ItemContainer
-            && Location.ParentItemId == ParentItemId)
+        return;
+    }
+
+    OutChildren.Reserve(Children->Num());
+    for (const FPEPItemId ChildId : *Children)
+    {
+        if (const FPEPInventoryEntry* Child = FindIndexedEntry(ChildId))
         {
-            OutChildren.Add(&Pair);
+            OutChildren.Add(Child);
         }
     }
 }
@@ -1046,21 +1500,26 @@ void UPEPInventoryComponent::GetDirectSingleSlotChildren(
         return;
     }
 
-    for (const FPEPInventoryEntry& Pair : InventoryView.Entries)
+    const TArray<FPEPItemId>* Children = ChildIndex.Find(ParentItemId);
+    if (!Children)
     {
-        const FPEPItemLocation& Location = Pair.Location;
-        if (Location.Type != EPEPItemLocationType::ItemContainer
-            || Location.ParentItemId != ParentItemId)
+        return;
+    }
+
+    for (const FPEPItemId ChildId : *Children)
+    {
+        const FPEPInventoryEntry* Child = FindIndexedEntry(ChildId);
+        if (!Child)
         {
             continue;
         }
 
         const FPEPContainerSlotDefinition* Slot =
-            ContainerFragment->FindSlot(Location.ContainerSlotName);
+            ContainerFragment->FindSlot(Child->Location.ContainerSlotName);
 
         if (Slot && Slot->Mode == EPEPContainerSlotMode::Single)
         {
-            OutChildren.Add(&Pair);
+            OutChildren.Add(Child);
         }
     }
 }
@@ -1070,19 +1529,26 @@ UPEPInventoryComponent::FindItemInContainerSlot(
     const FPEPItemId ParentItemId,
     const FName SlotName) const
 {
-    for (const FPEPInventoryEntry& Pair : InventoryView.Entries)
+    const TArray<FPEPItemId>* Occupants =
+        FindContainerSlotOccupants(ParentItemId, SlotName);
+
+    if (!Occupants)
     {
-        const FPEPItemLocation& Location = Pair.Location;
-        if (Location.Type == EPEPItemLocationType::ItemContainer
-            && Location.ParentItemId == ParentItemId
-            && Location.ContainerSlotName == SlotName)
+        return nullptr;
+    }
+
+    for (const FPEPItemId OccupantId : *Occupants)
+    {
+        if (const FPEPInventoryEntry* Occupant = FindIndexedEntry(OccupantId))
         {
-            return &Pair;
+            return Occupant;
         }
     }
 
     return nullptr;
 }
+
+// ---- Requests -------------------------------------------------------------------------------
 
 EPEPRequestResult UPEPInventoryComponent::RequestMoveItem(
     const FPEPItemId ItemId,
@@ -1228,6 +1694,17 @@ FPEPItemResult UPEPInventoryComponent::PreviewMergeStacks(
 		GetOwnerRequestContext());
 }
 
+bool UPEPInventoryComponent::Server_RequestMoveItem_Validate(
+    const FPEPItemId ItemId,
+    const FPEPItemLocation Destination,
+    const int32 RequestId)
+{
+    /* Malformed rather than refused: RequestMoveItem never sends any of these. */
+    return ItemId.IsValid()
+        && Destination.IsStructurallyValid()
+        && RequestId > 0;
+}
+
 void UPEPInventoryComponent::Server_RequestMoveItem_Implementation(
     const FPEPItemId ItemId,
     const FPEPItemLocation Destination,
@@ -1239,7 +1716,7 @@ void UPEPInventoryComponent::Server_RequestMoveItem_Implementation(
      * is what keeps a client from naming someone else.
      */
     const FPEPItemResult Result = RequestId > 0
-        ? MoveItem(ItemId, Destination, GetOwnerRequestContext())
+        ? MoveItem(ItemId, Destination, GetRemoteRequestContext())
         : FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
 	ResolveInventoryRequest(RequestId, EPEPInventoryRequestKind::Move, Result);
 }
@@ -1264,7 +1741,7 @@ void UPEPInventoryComponent::Server_RequestSplitStack_Implementation(
 		SourceItemId,
 		SplitCount,
 		Destination,
-		GetOwnerRequestContext());
+		GetRemoteRequestContext());
 	ResolveInventoryRequest(RequestId, EPEPInventoryRequestKind::SplitStack, Result);
 }
 
@@ -1288,9 +1765,11 @@ void UPEPInventoryComponent::Server_RequestMergeStacks_Implementation(
 		SourceItemId,
 		TargetItemId,
 		TransferCount,
-		GetOwnerRequestContext());
+		GetRemoteRequestContext());
 	ResolveInventoryRequest(RequestId, EPEPInventoryRequestKind::MergeStacks, Result);
 }
+
+// ---- Move -----------------------------------------------------------------------------------
 
 FPEPItemResult UPEPInventoryComponent::ValidateMoveSourceAccess(
 	const FPEPInventoryEntry& Entry,
@@ -1319,7 +1798,9 @@ FPEPItemResult UPEPInventoryComponent::ValidateMoveSourceAccess(
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, Entry.Item.ItemId);
 	}
-	return FPEPItemResult::Success(Entry.Item.ItemId, PEPCoreTags::Reason_None);
+
+	/* Rearranging inside a container is still reaching into it. */
+	return ValidateExternalReach(Entry, Role);
 }
 
 FPEPItemResult UPEPInventoryComponent::CanMoveItem(
@@ -1376,11 +1857,31 @@ FPEPItemResult UPEPInventoryComponent::MoveItem(
         return Validation;
     }
 
-    /* Read before the commit overwrites it; CanMoveItem has already established the entry exists. */
-    const FPEPItemLocation PreviousLocation = FindEntry(ItemId)->Location;
+    return CommitValidatedMove(ItemId, Destination);
+}
+
+FPEPItemResult UPEPInventoryComponent::CommitValidatedMove(
+    const FPEPItemId ItemId,
+    const FPEPItemLocation& Destination)
+{
+    const FPEPInventoryEntry* Entry = FindEntry(ItemId);
+    if (!Entry)
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
+
+    /* Read before the commit overwrites it. */
+    const FPEPItemLocation PreviousLocation = Entry->Location;
     const FGameplayTag PreviousRoot = ResolveRootSlotTag(PreviousLocation);
 
-    CommitMoveItem(ItemId, Destination);
+    if (!CommitMoveItem(ItemId, Destination))
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
     EmitMoved(ItemId, PreviousLocation, Destination, nullptr, &PreviousRoot);
 
     return FPEPItemResult::Success(
@@ -1400,10 +1901,10 @@ FPEPItemResult UPEPInventoryComponent::MutateItem(
             ItemId);
     }
 
-    FPEPInventoryEntry* Entry =
-        FindMutableEntry(ItemId);
+    const FPEPInventoryEntry* Original =
+        FindEntry(ItemId);
 
-    if (!Entry || !Mutation)
+    if (!Original || !Mutation)
     {
         return FPEPItemResult::Failure(
             PEPCoreTags::Reason_InvalidTarget,
@@ -1411,7 +1912,7 @@ FPEPItemResult UPEPInventoryComponent::MutateItem(
     }
 
     FPEPItemInstance WorkingCopy =
-        Entry->Item;
+        Original->Item;
 
     const FPrimaryAssetId ExpectedDefinitionId =
         WorkingCopy.DefinitionId;
@@ -1429,6 +1930,20 @@ FPEPItemResult UPEPInventoryComponent::MutateItem(
     {
         return FPEPItemResult::Failure(
             PEPCoreTags::Reason_BlockedByState,
+            ItemId);
+    }
+
+    /*
+     * Looked up again rather than kept: the mutation is caller code, and a pointer into the store
+     * taken before it ran is not one to write through after.
+     */
+    FPEPInventoryEntry* Entry =
+        FindMutableEntry(ItemId);
+
+    if (!Entry)
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
             ItemId);
     }
 
@@ -1462,6 +1977,8 @@ FPEPItemResult UPEPInventoryComponent::MutateItem(
         ItemId,
         PEPCoreTags::Reason_None);
 }
+
+// ---- Extract / delete -----------------------------------------------------------------------
 
 FPEPItemResult UPEPInventoryComponent::CanExtractItem(
     const FPEPItemId ItemId,
@@ -1523,7 +2040,12 @@ FPEPItemResult UPEPInventoryComponent::ExtractItem(
         return Validation;
     }
 
-    CommitExtractItem(ItemId, OutEntry);
+    if (!CommitExtractItem(ItemId, OutEntry))
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
     EmitRemoved(OutEntry.Item, OutEntry.Location);
 
     return FPEPItemResult::Success(
@@ -1634,7 +2156,12 @@ FPEPItemResult UPEPInventoryComponent::DestroyItem(
     }
 
     FPEPInventoryEntry DiscardedEntry;
-    CommitExtractItem(ItemId, DiscardedEntry);
+    if (!CommitExtractItem(ItemId, DiscardedEntry))
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
     EmitRemoved(DiscardedEntry.Item, DiscardedEntry.Location);
 
     return FPEPItemResult::Success(
@@ -1642,10 +2169,7 @@ FPEPItemResult UPEPInventoryComponent::DestroyItem(
         PEPCoreTags::Reason_None);
 }
 
-
-
-
-
+// ---- Stacks ---------------------------------------------------------------------------------
 
 FPEPItemResult UPEPInventoryComponent::BuildSplitStackPlan(
 	const FPEPItemId SourceItemId,
@@ -1675,21 +2199,30 @@ FPEPItemResult UPEPInventoryComponent::BuildSplitStackPlan(
 		return SourceValidation;
 	}
 
-	OutSourceItem = SourceEntry->Item;
-	const FPEPItemResult SplitResult = PEPItemMutation::SplitStack(
-		OutSourceItem,
+	/*
+	 * The non-allocating split: a preview that consumed an id per hover would drain the allocator
+	 * from a client merely dragging a stack about, and a refused request would burn one too.
+	 */
+	const FPEPItemResult SplitResult = PEPItemMutation::PreviewSplitStack(
+		SourceEntry->Item,
 		SplitCount,
+		OutSourceItem,
 		OutSplitItem);
 	if (!SplitResult.bSuccess)
 	{
 		return SplitResult;
 	}
 
-	return ValidateLocationForItem(
+	/* The would-be stack is checked where it would go; the answer is about the source. */
+	const FPEPItemResult Placement = ValidateLocationForItem(
 		OutSplitItem,
 		Destination,
 		Role,
 		bInternalContainerMove);
+
+	return Placement.bSuccess
+		? FPEPItemResult::Success(SourceItemId, PEPCoreTags::Reason_None)
+		: FPEPItemResult::Failure(Placement.ReasonTag, SourceItemId);
 }
 
 FPEPItemResult UPEPInventoryComponent::CanSplitStack(
@@ -1720,30 +2253,56 @@ FPEPItemResult UPEPInventoryComponent::SplitStack(
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, SourceItemId);
 	}
 
-	FPEPItemInstance SourceCopy;
-	FPEPItemInstance SplitItem;
+	FPEPItemInstance PreviewSource;
+	FPEPItemInstance PreviewSplit;
 	const FPEPItemResult Validation = BuildSplitStackPlan(
 		SourceItemId,
 		SplitCount,
 		Destination,
 		Access,
-		SourceCopy,
-		SplitItem);
+		PreviewSource,
+		PreviewSplit);
 	if (!Validation.bSuccess)
 	{
 		return Validation;
 	}
 
-	FPEPInventoryEntry* SourceEntry = FindMutableEntry(SourceItemId);
+	const FPEPInventoryEntry* SourceEntry = FindEntry(SourceItemId);
 	if (!SourceEntry)
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, SourceItemId);
 	}
+
+	/*
+	 * Only now, with the split approved, is an id allocated: the same rule re-run on the live
+	 * stack, producing what the preview described under a real identity.
+	 */
+	FPEPItemInstance SourceAfter = SourceEntry->Item;
+	FPEPItemInstance SplitItem;
+	const FPEPItemResult SplitResult = PEPItemMutation::SplitStack(
+		SourceAfter,
+		SplitCount,
+		SplitItem);
+	if (!SplitResult.bSuccess)
+	{
+		return SplitResult;
+	}
+
 	const FPEPItemLocation SourceLocation = SourceEntry->Location;
-	SourceEntry->Item = MoveTemp(SourceCopy);
-	InventoryView.MarkItemDirty(*SourceEntry);
 	const FPEPItemId SplitItemId = SplitItem.ItemId;
-	CommitAddItem(MoveTemp(SplitItem), Destination);
+
+	/* The new stack first: if it cannot be stored, the source has not been touched either. */
+	if (!CommitAddItem(MoveTemp(SplitItem), Destination))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, SourceItemId);
+	}
+
+	/* Looked up after the append, which may have moved the array. */
+	if (FPEPInventoryEntry* MutableSource = FindMutableEntry(SourceItemId))
+	{
+		MutableSource->Item = MoveTemp(SourceAfter);
+		InventoryView.MarkItemDirty(*MutableSource);
+	}
 
 	EmitStateChanged(SourceItemId, SourceLocation);
 	EmitAdded(SplitItemId, Destination);
@@ -1798,6 +2357,13 @@ FPEPItemResult UPEPInventoryComponent::BuildMergeStacksPlan(
 	else if (!CanDepositIntoLocation(TargetEntry->Location, Role))
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_BlockedByState, TargetItemId);
+	}
+
+	/* The stack being topped up is a destination, and an outsider has to be able to reach it. */
+	const FPEPItemResult TargetReach = ValidateExternalReach(*TargetEntry, Role);
+	if (!TargetReach.bSuccess)
+	{
+		return FPEPItemResult::Failure(TargetReach.ReasonTag, TargetItemId);
 	}
 
 	OutSourceItem = SourceEntry->Item;
@@ -1855,33 +2421,34 @@ FPEPItemResult UPEPInventoryComponent::MergeStacks(
 		return Validation;
 	}
 
+	/* Both looked up before anything is written, so a missing one refuses with nothing changed. */
 	const FPEPInventoryEntry* SourceBefore = FindEntry(SourceItemId);
-	const FPEPInventoryEntry* TargetBefore = FindEntry(TargetItemId);
-	if (!SourceBefore || !TargetBefore)
+	FPEPInventoryEntry* MutableTarget = FindMutableEntry(TargetItemId);
+	if (!SourceBefore || !MutableTarget)
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, SourceItemId);
 	}
 	const FPEPItemLocation SourceLocation = SourceBefore->Location;
-	const FPEPItemLocation TargetLocation = TargetBefore->Location;
+	const FPEPItemLocation TargetLocation = MutableTarget->Location;
 	const bool bRemoveSource = SourceCopy.IsDepleted();
-	const FPEPItemInstance RemovedSourceSnapshot = SourceBefore->Item;
+	const FPEPItemInstance RemovedSourceSnapshot = bRemoveSource
+		? SourceBefore->Item
+		: FPEPItemInstance();
+
+	/* The target first, while both pointers are still good: removing the source moves entries. */
+	MutableTarget->Item = MoveTemp(TargetCopy);
+	InventoryView.MarkItemDirty(*MutableTarget);
 
 	if (bRemoveSource)
 	{
 		FPEPInventoryEntry RemovedEntry;
 		CommitExtractItem(SourceItemId, RemovedEntry);
 	}
-	else
+	else if (FPEPInventoryEntry* MutableSource = FindMutableEntry(SourceItemId))
 	{
-		FPEPInventoryEntry* MutableSource = FindMutableEntry(SourceItemId);
 		MutableSource->Item = MoveTemp(SourceCopy);
 		InventoryView.MarkItemDirty(*MutableSource);
 	}
-
-	FPEPInventoryEntry* MutableTarget = FindMutableEntry(TargetItemId);
-	check(MutableTarget);
-	MutableTarget->Item = MoveTemp(TargetCopy);
-	InventoryView.MarkItemDirty(*MutableTarget);
 
 	if (bRemoveSource)
 	{
@@ -1894,6 +2461,8 @@ FPEPItemResult UPEPInventoryComponent::MergeStacks(
 	EmitStateChanged(TargetItemId, TargetLocation);
 	return FPEPItemResult::Success(TargetItemId, PEPCoreTags::Reason_None);
 }
+
+// ---- Swap -----------------------------------------------------------------------------------
 
 FPEPItemResult UPEPInventoryComponent::CanSwapItems(
 	const FPEPItemId& FirstItemId,
@@ -1931,9 +2500,9 @@ FPEPItemResult UPEPInventoryComponent::CanSwapItems(
 
 	/*
 	 * Each item is validated at the other's location with the other ignored. Once exchanged,
-	 * neither sits where it did, and those old cells are the only thing the two could collide on
-	 * — they were disjoint before, so they stay disjoint after. No simulated copy of the store is
-	 * needed for that, which matters: this runs on every drag hover over an equipment slot.
+	 * neither sits where it did, so the cells the other leaves are free to it — and when the two
+	 * locations are different slots, that is the whole answer. No simulated copy of the store is
+	 * needed for it, which matters: this runs on every drag hover over an equipment slot.
 	 */
 	Validation = ValidateLocationForItem(
 		FirstEntry->Item,
@@ -1945,12 +2514,54 @@ FPEPItemResult UPEPInventoryComponent::CanSwapItems(
 	{
 		return Validation;
 	}
-	return ValidateLocationForItem(
+	Validation = ValidateLocationForItem(
 		SecondEntry->Item,
 		FirstEntry->Location,
 		Role,
 		bSecondInternal,
 		FirstItemId);
+	if (!Validation.bSuccess)
+	{
+		return Validation;
+	}
+
+	/*
+	 * Within one grid slot it is not the whole answer. Each check above ignored the other item,
+	 * so neither saw where the other lands: footprints of different sizes trading origins can
+	 * claim a common cell — a 1x1 and a 2x1 swapped in a row of three both take the middle one.
+	 * Each lands on the other's origin, in the other's orientation, and the two must stay apart.
+	 */
+	if (FirstEntry->Location.Type == EPEPItemLocationType::ItemContainer
+		&& PEPInventoryComponentPrivate::AreLocationsInSameSlot(
+			FirstEntry->Location,
+			SecondEntry->Location))
+	{
+		bool bLocked = false;
+		const FPEPContainerSlotDefinition* Slot =
+			ResolveContainerSlot(FirstEntry->Location, bLocked);
+
+		if (Slot && Slot->Mode == EPEPContainerSlotMode::Grid)
+		{
+			FPEPItemInventoryShapeData FirstShape;
+			FPEPItemInventoryShapeData SecondShape;
+			if (!PEPInventoryQuery::GetInventoryShapeData(FirstEntry->Item, FirstShape)
+				|| !PEPInventoryQuery::GetInventoryShapeData(SecondEntry->Item, SecondShape))
+			{
+				return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, FirstItemId);
+			}
+
+			if (PEPInventoryValidation::DoFootprintsOverlap(
+				SecondEntry->Location.GridPosition,
+				PEPInventoryValidation::OrientedSize(FirstShape.Size, SecondEntry->Location.bRotated),
+				FirstEntry->Location.GridPosition,
+				PEPInventoryValidation::OrientedSize(SecondShape.Size, FirstEntry->Location.bRotated)))
+			{
+				return FPEPItemResult::Failure(PEPCoreTags::Reason_NoFreeSlot, FirstItemId);
+			}
+		}
+	}
+
+	return Validation;
 }
 
 FPEPItemResult UPEPInventoryComponent::SwapItems(
@@ -1968,29 +2579,30 @@ FPEPItemResult UPEPInventoryComponent::SwapItems(
 		return Validation;
 	}
 
-	const FPEPItemLocation FirstLocation = FindEntry(FirstItemId)->Location;
-	const FPEPItemLocation SecondLocation = FindEntry(SecondItemId)->Location;
+	/* Both resolved before either moves: a location write never reshapes the array. */
+	FPEPInventoryEntry* FirstEntry = FindMutableEntry(FirstItemId);
+	FPEPInventoryEntry* SecondEntry = FindMutableEntry(SecondItemId);
+	if (!FirstEntry || !SecondEntry)
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, FirstItemId);
+	}
+
+	const FPEPItemLocation FirstLocation = FirstEntry->Location;
+	const FPEPItemLocation SecondLocation = SecondEntry->Location;
 	const FGameplayTag FirstRoot = ResolveRootSlotTag(FirstLocation);
 	const FGameplayTag SecondRoot = ResolveRootSlotTag(SecondLocation);
-	CommitMoveItem(FirstItemId, SecondLocation);
-	CommitMoveItem(SecondItemId, FirstLocation);
+
+	SetEntryLocation(*FirstEntry, SecondLocation);
+	InventoryView.MarkItemDirty(*FirstEntry);
+	SetEntryLocation(*SecondEntry, FirstLocation);
+	InventoryView.MarkItemDirty(*SecondEntry);
+
 	EmitMoved(FirstItemId, FirstLocation, SecondLocation, nullptr, &FirstRoot);
 	EmitMoved(SecondItemId, SecondLocation, FirstLocation, nullptr, &SecondRoot);
 	return FPEPItemResult::Success(FirstItemId, PEPCoreTags::Reason_None);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
+// ---- Blueprint reads ------------------------------------------------------------------------
 
 void UPEPInventoryComponent::GetItemIds(TArray<FPEPItemId>& OutItemIds) const
 {
@@ -2001,8 +2613,6 @@ void UPEPInventoryComponent::GetItemIds(TArray<FPEPItemId>& OutItemIds) const
         OutItemIds.Add(Entry.Item.ItemId);
     }
 }
-
-
 
 bool UPEPInventoryComponent::FindInventoryEntry(
     const FPEPItemId ItemId,
@@ -2018,12 +2628,11 @@ bool UPEPInventoryComponent::FindInventoryEntry(
     return false;
 }
 
-UPEPItemDefinition* UPEPInventoryComponent::GetItemDefinitionById(const FPEPItemId ItemId) const
+const UPEPItemDefinition* UPEPInventoryComponent::GetItemDefinitionById(const FPEPItemId ItemId) const
 {
     const FPEPInventoryEntry* Entry = ItemId.IsValid() ? FindEntry(ItemId) : nullptr;
-    return Entry ? const_cast<UPEPItemDefinition*>(Entry->Item.GetDefinitionIfLoaded()) : nullptr;
+    return Entry ? Entry->Item.GetDefinitionIfLoaded() : nullptr;
 }
-
 
 void UPEPInventoryComponent::GetEntriesInContainerSlot(
     const FPEPItemId ParentItemId,
@@ -2032,29 +2641,45 @@ void UPEPInventoryComponent::GetEntriesInContainerSlot(
 {
     OutEntries.Reset();
 
-    const TArray<int32>* Occupants = FindContainerSlotOccupants(ParentItemId, SlotName);
+    const TArray<FPEPItemId>* Occupants = FindContainerSlotOccupants(ParentItemId, SlotName);
     if (!Occupants)
     {
         return;
     }
 
-    OutEntries.Reserve(Occupants->Num());
-    for (const int32 Index : *Occupants)
+    TArray<const FPEPInventoryEntry*> Ordered;
+    Ordered.Reserve(Occupants->Num());
+    for (const FPEPItemId OccupantId : *Occupants)
     {
-        OutEntries.Add(InventoryView.Entries[Index]);
+        if (const FPEPInventoryEntry* Occupant = FindIndexedEntry(OccupantId))
+        {
+            Ordered.Add(Occupant);
+        }
+    }
+
+    /* Cell order, then id: the same slot reads the same way however its occupants arrived. */
+    Ordered.Sort(
+        [](const FPEPInventoryEntry& First, const FPEPInventoryEntry& Second)
+        {
+            if (First.Location.GridPosition.Y != Second.Location.GridPosition.Y)
+            {
+                return First.Location.GridPosition.Y < Second.Location.GridPosition.Y;
+            }
+
+            if (First.Location.GridPosition.X != Second.Location.GridPosition.X)
+            {
+                return First.Location.GridPosition.X < Second.Location.GridPosition.X;
+            }
+
+            return First.Item.ItemId.Value < Second.Item.ItemId.Value;
+        });
+
+    OutEntries.Reserve(Ordered.Num());
+    for (const FPEPInventoryEntry* Occupant : Ordered)
+    {
+        OutEntries.Add(*Occupant);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
 
 int32 UPEPInventoryComponent::AllocateRequestId()
 {
@@ -2075,8 +2700,15 @@ void UPEPInventoryComponent::ResolveInventoryRequest(
     RequestResult.Kind = Kind;
     RequestResult.Result = Result;
 
+    /*
+     * A Client RPC needs a connection to travel on. Without an owning one — a crate, a corpse —
+     * the engine drops it, and the answer would reach nobody; it is broadcast here instead.
+     */
     AActor* Owner = GetOwner();
-    if (Owner && Owner->HasAuthority() && Owner->GetNetMode() != NM_Standalone)
+    if (Owner
+        && Owner->HasAuthority()
+        && Owner->GetNetMode() != NM_Standalone
+        && Owner->HasNetOwner())
     {
         Client_ResolveInventoryRequest(RequestResult);
         return;
@@ -2091,13 +2723,20 @@ void UPEPInventoryComponent::Client_ResolveInventoryRequest_Implementation(
     OnRequestResolved.Broadcast(RequestResult);
 }
 
-FPEPItemResult
-UPEPInventoryComponent::CanTransferItemToInventory(
+// ---- Transfer -------------------------------------------------------------------------------
+
+FPEPItemResult UPEPInventoryComponent::ValidateTransfer(
     const UPEPInventoryComponent* TargetInventory,
     const FPEPItemId ItemId,
     const FPEPItemLocation& Destination,
-    const FPEPItemAccessContext& Access) const
+    const FPEPItemAccessContext& Access,
+    TArray<FPEPInventoryEntry>* OutItemTree) const
 {
+    if (OutItemTree)
+    {
+        OutItemTree->Reset();
+    }
+
     if (!TargetInventory)
     {
         return FPEPItemResult::Failure(
@@ -2122,7 +2761,8 @@ UPEPInventoryComponent::CanTransferItemToInventory(
         return ExtractValidation;
     }
 
-    TArray<FPEPInventoryEntry> ItemTree;
+    TArray<FPEPInventoryEntry> LocalItemTree;
+    TArray<FPEPInventoryEntry>& ItemTree = OutItemTree ? *OutItemTree : LocalItemTree;
     if (!BuildItemTreeSnapshot(ItemId, ItemTree))
     {
         return FPEPItemResult::Failure(
@@ -2135,6 +2775,21 @@ UPEPInventoryComponent::CanTransferItemToInventory(
         Destination,
         Access,
         false);
+}
+
+FPEPItemResult
+UPEPInventoryComponent::CanTransferItemToInventory(
+    const UPEPInventoryComponent* TargetInventory,
+    const FPEPItemId ItemId,
+    const FPEPItemLocation& Destination,
+    const FPEPItemAccessContext& Access) const
+{
+    return ValidateTransfer(
+        TargetInventory,
+        ItemId,
+        Destination,
+        Access,
+        nullptr);
 }
 
 FPEPItemResult UPEPInventoryComponent::TransferItemToInventory(
@@ -2159,12 +2814,14 @@ FPEPItemResult UPEPInventoryComponent::TransferItemToInventory(
             ItemId);
     }
 
+    TArray<FPEPInventoryEntry> ItemTree;
     const FPEPItemResult Validation =
-        CanTransferItemToInventory(
+        ValidateTransfer(
             TargetInventory,
             ItemId,
             Destination,
-            Access);
+            Access,
+            &ItemTree);
 
     if (!Validation.bSuccess)
     {
@@ -2173,19 +2830,26 @@ FPEPItemResult UPEPInventoryComponent::TransferItemToInventory(
 
     if (TargetInventory == this)
     {
-        const FPEPItemLocation PreviousLocation = FindEntry(ItemId)->Location;
-        const FGameplayTag PreviousRoot = ResolveRootSlotTag(PreviousLocation);
-
-        CommitMoveItem(ItemId, Destination);
-        EmitMoved(ItemId, PreviousLocation, Destination, nullptr, &PreviousRoot);
-
-        return FPEPItemResult::Success(
-            ItemId,
-            PEPCoreTags::Reason_None);
+        return CommitValidatedMove(ItemId, Destination);
     }
 
-    TArray<FPEPInventoryEntry> ItemTree;
-    if (!BuildItemTreeSnapshot(ItemId, ItemTree))
+    return CommitValidatedTransfer(
+        TargetInventory,
+        ItemId,
+        Destination,
+        MoveTemp(ItemTree));
+}
+
+FPEPItemResult UPEPInventoryComponent::CommitValidatedTransfer(
+    UPEPInventoryComponent* TargetInventory,
+    const FPEPItemId ItemId,
+    const FPEPItemLocation& Destination,
+    TArray<FPEPInventoryEntry>&& ItemTree)
+{
+    if (!TargetInventory
+        || TargetInventory == this
+        || ItemTree.IsEmpty()
+        || ItemTree[0].Item.ItemId != ItemId)
     {
         return FPEPItemResult::Failure(
             PEPCoreTags::Reason_InvalidTarget,
@@ -2193,6 +2857,7 @@ FPEPItemResult UPEPInventoryComponent::TransferItemToInventory(
     }
 
     TMap<FPEPItemId, FGameplayTag> RemovedRoots;
+    RemovedRoots.Reserve(ItemTree.Num());
     TArray<TPair<FPEPItemInstance, FPEPItemLocation>> RemovedEntries;
     RemovedEntries.Reserve(ItemTree.Num());
     for (const FPEPInventoryEntry& Entry : ItemTree)
@@ -2216,8 +2881,10 @@ FPEPItemResult UPEPInventoryComponent::TransferItemToInventory(
     {
         const FPEPItemId AddedItemId = Entry.Item.ItemId;
         const FPEPItemLocation AddedLocation = Entry.Location;
-        TargetInventory->CommitAddItem(MoveTemp(Entry.Item), AddedLocation);
-        AddedEntries.Emplace(AddedItemId, AddedLocation);
+        if (TargetInventory->CommitAddItem(MoveTemp(Entry.Item), AddedLocation))
+        {
+            AddedEntries.Emplace(AddedItemId, AddedLocation);
+        }
     }
 
     /* Both authoritative stores are final before observers or replication are notified. */
@@ -2234,6 +2901,8 @@ FPEPItemResult UPEPInventoryComponent::TransferItemToInventory(
         ItemId,
         PEPCoreTags::Reason_None);
 }
+
+// ---- Placement ------------------------------------------------------------------------------
 
 FPEPItemResult
 UPEPInventoryComponent::ValidateLocationForItem(
@@ -2307,6 +2976,21 @@ UPEPInventoryComponent::ValidateLocationForItem(
 		{
 			return FPEPItemResult::Failure(
 				PEPCoreTags::Reason_BlockedByState,
+				Item.ItemId);
+		}
+
+		/*
+		 * The slot's own container was checked just above; what holds that container was not. An
+		 * outsider putting into an open pouch inside a locked backpack, or into a container they
+		 * cannot see, is refused here.
+		 */
+		const FPEPItemResult ParentReach =
+			ValidateExternalReach(*ParentEntry, Role);
+
+		if (!ParentReach.bSuccess)
+		{
+			return FPEPItemResult::Failure(
+				ParentReach.ReasonTag,
 				Item.ItemId);
 		}
 
@@ -2391,75 +3075,63 @@ UPEPInventoryComponent::ValidateLocationForItem(
 			FindGridOccupancy(Location.ParentItemId, Location.ContainerSlotName);
 		if (Occupancy && !Occupancy->bUnknown)
 		{
-			for (int32 Y = Location.GridPosition.Y; Y < Location.GridPosition.Y + ItemSize.Y; ++Y)
-			{
-				for (int32 X = Location.GridPosition.X; X < Location.GridPosition.X + ItemSize.X; ++X)
-				{
-					const int32 OccupantIndex = Occupancy->OccupantAt(FIntPoint(X, Y));
-					if (OccupantIndex == INDEX_NONE)
-					{
-						continue;
-					}
-					const FPEPItemId OccupantId = InventoryView.Entries[OccupantIndex].Item.ItemId;
-					if (OccupantId == Item.ItemId || OccupantId == AlsoIgnoredItemId)
-					{
-						continue;
-					}
-					return FPEPItemResult::Failure(
-						PEPCoreTags::Reason_NoFreeSlot,
-						Item.ItemId);
-				}
-			}
-			return FPEPItemResult::Success(
+			return IsGridFootprintFree(
+				*Occupancy,
+				Location.GridPosition,
+				ItemSize,
 				Item.ItemId,
-				PEPCoreTags::Reason_None);
+				AlsoIgnoredItemId)
+				? FPEPItemResult::Success(Item.ItemId, PEPCoreTags::Reason_None)
+				: FPEPItemResult::Failure(PEPCoreTags::Reason_NoFreeSlot, Item.ItemId);
 		}
 
-		const TArray<int32>* Occupants =
+		const TArray<FPEPItemId>* Occupants =
 			FindContainerSlotOccupants(
 				Location.ParentItemId,
 				Location.ContainerSlotName);
 
-		// Reference, not a ternary yielding a prvalue: that would copy the array on every call.
-		static const TArray<int32> EmptySlot;
-		const TArray<int32>& SlotOccupants = Occupants ? *Occupants : EmptySlot;
-
-		for (const int32 OccupantIndex : SlotOccupants)
+		if (Occupants)
 		{
-			const FPEPInventoryEntry& Existing =
-				InventoryView.Entries[OccupantIndex];
-
-			if (Existing.Item.ItemId == Item.ItemId
-				|| Existing.Item.ItemId == AlsoIgnoredItemId)
+			for (const FPEPItemId OccupantId : *Occupants)
 			{
-				continue;
-			}
+				if (OccupantId == Item.ItemId
+					|| OccupantId == AlsoIgnoredItemId)
+				{
+					continue;
+				}
 
-			FPEPItemInventoryShapeData
-				ExistingShapeData;
+				const FPEPInventoryEntry* Existing = FindIndexedEntry(OccupantId);
+				if (!Existing)
+				{
+					continue;
+				}
 
-			if (!PEPInventoryQuery::GetInventoryShapeData(
-				Existing.Item,
-				ExistingShapeData))
-			{
-				return FPEPItemResult::Failure(
-					PEPCoreTags::Reason_BlockedByState,
-					Item.ItemId);
-			}
+				FPEPItemInventoryShapeData
+					ExistingShapeData;
 
-			const FIntPoint ExistingSize = PEPInventoryValidation::OrientedSize(
-				ExistingShapeData.Size,
-				Existing.Location.bRotated);
+				if (!PEPInventoryQuery::GetInventoryShapeData(
+					Existing->Item,
+					ExistingShapeData))
+				{
+					return FPEPItemResult::Failure(
+						PEPCoreTags::Reason_BlockedByState,
+						Item.ItemId);
+				}
 
-			if (PEPInventoryValidation::DoFootprintsOverlap(
-				Location.GridPosition,
-				ItemSize,
-				Existing.Location.GridPosition,
-				ExistingSize))
-			{
-				return FPEPItemResult::Failure(
-					PEPCoreTags::Reason_NoFreeSlot,
-					Item.ItemId);
+				const FIntPoint ExistingSize = PEPInventoryValidation::OrientedSize(
+					ExistingShapeData.Size,
+					Existing->Location.bRotated);
+
+				if (PEPInventoryValidation::DoFootprintsOverlap(
+					Location.GridPosition,
+					ItemSize,
+					Existing->Location.GridPosition,
+					ExistingSize))
+				{
+					return FPEPItemResult::Failure(
+						PEPCoreTags::Reason_NoFreeSlot,
+						Item.ItemId);
+				}
 			}
 		}
 
@@ -2495,8 +3167,8 @@ FPEPItemResult UPEPInventoryComponent::ValidateExternalLocation(
     const FPEPItemLocation& Location) const
 {
     const FPEPLocationValidatorBinding* BestBinding = nullptr;
-    int32 BestSpecificity = INDEX_NONE;
 
+    /* The deepest claim covering the tag decides; depths were counted when the tags were claimed. */
     for (const FPEPLocationValidatorBinding& Binding : LocationValidators)
     {
         if (!Binding.Validator.IsBound()
@@ -2505,13 +3177,9 @@ FPEPItemResult UPEPInventoryComponent::ValidateExternalLocation(
             continue;
         }
 
-        const int32 Specificity =
-            Binding.RootLocationTag.ToString().Len();
-
-        if (!BestBinding || Specificity > BestSpecificity)
+        if (!BestBinding || Binding.TagDepth > BestBinding->TagDepth)
         {
             BestBinding = &Binding;
-            BestSpecificity = Specificity;
         }
     }
 
@@ -2540,56 +3208,36 @@ FPEPItemResult UPEPInventoryComponent::ValidateExternalLocation(
     return BestBinding->Validator.Execute(Item, Location);
 }
 
-namespace
-{
-	/**
-	 * Whether two locations name the same slot, the cell aside.
-	 *
-	 * A named slot holds one item, so the tag is its whole identity. A container slot holds many,
-	 * and two cells of one grid are the same place as far as putting something away goes.
-	 */
-	bool AreLocationsInSameSlot(
-		const FPEPItemLocation& First,
-		const FPEPItemLocation& Second)
-	{
-		if (First.Type != Second.Type)
-		{
-			return false;
-		}
-
-		switch (First.Type)
-		{
-		case EPEPItemLocationType::NamedSlot:
-			return First.LocationTag == Second.LocationTag;
-
-		case EPEPItemLocationType::ItemContainer:
-			return First.ParentItemId == Second.ParentItemId
-				&& First.ContainerSlotName == Second.ContainerSlotName;
-
-		default:
-			return false;
-		}
-	}
-}
-
 void UPEPInventoryComponent::AppendOrderedNamedSlotItems(
 	TArray<FPEPItemId>& OutItemIds) const
 {
-	TArray<const FPEPInventoryEntry*> NamedSlotEntries;
+	RefreshIndices();
 
-	for (const FPEPInventoryEntry& Entry : InventoryView.Entries)
+	/* Read from the named-slot index rather than by walking every entry for the few worn ones. */
+	TArray<const FPEPInventoryEntry*> NamedSlotEntries;
+	NamedSlotEntries.Reserve(NamedSlotIndex.Num());
+
+	for (const TPair<FGameplayTag, TArray<FPEPItemId>>& Pair : NamedSlotIndex)
 	{
-		if (Entry.Location.Type == EPEPItemLocationType::NamedSlot)
+		for (const FPEPItemId OccupantId : Pair.Value)
 		{
-			NamedSlotEntries.Add(&Entry);
+			if (const FPEPInventoryEntry* Entry = FindIndexedEntry(OccupantId))
+			{
+				NamedSlotEntries.Add(Entry);
+			}
 		}
 	}
 
 	NamedSlotEntries.Sort(
 		[](const FPEPInventoryEntry& First, const FPEPInventoryEntry& Second)
 		{
-			return First.Location.LocationTag.GetTagName().LexicalLess(
-				Second.Location.LocationTag.GetTagName());
+			if (First.Location.LocationTag != Second.Location.LocationTag)
+			{
+				return First.Location.LocationTag.GetTagName().LexicalLess(
+					Second.Location.LocationTag.GetTagName());
+			}
+
+			return First.Item.ItemId.Value < Second.Item.ItemId.Value;
 		});
 
 	OutItemIds.Reserve(OutItemIds.Num() + NamedSlotEntries.Num());
@@ -2607,7 +3255,10 @@ void UPEPInventoryComponent::AppendOrderedChildItems(
 	TArray<const FPEPInventoryEntry*> Children;
 	GetDirectChildEntries(ParentItemId, Children);
 
-	/* Children of one parent occupy distinct locations, so this is a total order. */
+	/*
+	 * Children of one parent occupy distinct locations, so slot and cell are already a total
+	 * order; the id settles a corrupt store holding two on one cell the same way every time.
+	 */
 	Children.Sort(
 		[](const FPEPInventoryEntry& First, const FPEPInventoryEntry& Second)
 		{
@@ -2622,7 +3273,12 @@ void UPEPInventoryComponent::AppendOrderedChildItems(
 				return First.Location.GridPosition.Y < Second.Location.GridPosition.Y;
 			}
 
-			return First.Location.GridPosition.X < Second.Location.GridPosition.X;
+			if (First.Location.GridPosition.X != Second.Location.GridPosition.X)
+			{
+				return First.Location.GridPosition.X < Second.Location.GridPosition.X;
+			}
+
+			return First.Item.ItemId.Value < Second.Item.ItemId.Value;
 		});
 
 	OutItemIds.Reserve(OutItemIds.Num() + Children.Num());
@@ -2651,7 +3307,7 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 	{
 		const FPEPItemLocation Candidate = FPEPItemLocation::MakeNamedSlot(SlotTag);
 
-		if (AreLocationsInSameSlot(Candidate, ExcludedLocation))
+		if (PEPInventoryComponentPrivate::AreLocationsInSameSlot(Candidate, ExcludedLocation))
 		{
 			continue;
 		}
@@ -2676,7 +3332,16 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 	 * The queue is walked by index while it grows, which is what makes this level by level: the
 	 * children of everything at one depth are appended behind everything still to try at that
 	 * depth.
+	 *
+	 * Only grids take a stowed item, and a grid refuses an item without a footprint on every one
+	 * of its cells, so a shapeless item has nowhere further to go.
 	 */
+	FPEPItemInventoryShapeData ItemShape;
+	if (!PEPInventoryQuery::GetInventoryShapeData(Item, ItemShape))
+	{
+		return false;
+	}
+
 	TArray<FPEPItemId> PendingParents;
 	AppendOrderedNamedSlotItems(PendingParents);
 
@@ -2716,24 +3381,29 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 			continue;
 		}
 
-		const FPEPItemState_ContainerRuntime* Runtime =
-			ParentEntry->Item.GetState<
-				FPEPItemState_ContainerRuntime>();
-
-		const bool bLocked =
-			Runtime
-				? Runtime->bLocked
-				: Container->bStartsLocked;
-
 		/* A locked container keeps its contents shut in, so nothing nested in it is reachable. */
-		if (bLocked)
+		if (PEPInventoryComponentPrivate::IsContainerItemLocked(ParentEntry->Item, *Container))
 		{
 			continue;
 		}
 
+		/*
+		 * What ValidateLocationForItem would decide identically for every cell of this container:
+		 * whether the item may enter it at all. Asked once here rather than once per cell. A
+		 * refusal skips the slots but not the descent below, exactly as the per-cell refusals did.
+		 */
+		const bool bParentAccepts =
+			!WouldCreateCycle(Item.ItemId, ParentItemId)
+			&& ValidateExternalReach(*ParentEntry, Role).bSuccess;
+
 		for (const FPEPContainerSlotDefinition& Slot
 			: Container->Slots)
 		{
+			if (!bParentAccepts)
+			{
+				break;
+			}
+
 			/* Never automatically into magazine_socket, optic_socket and the like. */
 			if (!Slot.IsValid()
 				|| Slot.Mode !=
@@ -2744,24 +3414,33 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 			}
 
 			/* The whole slot is excluded, so none of its cells will do either. */
-			if (AreLocationsInSameSlot(
+			if (PEPInventoryComponentPrivate::AreLocationsInSameSlot(
 				FPEPItemLocation::MakeItemContainer(ParentItemId, Slot.SlotName),
 				ExcludedLocation))
 			{
 				continue;
 			}
 
+			/* Slot-wide, so decided once for all its cells. */
+			if (!PEPItemQuery::DoesItemMatchRequiredBlockedTags(
+				Item,
+				Slot.RequiredItemTags,
+				Slot.BlockedItemTags))
+			{
+				continue;
+			}
+
 			/*
-			 * Two prunings, both necessary conditions of what ValidateLocationForItem decides: a
-			 * grid with fewer free cells than the footprint cannot take it, and a footprint cannot
-			 * start on a cell someone else holds. Neither applies while the map is unknown.
+			 * Pruning, every step a necessary condition of what ValidateLocationForItem decides: a
+			 * grid with fewer free cells than the footprint cannot take it, a footprint cannot
+			 * start where it would hang off the grid, and it cannot cover a cell someone else
+			 * holds. The cell map is unavailable while unknown; the per-cell validation then
+			 * decides alone, as it always did.
 			 */
 			const FPEPGridOccupancy* Occupancy = FindGridOccupancy(ParentItemId, Slot.SlotName);
 			const bool bUseOccupancy = Occupancy && !Occupancy->bUnknown;
-			FPEPItemInventoryShapeData Shape;
 			if (bUseOccupancy
-				&& (!PEPInventoryQuery::GetInventoryShapeData(Item, Shape)
-					|| Occupancy->FreeCells < Shape.Size.X * Shape.Size.Y))
+				&& Occupancy->FreeCells < ItemShape.Size.X * ItemShape.Size.Y)
 			{
 				continue;
 			}
@@ -2776,22 +3455,38 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 				const bool bRotated =
 					RotationIndex == 1;
 
+				/* A rotation the item does not allow is refused on every cell. */
+				if (bRotated && !ItemShape.bCanRotate)
+				{
+					continue;
+				}
+
+				const FIntPoint Size =
+					PEPInventoryValidation::OrientedSize(ItemShape.Size, bRotated);
+
+				/* Past these the footprint hangs off the grid; an oversized item gets no cell. */
+				const int32 LastY = Slot.GridSize.Y - Size.Y;
+				const int32 LastX = Slot.GridSize.X - Size.X;
+
 				for (int32 Y = 0;
-					Y < Slot.GridSize.Y;
+					Y <= LastY;
 					++Y)
 				{
 					for (int32 X = 0;
-						X < Slot.GridSize.X;
+						X <= LastX;
 						++X)
 					{
-						if (bUseOccupancy)
+						const FIntPoint Position(X, Y);
+
+						if (bUseOccupancy
+							&& !IsGridFootprintFree(
+								*Occupancy,
+								Position,
+								Size,
+								Item.ItemId,
+								FPEPItemId()))
 						{
-							const int32 OccupantIndex = Occupancy->OccupantAt(FIntPoint(X, Y));
-							if (OccupantIndex != INDEX_NONE
-								&& InventoryView.Entries[OccupantIndex].Item.ItemId != Item.ItemId)
-							{
-								continue;
-							}
+							continue;
 						}
 
 						const FPEPItemLocation Candidate =
@@ -2799,9 +3494,10 @@ bool UPEPInventoryComponent::TryResolveAutoPlacement(
 							MakeItemContainer(
 								ParentItemId,
 								Slot.SlotName,
-								FIntPoint(X, Y),
+								Position,
 								bRotated);
 
+						/* The full decision, for a cell the pruning could not rule out. */
 						if (ValidateLocationForItem(
 							Item,
 							Candidate,
@@ -2884,12 +3580,20 @@ bool UPEPInventoryComponent::TryResolvePickupPlacement(
 		|| TryResolveAutoPlacement(Item, OutLocation, Role);
 }
 
+// ---- Pickup ---------------------------------------------------------------------------------
+
 void UPEPInventoryComponent::PlanPickupStackMerges(
 	FPEPItemInstance& Item,
 	const EPEPAccessRole Role,
 	TArray<FPEPInventoryStackMerge>& OutMerges) const
 {
 	OutMerges.Reset();
+
+	/*
+	 * Candidates first, then filled in item-id order. Walking the entry array and filling as it
+	 * went made which stacks a pickup topped up depend on where RemoveAtSwap had last moved them.
+	 */
+	TArray<const FPEPInventoryEntry*> Candidates;
 
 	for (const FPEPInventoryEntry& Entry : InventoryView.Entries)
 	{
@@ -2900,15 +3604,28 @@ void UPEPInventoryComponent::PlanPickupStackMerges(
 
 		/*
 		 * Merging bypasses placement entirely, so without this a sealed slot would still accept
-		 * ammunition as long as a compatible stack already sat inside it.
+		 * ammunition as long as a compatible stack already sat inside it — and an outsider could
+		 * top up a stack they cannot see, or one behind a lock further up.
 		 */
-		if (!CanDepositIntoLocation(Entry.Location, Role))
+		if (!CanDepositIntoLocation(Entry.Location, Role)
+			|| !ValidateExternalReach(Entry, Role).bSuccess)
 		{
 			continue;
 		}
 
+		Candidates.Add(&Entry);
+	}
+
+	Candidates.Sort(
+		[](const FPEPInventoryEntry& First, const FPEPInventoryEntry& Second)
+		{
+			return First.Item.ItemId.Value < Second.Item.ItemId.Value;
+		});
+
+	for (const FPEPInventoryEntry* Entry : Candidates)
+	{
 		int32 TransferredCount = 0;
-		FPEPItemInstance MergedItem = Entry.Item;
+		FPEPItemInstance MergedItem = Entry->Item;
 
 		/* Refuses a transfer of nothing, so a full stack never enters the plan as a no-op. */
 		if (!PEPItemMutation::MergeStacks(
@@ -2921,9 +3638,9 @@ void UPEPInventoryComponent::PlanPickupStackMerges(
 		}
 
 		FPEPInventoryStackMerge& Planned = OutMerges.AddDefaulted_GetRef();
-		Planned.TargetItemId = Entry.Item.ItemId;
+		Planned.TargetItemId = Entry->Item.ItemId;
 		Planned.MergedItem = MoveTemp(MergedItem);
-		Planned.Location = Entry.Location;
+		Planned.Location = Entry->Location;
 
 		if (Item.IsDepleted())
 		{
@@ -2932,11 +3649,31 @@ void UPEPInventoryComponent::PlanPickupStackMerges(
 	}
 }
 
-FPEPItemResult
-UPEPInventoryComponent::CanAddPickupItem(
+FPEPItemResult UPEPInventoryComponent::PlanPickupItem(
 	const FPEPItemInstance& Item,
-	const FPEPItemAccessContext& Access) const
+	const EPEPAccessRole Role,
+	FPEPItemInstance& OutRemainder,
+	TArray<FPEPInventoryStackMerge>& OutMerges,
+	FPEPItemLocation& OutDestination,
+	bool& bOutAddRemainder) const
 {
+	OutMerges.Reset();
+	OutDestination = FPEPItemLocation();
+	bOutAddRemainder = false;
+
+	/*
+	 * The item itself first, whatever happens to it next. A pickup absorbed whole into carried
+	 * stacks never needed a cell, and so never passed through CanAddItem: an id this store already
+	 * held, or a malformed instance, went straight to the commit, whose only guard was a check()
+	 * that a shipping server does not have.
+	 */
+	if (!PEPInventoryComponentPrivate::IsItemCatalogueReadyForInventoryMutation(*this))
+	{
+		return FPEPItemResult::Failure(
+			PEPCoreTags::Reason_BlockedByState,
+			Item.ItemId);
+	}
+
 	if (!Item.IsValid())
 	{
 		return FPEPItemResult::Failure(
@@ -2944,47 +3681,81 @@ UPEPInventoryComponent::CanAddPickupItem(
 			Item.ItemId);
 	}
 
-	const EPEPAccessRole Role = ResolveAccessRole(Access);
+	FPEPItemInstanceValidationResult InstanceValidation;
+	if (!Item.ValidateInstance(InstanceValidation))
+	{
+		return FPEPItemResult::Failure(
+			PEPCoreTags::Reason_InvalidTarget,
+			Item.ItemId);
+	}
+
+	if (ContainsItem(Item.ItemId))
+	{
+		return FPEPItemResult::Failure(
+			PEPCoreTags::Reason_BlockedByState,
+			Item.ItemId);
+	}
+
+	OutRemainder = Item;
 
 	// Mount the complete pickup before considering any storage, including stack merging.
-	FPEPItemLocation AttachmentLocation;
-	if (TryResolveAttachmentPlacement(Item, AttachmentLocation, Role))
+	if (TryResolveAttachmentPlacement(Item, OutDestination, Role))
 	{
-		return CanAddItem(Item, AttachmentLocation, Access);
+		bOutAddRemainder = true;
+		return FPEPItemResult::Success(
+			Item.ItemId,
+			PEPCoreTags::Reason_None);
 	}
 
 	/*
-	 * The merges are planned here for the same reason AddPickupItem plans them: a pickup the
-	 * carried stacks would swallow whole needs no cell, and asking for one would refuse a pickup
-	 * that in fact succeeds. The copy is what keeps this const — nothing carries over to the add.
+	 * Top up the stacks already carried before looking for a place: picking up cartridges must
+	 * fill the ones on the rig rather than claim a new cell. A pickup the carried stacks swallow
+	 * whole needs no cell, and asking for one would refuse a pickup that in fact succeeds.
 	 */
-	FPEPItemInstance Remainder = Item;
-	TArray<FPEPInventoryStackMerge> PlannedMerges;
-	PlanPickupStackMerges(Remainder, Role, PlannedMerges);
+	PlanPickupStackMerges(OutRemainder, Role, OutMerges);
 
-	if (Remainder.IsDepleted())
+	if (OutRemainder.IsDepleted())
 	{
 		return FPEPItemResult::Success(
 			Item.ItemId,
 			PEPCoreTags::Reason_None);
 	}
 
-	FPEPItemLocation Destination;
-
 	if (!TryResolveAutoPlacement(
-		Remainder,
-		Destination,
+		OutRemainder,
+		OutDestination,
 		Role))
 	{
+		OutMerges.Reset();
 		return FPEPItemResult::Failure(
 			PEPCoreTags::Reason_NoFreeSlot,
 			Item.ItemId);
 	}
 
-	return CanAddItem(
+	bOutAddRemainder = true;
+	return FPEPItemResult::Success(
+		Item.ItemId,
+		PEPCoreTags::Reason_None);
+}
+
+FPEPItemResult
+UPEPInventoryComponent::CanAddPickupItem(
+	const FPEPItemInstance& Item,
+	const FPEPItemAccessContext& Access) const
+{
+	/* The same plan AddPickupItem commits; the copies it works on are what keep this const. */
+	FPEPItemInstance Remainder;
+	TArray<FPEPInventoryStackMerge> PlannedMerges;
+	FPEPItemLocation Destination;
+	bool bAddRemainder = false;
+
+	return PlanPickupItem(
+		Item,
+		ResolveAccessRole(Access),
 		Remainder,
+		PlannedMerges,
 		Destination,
-		Access);
+		bAddRemainder);
 }
 
 FPEPItemResult
@@ -3027,57 +3798,57 @@ UPEPInventoryComponent::AddPickupItem(
 			Item.ItemId);
 	}
 
-	if (!Item.IsValid())
+	const FPEPItemId PickedUpItemId = Item.ItemId;
+
+	/*
+	 * Planned first and written afterwards, so a remainder that turns out to have nowhere to go
+	 * leaves the carried stacks exactly as they were. The plan is the whole validation: nothing
+	 * between it and the writes below can run.
+	 */
+	FPEPItemInstance Remainder;
+	TArray<FPEPInventoryStackMerge> PlannedMerges;
+	FPEPItemLocation Destination;
+	bool bAddRemainder = false;
+
+	const FPEPItemResult Plan = PlanPickupItem(
+		Item,
+		ResolveAccessRole(Access),
+		Remainder,
+		PlannedMerges,
+		Destination,
+		bAddRemainder);
+
+	if (!Plan.bSuccess)
+	{
+		return Plan;
+	}
+
+	/* Every target confirmed before any is written: a pickup is all of its writes or none. */
+	for (const FPEPInventoryStackMerge& Planned : PlannedMerges)
+	{
+		if (!ContainsItem(Planned.TargetItemId))
+		{
+			return FPEPItemResult::Failure(
+				PEPCoreTags::Reason_InvalidTarget,
+				PickedUpItemId);
+		}
+	}
+
+	if (bAddRemainder
+		&& !CommitAddItem(MoveTemp(Remainder), Destination))
 	{
 		return FPEPItemResult::Failure(
 			PEPCoreTags::Reason_InvalidTarget,
-			Item.ItemId);
-	}
-
-	const EPEPAccessRole Role = ResolveAccessRole(Access);
-	const FPEPItemId PickedUpItemId = Item.ItemId;
-
-	FPEPItemLocation AttachmentLocation;
-	if (TryResolveAttachmentPlacement(Item, AttachmentLocation, Role))
-	{
-		return AddItem(MoveTemp(Item), AttachmentLocation, Access);
-	}
-
-	/*
-	 * Top up the stacks already carried before looking for a place: picking up cartridges must
-	 * fill the ones on the rig rather than claim a new cell.
-	 *
-	 * Planned first and written afterwards, so a remainder that turns out to have nowhere to go
-	 * leaves the carried stacks exactly as they were.
-	 */
-	TArray<FPEPInventoryStackMerge> PlannedMerges;
-	PlanPickupStackMerges(Item, Role, PlannedMerges);
-
-	/* Absorbed whole: the picked-up item never enters the store. */
-	const bool bAddRemainder = !Item.IsDepleted();
-
-	FPEPItemLocation Destination;
-
-	if (bAddRemainder
-		&& !TryResolveAutoPlacement(Item, Destination, Role))
-	{
-		return FPEPItemResult::Failure(
-			PEPCoreTags::Reason_NoFreeSlot,
 			PickedUpItemId);
 	}
 
 	for (FPEPInventoryStackMerge& Planned : PlannedMerges)
 	{
-		FPEPInventoryEntry* Target = FindMutableEntry(Planned.TargetItemId);
-		check(Target);
-
-		Target->Item = MoveTemp(Planned.MergedItem);
-		InventoryView.MarkItemDirty(*Target);
-	}
-
-	if (bAddRemainder)
-	{
-		CommitAddItem(MoveTemp(Item), Destination);
+		if (FPEPInventoryEntry* Target = FindMutableEntry(Planned.TargetItemId))
+		{
+			Target->Item = MoveTemp(Planned.MergedItem);
+			InventoryView.MarkItemDirty(*Target);
+		}
 	}
 
 	/*
@@ -3156,9 +3927,18 @@ void UPEPInventoryComponent::CommitAddItemTree(
 
     const FPEPItemId RootItemId = ItemTree[0].Item.ItemId;
 
-    CommitAddItem(
+    if (!CommitAddItem(
         MoveTemp(ItemTree[0].Item),
-        RootLocation);
+        RootLocation))
+    {
+        UE_LOG(
+            LogPEPItems,
+            Error,
+            TEXT("CommitAddItemTree: root %d could not be stored; its %d descendant(s) were dropped with it."),
+            RootItemId.Value,
+            ItemTree.Num() - 1);
+        return;
+    }
     OutAdded.Emplace(
         RootItemId,
         RootLocation);
@@ -3199,24 +3979,24 @@ void UPEPInventoryComponent::CommitAddItemTree(
             const FPEPItemId ChildItemId = PendingEntry.Item.ItemId;
             const FPEPItemLocation ChildLocation = PendingEntry.Location;
 
-            CommitAddItem(
+            /* A refused child is dropped from the pass either way; its own children stay pending. */
+            if (CommitAddItem(
                 MoveTemp(PendingEntry.Item),
-                ChildLocation);
-
-            AddedIds.Add(ChildItemId);
-            OutAdded.Emplace(
-                ChildItemId,
-                ChildLocation);
+                ChildLocation))
+            {
+                AddedIds.Add(ChildItemId);
+                OutAdded.Emplace(
+                    ChildItemId,
+                    ChildLocation);
+            }
 
             PendingIndices.RemoveAtSwap(PendingIndex);
             bMadeProgress = true;
         }
 
-        checkf(
+        if (!ensureMsgf(
             bMadeProgress,
-            TEXT("Validated item tree could not be inserted parent-first."));
-
-        if (!bMadeProgress)
+            TEXT("Validated item tree could not be inserted parent-first.")))
         {
             break;
         }
@@ -3245,6 +4025,8 @@ void UPEPInventoryComponent::EmitAddedEntries(
         EmitAdded(AddedEntry.Key, AddedEntry.Value);
     }
 }
+
+// ---- Loadout --------------------------------------------------------------------------------
 
 FPEPItemResult UPEPInventoryComponent::CanApplyLoadout(
     const UPEPLoadoutPreset* Loadout,
@@ -3312,6 +4094,8 @@ FPEPItemResult UPEPInventoryComponent::ApplyLoadoutForOwner(const UPEPLoadoutPre
     return ApplyLoadout(Loadout, GetOwnerRequestContext());
 }
 
+// ---- Drop -----------------------------------------------------------------------------------
+
 FPEPItemInstanceTree UPEPInventoryComponent::MakeItemTreeFromEntries(
     TArray<FPEPInventoryEntry>&& Entries)
 {
@@ -3350,10 +4134,11 @@ FPEPItemResult UPEPInventoryComponent::CanDropItemTree(
      * Resolved rather than merely tested for emptiness, so this and the drop itself can never
      * disagree. It loads the class on first use; that happens once for the life of the process.
      */
+    const FPEPItemInstance* Item = FindItem(ItemId);
     const TSubclassOf<APEPItemWorldActor> ActorClass = OverrideActorClass
         ? OverrideActorClass
         : PEPInventorySettings().ResolveWorldItemActorClassForDefinition(
-            FindItem(ItemId) ? FindItem(ItemId)->GetDefinitionIfLoaded() : nullptr);
+            Item ? Item->GetDefinitionIfLoaded() : nullptr);
 
     if (!ActorClass || ActorClass->HasAnyClassFlags(CLASS_Abstract))
     {
@@ -3385,10 +4170,11 @@ FPEPItemResult UPEPInventoryComponent::DropItemTree(
     }
 
     UWorld* World = GetWorld();
+    const FPEPItemInstance* Item = FindItem(ItemId);
     const TSubclassOf<APEPItemWorldActor> ActorClass = OverrideActorClass
         ? OverrideActorClass
         : PEPInventorySettings().ResolveWorldItemActorClassForDefinition(
-            FindItem(ItemId) ? FindItem(ItemId)->GetDefinitionIfLoaded() : nullptr);
+            Item ? Item->GetDefinitionIfLoaded() : nullptr);
 
     /*
      * Spawned deferred so the tree is in place before BeginPlay. An actor that began play empty
@@ -3414,14 +4200,24 @@ FPEPItemResult UPEPInventoryComponent::DropItemTree(
         return FPEPItemResult::Failure(PEPCoreTags::Reason_UnsupportedMode, ItemId);
     }
 
-    TArray<FPEPInventoryEntry> Extracted;
-    const FPEPItemResult Removed = ExtractItemTree(ItemId, Extracted, Access);
+    /*
+     * Asked again, and not out of habit: unlike every other Do here, this one ran foreign code —
+     * the carrier's construction and SetItemTree — between its decision and its write. The check
+     * is a few lookups; a stale decision here would put the items in two places.
+     */
+    const FPEPItemResult StillTakeable = CanExtractItemTree(ItemId, Access);
+    if (!StillTakeable.bSuccess)
+    {
+        Carrier->Destroy();
+        return StillTakeable;
+    }
 
-    if (!Removed.bSuccess)
+    TArray<FPEPInventoryEntry> Extracted;
+    if (!CommitExtractItemTree(ItemId, Extracted))
     {
         /* Validated a moment ago, so this is a bug rather than a refusal — lose the carrier, not the items. */
         Carrier->Destroy();
-        return Removed;
+        return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
     }
 
     Carrier->FinishSpawning(WorldTransform);
@@ -3464,32 +4260,7 @@ TArray<FPEPInventoryEntry> UPEPInventoryComponent::FlattenItemTree(
     return Entries;
 }
 
-namespace
-{
-    /*
-     * FPEPItemResult names one item, so a result about several can only name one of them
-     * arbitrarily — and a caller would then be entitled to read it. It stays unset instead.
-     * A failure is a different matter: it comes from the validator and names the item that caused
-     * it, which is exactly what a caller needs.
-     */
-    FPEPItemId SingleTreeItemId(const TArray<FPEPInventoryTreePlacement>& Placements)
-    {
-        return Placements.Num() == 1
-            ? Placements[0].Tree.RootItem.ItemId
-            : FPEPItemId();
-    }
-
-    TArray<FPEPInventoryTreePlacement> MakeSingleTreePlacement(
-        FPEPItemInstanceTree&& Tree,
-        const FPEPItemLocation& RootLocation)
-    {
-        TArray<FPEPInventoryTreePlacement> Placements;
-        FPEPInventoryTreePlacement& Placement = Placements.AddDefaulted_GetRef();
-        Placement.RootLocation = RootLocation;
-        Placement.Tree = MoveTemp(Tree);
-        return Placements;
-    }
-}
+// ---- Trees ----------------------------------------------------------------------------------
 
 FPEPItemResult UPEPInventoryComponent::CanAddItemTreeAt(
     const FPEPItemInstanceTree& Tree,
@@ -3499,7 +4270,7 @@ FPEPItemResult UPEPInventoryComponent::CanAddItemTreeAt(
     FPEPItemInstanceTree TreeCopy = Tree;
 
     return CanAddItemTrees(
-        MakeSingleTreePlacement(MoveTemp(TreeCopy), RootLocation),
+        PEPInventoryComponentPrivate::MakeSingleTreePlacement(MoveTemp(TreeCopy), RootLocation),
         Access);
 }
 
@@ -3509,7 +4280,7 @@ FPEPItemResult UPEPInventoryComponent::AddItemTreeAt(
     const FPEPItemAccessContext& Access)
 {
     return AddItemTrees(
-        MakeSingleTreePlacement(MoveTemp(Tree), RootLocation),
+        PEPInventoryComponentPrivate::MakeSingleTreePlacement(MoveTemp(Tree), RootLocation),
         Access);
 }
 
@@ -3521,6 +4292,27 @@ FPEPItemResult UPEPInventoryComponent::CanAddItemTrees(
     {
         return FPEPItemResult::Failure(
             PEPCoreTags::Reason_InvalidTarget);
+    }
+
+    /*
+     * One tree has no other tree to collide with, so it is decided the way any single tree is —
+     * and a lone item, the common restore of a loose slot, without copying the store at all.
+     */
+    if (Placements.Num() == 1)
+    {
+        FPEPItemInstanceTree TreeCopy = Placements[0].Tree;
+
+        const FPEPItemResult Validation = ValidateItemTreeAtRootLocation(
+            FlattenItemTree(MoveTemp(TreeCopy)),
+            Placements[0].RootLocation,
+            Access,
+            /*bValidateChildPlacement*/ true);
+
+        return Validation.bSuccess
+            ? FPEPItemResult::Success(
+                PEPInventoryComponentPrivate::SingleTreeItemId(Placements),
+                PEPCoreTags::Reason_None)
+            : Validation;
     }
 
     /*
@@ -3549,7 +4341,7 @@ FPEPItemResult UPEPInventoryComponent::CanAddItemTrees(
     }
 
     return FPEPItemResult::Success(
-        SingleTreeItemId(Placements),
+        PEPInventoryComponentPrivate::SingleTreeItemId(Placements),
         PEPCoreTags::Reason_None);
 }
 
@@ -3561,7 +4353,7 @@ FPEPItemResult UPEPInventoryComponent::AddItemTrees(
     {
         return FPEPItemResult::Failure(
             PEPCoreTags::Reason_NotAuthority,
-            SingleTreeItemId(Placements));
+            PEPInventoryComponentPrivate::SingleTreeItemId(Placements));
     }
 
     const FPEPItemResult Validation = CanAddItemTrees(Placements, Access);
@@ -3594,7 +4386,11 @@ void UPEPInventoryComponent::ExportItemTrees(
 {
     OutPlacements.Reset();
 
-    /* A root is whatever is not inside another item; store order is kept so a save is stable. */
+    /*
+     * A root is whatever is not inside another item; store order is kept so a save is stable.
+     * Each tree is walked through the child index, so the whole forest costs one pass over the
+     * store rather than one per root.
+     */
     for (const FPEPInventoryEntry& Entry : InventoryView.Entries)
     {
         if (Entry.Location.Type == EPEPItemLocationType::ItemContainer)
@@ -3626,16 +4422,18 @@ bool UPEPInventoryComponent::WouldCreateCycle(
     const FPEPItemId MovingItemId,
     FPEPItemId ParentItemId) const
 {
-    TSet<FPEPItemId> Visited;
+    /*
+     * Bounded by the store size instead of a visited set: a chain of distinct ancestors cannot be
+     * longer than the store, so a longer walk has met a cycle — which is a cycle either way.
+     */
+    const int32 MaxSteps = InventoryView.Entries.Num();
 
-    while (ParentItemId.IsValid())
+    for (int32 Step = 0; ParentItemId.IsValid(); ++Step)
     {
-        if (ParentItemId == MovingItemId || Visited.Contains(ParentItemId))
+        if (ParentItemId == MovingItemId || Step > MaxSteps)
         {
             return true;
         }
-
-        Visited.Add(ParentItemId);
 
         const FPEPInventoryEntry* ParentEntry = FindEntry(ParentItemId);
         if (!ParentEntry
@@ -3654,39 +4452,60 @@ bool UPEPInventoryComponent::WouldCreateCycle(
 bool UPEPInventoryComponent::HasChildren(
     const FPEPItemId ParentItemId) const
 {
-    for (const FPEPInventoryEntry& Pair : InventoryView.Entries)
-    {
-        const FPEPItemLocation& Location = Pair.Location;
-        if (Location.Type == EPEPItemLocationType::ItemContainer
-            && Location.ParentItemId == ParentItemId)
-        {
-            return true;
-        }
-    }
+    RefreshIndices();
 
-    return false;
+    /* The index drops a parent's list once it empties, so presence alone answers. */
+    return ChildIndex.Contains(ParentItemId);
 }
 
 void UPEPInventoryComponent::AppendDescendantEntries(
     const FPEPItemId ParentItemId,
     TArray<const FPEPInventoryEntry*>& OutEntries) const
 {
-    TArray<const FPEPInventoryEntry*> Children;
-    GetDirectChildEntries(
-        ParentItemId,
-        Children);
+    RefreshIndices();
 
-    for (const FPEPInventoryEntry* Child : Children)
+    /*
+     * Depth-first, each parent before its children, with an explicit stack: children are pushed
+     * in reverse so they come off in the order they arrived, which is the order the recursion this
+     * replaces produced.
+     *
+     * Cycle-safe without a visited set. Each item names one parent, so from a start outside any
+     * cycle the walk can never enter one, and from a start inside one the first item met twice is
+     * the start itself — which is never pushed. The store size bounds the output regardless.
+     */
+    TArray<FPEPItemId, TInlineAllocator<32>> Pending;
+
+    const auto PushChildren = [this, ParentItemId, &Pending](const FPEPItemId Id)
     {
+        if (const TArray<FPEPItemId>* Children = ChildIndex.Find(Id))
+        {
+            for (int32 Index = Children->Num() - 1; Index >= 0; --Index)
+            {
+                if ((*Children)[Index] != ParentItemId)
+                {
+                    Pending.Add((*Children)[Index]);
+                }
+            }
+        }
+    };
+
+    PushChildren(ParentItemId);
+
+    const int32 MaxEntries = InventoryView.Entries.Num();
+    int32 Appended = 0;
+
+    while (!Pending.IsEmpty() && Appended < MaxEntries)
+    {
+        const FPEPItemId ChildId = Pending.Pop();
+        const FPEPInventoryEntry* Child = FindIndexedEntry(ChildId);
         if (!Child)
         {
             continue;
         }
 
         OutEntries.Add(Child);
-        AppendDescendantEntries(
-            Child->Item.ItemId,
-            OutEntries);
+        ++Appended;
+        PushChildren(ChildId);
     }
 }
 
@@ -3754,15 +4573,20 @@ FPEPItemResult UPEPInventoryComponent::ValidatePickupItemTree(
     return ValidateItemTreeAtRootLocation(ItemTree, OutRootLocation, Access);
 }
 
-UPEPInventoryComponent* UPEPInventoryComponent::CreateValidationScratch() const
+UPEPInventoryComponent* UPEPInventoryComponent::CreateValidationScratch(
+    const bool bCopyEntries) const
 {
     UPEPInventoryComponent* Scratch =
         NewObject<UPEPInventoryComponent>(GetTransientPackage());
 
-    Scratch->InventoryView.Entries = InventoryView.Entries;
+    if (bCopyEntries)
+    {
+        Scratch->InventoryView.Entries = InventoryView.Entries;
+    }
     Scratch->LocationValidators = LocationValidators;
-    Scratch->bEntryIndexDirty = true;
-    Scratch->bContainerSlotIndexDirty = true;
+    Scratch->ExternalAccess = ExternalAccess;
+    Scratch->bAutoPlacementSlotTagsDirty = true;
+    Scratch->MarkAllIndicesDirty();
 
     return Scratch;
 }
@@ -3773,14 +4597,79 @@ FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAtRootLocation(
     const FPEPItemAccessContext& Access,
     const bool bValidateChildPlacement) const
 {
+    const EPEPAccessRole Role = ResolveAccessRole(Access);
+
+    /*
+     * A lone item has no siblings and no parent inside the tree to simulate, so the live store
+     * answers exactly what a copy of it would: the same checks, in the same order, as the scratch
+     * path below makes for a tree of one. Looting a single item no longer copies the looter's
+     * whole inventory to decide it.
+     */
+    if (ItemTree.Num() == 1)
+    {
+        const FPEPItemInstance& Item = ItemTree[0].Item;
+
+        if (!PEPInventoryComponentPrivate::IsItemCatalogueReadyForInventoryMutation(*this))
+        {
+            return FPEPItemResult::Failure(
+                PEPCoreTags::Reason_BlockedByState,
+                Item.ItemId);
+        }
+
+        if (!RootLocation.IsStructurallyValid())
+        {
+            return FPEPItemResult::Failure(
+                PEPCoreTags::Reason_InvalidTarget);
+        }
+
+        const FPEPItemResult Incoming = ValidateIncomingItem(*this, Item);
+        if (!Incoming.bSuccess)
+        {
+            return Incoming;
+        }
+
+        return ValidateLocationForItem(
+            Item,
+            RootLocation,
+            Role);
+    }
+
     const TStrongObjectPtr<UPEPInventoryComponent> Scratch(CreateValidationScratch());
 
     return ValidateItemTreeAgainstScratch(
         *Scratch,
         ItemTree,
         RootLocation,
-        ResolveAccessRole(Access),
+        Role,
         bValidateChildPlacement);
+}
+
+FPEPItemResult UPEPInventoryComponent::ValidateIncomingItem(
+    const UPEPInventoryComponent& Store,
+    const FPEPItemInstance& Item)
+{
+    const FPEPItemId ItemId = Item.ItemId;
+
+    if (!Item.IsValid()
+        || !ItemId.IsValid()
+        || Store.ContainsItem(ItemId))
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
+
+    FPEPItemInstanceValidationResult InstanceValidation;
+    if (!Item.ValidateInstance(InstanceValidation))
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
+
+    return FPEPItemResult::Success(
+        ItemId,
+        PEPCoreTags::Reason_None);
 }
 
 FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
@@ -3790,7 +4679,7 @@ FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
     const EPEPAccessRole Role,
     const bool bValidateChildPlacement) const
 {
-	if (!IsItemCatalogueReadyForInventoryMutation(*this))
+	if (!PEPInventoryComponentPrivate::IsItemCatalogueReadyForInventoryMutation(*this))
 	{
 		return FPEPItemResult::Failure(
 			PEPCoreTags::Reason_BlockedByState,
@@ -3813,23 +4702,18 @@ FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
     {
         const FPEPItemId EntryItemId = Entry.Item.ItemId;
 
-        if (!Entry.Item.IsValid()
-            || !EntryItemId.IsValid()
-            || TreeEntriesById.Contains(EntryItemId)
-            || Scratch.ContainsItem(EntryItemId))
+        if (TreeEntriesById.Contains(EntryItemId))
         {
             return FPEPItemResult::Failure(
                 PEPCoreTags::Reason_InvalidTarget,
                 EntryItemId);
         }
 
-		FPEPItemInstanceValidationResult InstanceValidation;
-		if (!Entry.Item.ValidateInstance(InstanceValidation))
-		{
-			return FPEPItemResult::Failure(
-				PEPCoreTags::Reason_InvalidTarget,
-				EntryItemId);
-		}
+        const FPEPItemResult Incoming = ValidateIncomingItem(Scratch, Entry.Item);
+        if (!Incoming.bSuccess)
+        {
+            return Incoming;
+        }
 
         TreeEntriesById.Add(
             EntryItemId,
@@ -3850,11 +4734,14 @@ FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
                 Entry.Item.ItemId);
         }
 
-        TSet<FPEPItemId> VisitedParents;
+        /*
+         * Up to the root, bounded by the tree's size: a chain of distinct members is shorter than
+         * the tree, so a longer one has met a cycle. No set per member.
+         */
         FPEPItemId Cursor = Entry.Location.ParentItemId;
         bool bReachedRoot = false;
 
-        while (Cursor.IsValid())
+        for (int32 Step = 0; Cursor.IsValid(); ++Step)
         {
             if (Cursor == RootItemId)
             {
@@ -3862,14 +4749,12 @@ FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
                 break;
             }
 
-            if (VisitedParents.Contains(Cursor))
+            if (Step >= ItemTree.Num())
             {
                 return FPEPItemResult::Failure(
                     PEPCoreTags::Reason_BlockedByState,
                     Entry.Item.ItemId);
             }
-
-            VisitedParents.Add(Cursor);
 
             const FPEPInventoryEntry* const* ParentEntry =
                 TreeEntriesById.Find(Cursor);
@@ -3908,7 +4793,12 @@ FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
     }
 
     FPEPItemInstance RootCopy = RootEntry.Item;
-    Scratch.CommitAddItem(MoveTemp(RootCopy), RootLocation);
+    if (!Scratch.CommitAddItem(MoveTemp(RootCopy), RootLocation))
+    {
+        return FPEPItemResult::Failure(
+            PEPCoreTags::Reason_InvalidTarget,
+            RootItemId);
+    }
 
     TSet<FPEPItemId> AddedIds;
     AddedIds.Add(RootItemId);
@@ -3942,7 +4832,12 @@ FPEPItemResult UPEPInventoryComponent::ValidateItemTreeAgainstScratch(
             }
 
             FPEPItemInstance ChildCopy = PendingEntry.Item;
-            Scratch.CommitAddItem(MoveTemp(ChildCopy), PendingEntry.Location);
+            if (!Scratch.CommitAddItem(MoveTemp(ChildCopy), PendingEntry.Location))
+            {
+                return FPEPItemResult::Failure(
+                    PEPCoreTags::Reason_InvalidTarget,
+                    PendingEntry.Item.ItemId);
+            }
             AddedIds.Add(PendingEntry.Item.ItemId);
             PendingIndices.RemoveAtSwap(PendingIndex);
             bMadeProgress = true;
@@ -3965,14 +4860,13 @@ bool UPEPInventoryComponent::IsNamedSlotOccupied(
     const FPEPItemId AlsoIgnoredItemId) const
 {
     RefreshIndices();
-    const TArray<int32>* Occupants = NamedSlotIndex.Find(SlotTag);
+    const TArray<FPEPItemId>* Occupants = NamedSlotIndex.Find(SlotTag);
     if (!Occupants)
     {
         return false;
     }
-    for (const int32 Index : *Occupants)
+    for (const FPEPItemId OccupantId : *Occupants)
     {
-        const FPEPItemId OccupantId = InventoryView.Entries[Index].Item.ItemId;
         if (OccupantId != IgnoredItemId && OccupantId != AlsoIgnoredItemId)
         {
             return true;
@@ -3988,7 +4882,7 @@ bool UPEPInventoryComponent::IsItemContainerSlotOccupied(
     const FPEPItemId IgnoredItemId,
     const FPEPItemId AlsoIgnoredItemId) const
 {
-    const TArray<int32>* Occupants =
+    const TArray<FPEPItemId>* Occupants =
         FindContainerSlotOccupants(ParentItemId, SlotName);
 
     if (!Occupants)
@@ -3996,9 +4890,8 @@ bool UPEPInventoryComponent::IsItemContainerSlotOccupied(
         return false;
     }
 
-    for (const int32 Index : *Occupants)
+    for (const FPEPItemId OccupantId : *Occupants)
     {
-        const FPEPItemId OccupantId = InventoryView.Entries[Index].Item.ItemId;
         if (OccupantId != IgnoredItemId && OccupantId != AlsoIgnoredItemId)
         {
             return true;
@@ -4008,50 +4901,73 @@ bool UPEPInventoryComponent::IsItemContainerSlotOccupied(
     return false;
 }
 
-void UPEPInventoryComponent::CommitAddItem(
+// ---- Commits --------------------------------------------------------------------------------
+
+bool UPEPInventoryComponent::CommitAddItem(
     FPEPItemInstance&& Item,
     const FPEPItemLocation& Location)
 {
     const FPEPItemId ItemId = Item.ItemId;
 
-    check(Item.IsValid());
-    check(ItemId.IsValid());
-    check(!ContainsItem(ItemId));
-    check(Location.IsStructurallyValid());
+    if (!ensureMsgf(
+        Item.IsValid()
+            && ItemId.IsValid()
+            && Location.IsStructurallyValid()
+            && !ContainsItem(ItemId),
+        TEXT("CommitAddItem: item %d reached the store without the validation its caller owed it; refused."),
+        ItemId.Value))
+    {
+        return false;
+    }
 
     FPEPInventoryEntry Entry;
     Entry.Item = MoveTemp(Item);
     Entry.Location = Location;
 
-    FPEPInventoryEntry& Added = MutableEntries().Add_GetRef(MoveTemp(Entry));
+    FPEPInventoryEntry& Added = AppendEntry(MoveTemp(Entry));
     InventoryView.MarkItemDirty(Added);
+    return true;
 }
 
-void UPEPInventoryComponent::CommitMoveItem(
+bool UPEPInventoryComponent::CommitMoveItem(
     const FPEPItemId ItemId,
     const FPEPItemLocation& Destination)
 {
     FPEPInventoryEntry* Entry = FindMutableEntry(ItemId);
-    check(Entry);
-    check(Destination.IsStructurallyValid());
+
+    if (!ensureMsgf(
+        Entry && Destination.IsStructurallyValid(),
+        TEXT("CommitMoveItem: item %d cannot be moved there; refused."),
+        ItemId.Value))
+    {
+        return false;
+    }
 
     SetEntryLocation(*Entry, Destination);
 
     InventoryView.MarkItemDirty(*Entry);
+    return true;
 }
 
-void UPEPInventoryComponent::CommitExtractItem(
+bool UPEPInventoryComponent::CommitExtractItem(
     const FPEPItemId ItemId,
     FPEPInventoryEntry& OutEntry)
 {
-    const FPEPInventoryEntry* Entry = FindEntry(ItemId);
-    check(Entry);
+    RefreshIndices();
 
-    OutEntry = *Entry;
+    const int32* FoundIndex = EntryIndex.Find(ItemId);
+    const int32 Index = FoundIndex ? *FoundIndex : INDEX_NONE;
 
-    // RemoveAtSwap is safe: the fast array keys entries by replication id, not by position.
-    MutableEntries().RemoveAtSwap(EntryIndex.FindChecked(ItemId));
-    InventoryView.MarkArrayDirty();
+    if (!ensureMsgf(
+        InventoryView.Entries.IsValidIndex(Index),
+        TEXT("CommitExtractItem: item %d is not in the store; nothing removed."),
+        ItemId.Value))
+    {
+        return false;
+    }
+
+    RemoveEntryAtSwap(Index, OutEntry);
+    return true;
 }
 
 bool UPEPInventoryComponent::CommitExtractItemTree(
@@ -4064,6 +4980,7 @@ bool UPEPInventoryComponent::CommitExtractItemTree(
     }
 
     TMap<FPEPItemId, FGameplayTag> RemovedRoots;
+    RemovedRoots.Reserve(OutEntries.Num());
     for (const FPEPInventoryEntry& Entry : OutEntries)
     {
         RemovedRoots.Add(Entry.Item.ItemId, ResolveRootSlotTag(Entry.Location));
@@ -4071,7 +4988,8 @@ bool UPEPInventoryComponent::CommitExtractItemTree(
 
     /*
      * The snapshot lists a parent before its children, so it is consumed backwards: the deepest
-     * item leaves first and no entry ever names a parent the store has already dropped.
+     * item leaves first and no entry ever names a parent the store has already dropped. Each
+     * removal repairs the indices it touches, so a subtree of any size rebuilds nothing.
      */
     for (int32 Index = OutEntries.Num() - 1; Index >= 0; --Index)
     {
@@ -4090,26 +5008,74 @@ bool UPEPInventoryComponent::CommitExtractItemTree(
     return true;
 }
 
+// ---- Pickup transfer ------------------------------------------------------------------------
+
+FPEPItemResult UPEPInventoryComponent::ResolvePickupTransfer(
+    const UPEPInventoryComponent* TargetInventory,
+    const FPEPItemId ItemId,
+    const FPEPItemAccessContext& Access,
+    FPEPItemLocation& OutDestination,
+    TArray<FPEPInventoryEntry>* OutItemTree) const
+{
+    OutDestination = FPEPItemLocation();
+
+    const FPEPItemInstance* Item = FindItem(ItemId);
+    if (!TargetInventory || !Item)
+    {
+        return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+    }
+
+    if (!TargetInventory->TryResolvePickupPlacement(
+        *Item,
+        OutDestination,
+        TargetInventory->ResolveAccessRole(Access)))
+    {
+        return FPEPItemResult::Failure(PEPCoreTags::Reason_NoFreeSlot, ItemId);
+    }
+
+    return ValidateTransfer(TargetInventory, ItemId, OutDestination, Access, OutItemTree);
+}
 
 FPEPItemResult UPEPInventoryComponent::CanTransferPickupToInventory(
     const UPEPInventoryComponent* TargetInventory, FPEPItemId ItemId, const FPEPItemAccessContext& Access) const
 {
-    const FPEPItemInstance* Item = FindItem(ItemId);
     FPEPItemLocation Destination;
-    if (!TargetInventory || !Item) return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
-    if (!TargetInventory->TryResolvePickupPlacement(*Item, Destination, TargetInventory->ResolveAccessRole(Access)))
-        return FPEPItemResult::Failure(PEPCoreTags::Reason_NoFreeSlot, ItemId);
-    return CanTransferItemToInventory(TargetInventory, ItemId, Destination, Access);
+    return ResolvePickupTransfer(TargetInventory, ItemId, Access, Destination, nullptr);
 }
+
 FPEPItemResult UPEPInventoryComponent::TransferPickupToInventory(
     UPEPInventoryComponent* TargetInventory, FPEPItemId ItemId, const FPEPItemAccessContext& Access)
 {
-    const FPEPItemResult Validation = CanTransferPickupToInventory(TargetInventory, ItemId, Access);
-    if (!Validation.bSuccess) return Validation;
+    if (!HasMutationAuthority())
+    {
+        return FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, ItemId);
+    }
+
+    if (!TargetInventory || !TargetInventory->HasMutationAuthority())
+    {
+        return FPEPItemResult::Failure(
+            TargetInventory
+                ? PEPCoreTags::Reason_NotAuthority
+                : PEPCoreTags::Reason_InvalidTarget,
+            ItemId);
+    }
+
+    /* Placement resolved and the transfer validated once; the commit reuses both. */
     FPEPItemLocation Destination;
-    if (!TargetInventory->TryResolvePickupPlacement(*FindItem(ItemId), Destination, TargetInventory->ResolveAccessRole(Access)))
-        return FPEPItemResult::Failure(PEPCoreTags::Reason_NoFreeSlot, ItemId);
-    return TransferItemToInventory(TargetInventory, ItemId, Destination, Access);
+    TArray<FPEPInventoryEntry> ItemTree;
+    const FPEPItemResult Validation =
+        ResolvePickupTransfer(TargetInventory, ItemId, Access, Destination, &ItemTree);
+    if (!Validation.bSuccess)
+    {
+        return Validation;
+    }
+
+    if (TargetInventory == this)
+    {
+        return CommitValidatedMove(ItemId, Destination);
+    }
+
+    return CommitValidatedTransfer(TargetInventory, ItemId, Destination, MoveTemp(ItemTree));
 }
 
 bool UPEPInventoryComponent::RestoreWorldItemTree(FPEPItemInstanceTree Tree, FGameplayTag RootTag)
@@ -4117,15 +5083,14 @@ bool UPEPInventoryComponent::RestoreWorldItemTree(FPEPItemInstanceTree Tree, FGa
     if (!HasMutationAuthority() || !Tree.IsStructurallyValid()) return false;
     TArray<FPEPInventoryEntry> Entries = FlattenItemTree(MoveTemp(Tree));
     const FPEPItemLocation RootLocation = FPEPItemLocation::MakeNamedSlot(RootTag);
-    const TStrongObjectPtr<UPEPInventoryComponent> Scratch(CreateValidationScratch());
-    Scratch->MutableEntries().Reset();
+    /* The tree replaces the whole store, so it is validated against an empty one. */
+    const TStrongObjectPtr<UPEPInventoryComponent> Scratch(CreateValidationScratch(false));
     // Descendant layout was already authored or validated by its source store. Locks must not
     // turn restoring/dropping a complete tree into an attempt to put items into its locked slots.
     if (!ValidateItemTreeAgainstScratch(*Scratch, Entries, RootLocation,
         EPEPAccessRole::Owner, false).bSuccess) return false;
     const TArray<FPEPInventoryEntry> PreviousEntries = InventoryView.Entries;
-    MutableEntries().Reset();
-    InventoryView.MarkArrayDirty();
+    ResetEntries();
     TArray<TPair<FPEPItemId, FPEPItemLocation>> AddedEntries;
     CommitAddItemTree(Entries, RootLocation, AddedEntries);
     for (const FPEPInventoryEntry& Previous : PreviousEntries)

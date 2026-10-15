@@ -147,8 +147,9 @@ TSharedRef<SWidget> FPEPItemPresetChildCustomization::BuildSlotMenu()
 		return MenuBuilder.MakeWidget();
 	}
 
-	const TArray<FPEPContainerSlotDefinition> Slots =
-		UPEPItemContainerRulesLibrary::GetContainerSlots(RootDefinition);
+	/* Read in place; the Blueprint accessor copies every slot just to list their names. */
+	const TConstArrayView<FPEPContainerSlotDefinition> Slots =
+		PEPItemContainerRules::FindContainerSlots(RootDefinition);
 
 	if (Slots.IsEmpty())
 	{

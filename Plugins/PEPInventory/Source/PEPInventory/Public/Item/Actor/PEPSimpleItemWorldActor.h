@@ -9,7 +9,7 @@ class PEPINVENTORY_API APEPSimpleItemWorldActor : public APEPItemWorldActor
 	GENERATED_BODY()
 public:
 	virtual bool SupportsDefinition(const UPEPItemDefinition* Definition) const override;
-	virtual FPEPItemInstance GetAuthorityItemInstance() const override;
+	virtual const FPEPItemInstance* FindAuthorityItemInstance() const override;
 protected:
 	virtual void ResetAuthorityStorage() override;
 	virtual bool StoreAuthorityTree(const FPEPItemInstanceTree& Tree) override;

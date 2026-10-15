@@ -4,6 +4,7 @@
 #include "Core/PEPCoreTags.h"
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
+#include "GameFramework/Info.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
@@ -13,6 +14,7 @@
 #include "Item/PEPItemDefinition.h"
 #include "Net/UnrealNetwork.h"
 #include "TimerManager.h"
+#include "UObject/PropertyPortFlags.h"
 
 UPEPInventorySessionComponent::UPEPInventorySessionComponent()
 {
@@ -122,29 +124,72 @@ bool UPEPInventorySessionComponent::HasAuthority() const
 	return Owner && Owner->HasAuthority();
 }
 
+const AController* UPEPInventorySessionComponent::GetSessionController() const
+{
+	const AActor* Owner = GetOwner();
+	if (const AController* Controller = Cast<AController>(Owner))
+	{
+		return Controller;
+	}
+	/* A pawn's or a player state's RPCs arrive on its controller's connection: that is the player. */
+	if (const APawn* Pawn = Cast<APawn>(Owner))
+	{
+		return Pawn->GetController();
+	}
+	if (const APlayerState* PlayerState = Cast<APlayerState>(Owner))
+	{
+		return PlayerState->GetOwningController();
+	}
+	return nullptr;
+}
+
 FPEPItemAccessContext UPEPInventorySessionComponent::GetRequestContext() const
 {
-	if (const UPEPInventoryComponent* Local = GetLocalInventory())
+	return FPEPItemAccessContext::From(GetSessionController());
+}
+
+/* Named rather than anonymous, so a unity build cannot fold it into a neighbour's helper. */
+namespace PEPInventorySessionPrivate
+{
+	/**
+	 * Whether Actor's location says where something is. A controller and an info actor (a player
+	 * state) have a transform only by accident — wherever they spawned, the world origin as often
+	 * as not — and measuring a looter from there opens or keeps sessions from across the map.
+	 */
+	bool HasMeaningfulLocation(const AActor& Actor)
 	{
-		return Local->GetOwnerRequestContext();
+		if (Actor.IsA<APawn>())
+		{
+			return true;
+		}
+		return !Actor.IsA<AController>() && !Actor.IsA<AInfo>() && Actor.GetRootComponent() != nullptr;
 	}
-	return FPEPItemAccessContext::From(Cast<AController>(GetOwner()));
 }
 
 const AActor* UPEPInventorySessionComponent::GetLocationActor() const
 {
-	if (const UPEPInventoryComponent* Local = GetLocalInventory())
+	const AActor* Owner = GetOwner();
+	if (const APawn* OwnerPawn = Cast<APawn>(Owner))
 	{
-		return Local->GetOwner();
+		return OwnerPawn;
 	}
-	if (const AController* Controller = Cast<AController>(GetOwner()))
+	if (const AController* Controller = GetSessionController())
 	{
 		if (const APawn* Pawn = Controller->GetPawn())
 		{
 			return Pawn;
 		}
 	}
-	return GetOwner();
+	if (const UPEPInventoryComponent* Local = GetLocalInventory())
+	{
+		const AActor* Carrier = Local->GetOwner();
+		if (Carrier && PEPInventorySessionPrivate::HasMeaningfulLocation(*Carrier))
+		{
+			return Carrier;
+		}
+	}
+	/* Nothing better: a controller with no pawn, or a test actor. As before, the owner itself. */
+	return Owner;
 }
 
 // ---- The mirror ----------------------------------------------------------------------------
@@ -162,12 +207,7 @@ bool UPEPInventorySessionComponent::FindSessionEntry(
 	const FPEPItemId ItemId,
 	FPEPInventoryEntry& OutEntry) const
 {
-	const FPEPInventoryEntry* Entry = SessionView.Entries.FindByPredicate(
-		[ItemId](const FPEPInventoryEntry& Candidate)
-		{
-			return Candidate.Item.ItemId == ItemId;
-		});
-	if (Entry)
+	if (const FPEPInventoryEntry* Entry = FindSessionEntryPtr(ItemId))
 	{
 		OutEntry = *Entry;
 		return true;
@@ -176,22 +216,122 @@ bool UPEPInventorySessionComponent::FindSessionEntry(
 	return false;
 }
 
-UPEPItemDefinition* UPEPInventorySessionComponent::GetSessionItemDefinitionById(const FPEPItemId ItemId) const
+const FPEPInventoryEntry* UPEPInventorySessionComponent::FindSessionEntryPtr(const FPEPItemId ItemId) const
+{
+	const int32 Index = FindSessionEntryIndex(ItemId);
+	return Index != INDEX_NONE ? &SessionView.Entries[Index] : nullptr;
+}
+
+const UPEPItemDefinition* UPEPInventorySessionComponent::GetSessionItemDefinitionById(const FPEPItemId ItemId) const
+{
+	const FPEPInventoryEntry* Entry = FindSessionEntryPtr(ItemId);
+	return Entry ? Entry->Item.GetDefinitionIfLoaded() : nullptr;
+}
+
+int32 UPEPInventorySessionComponent::FindSessionEntryIndex(const FPEPItemId ItemId) const
 {
 	if (!ItemId.IsValid())
 	{
-		return nullptr;
+		return INDEX_NONE;
 	}
-	const FPEPInventoryEntry* Entry = SessionView.Entries.FindByPredicate(
-		[ItemId](const FPEPInventoryEntry& Candidate)
+	const TArray<FPEPInventoryEntry>& Entries = SessionView.Entries;
+	/* A size the index does not know means a write it never saw: rebuild rather than trust it. */
+	if (bSessionEntryIndexDirty || SessionEntryIndexArrayNum != Entries.Num())
+	{
+		RebuildSessionEntryIndex();
+	}
+	const int32* Found = SessionEntryIndex.Find(ItemId);
+	if (!Found)
+	{
+		return INDEX_NONE;
+	}
+	if (Entries.IsValidIndex(*Found) && Entries[*Found].Item.ItemId == ItemId)
+	{
+		return *Found;
+	}
+	/* Same size, different order: reshuffled behind the index's back. Cheap to repair, once. */
+	RebuildSessionEntryIndex();
+	Found = SessionEntryIndex.Find(ItemId);
+	return Found ? *Found : INDEX_NONE;
+}
+
+void UPEPInventorySessionComponent::RebuildSessionEntryIndex() const
+{
+	const TArray<FPEPInventoryEntry>& Entries = SessionView.Entries;
+	SessionEntryIndex.Reset();
+	SessionEntryIndex.Reserve(Entries.Num());
+	for (int32 Index = 0; Index < Entries.Num(); ++Index)
+	{
+		SessionEntryIndex.Add(Entries[Index].Item.ItemId, Index);
+	}
+	SessionEntryIndexArrayNum = Entries.Num();
+	bSessionEntryIndexDirty = false;
+}
+
+void UPEPInventorySessionComponent::AddSessionSnapshot(const FPEPInventoryEntry& RemoteEntry)
+{
+	FPEPInventoryEntry& Snapshot = SessionView.Entries.AddDefaulted_GetRef();
+	Snapshot.Item = RemoteEntry.Item;
+	Snapshot.Location = RemoteEntry.Location;
+	SessionView.MarkItemDirty(Snapshot);
+	if (!bSessionEntryIndexDirty)
+	{
+		SessionEntryIndex.Add(Snapshot.Item.ItemId, SessionView.Entries.Num() - 1);
+		SessionEntryIndexArrayNum = SessionView.Entries.Num();
+	}
+}
+
+bool UPEPInventorySessionComponent::UpdateSessionSnapshot(const int32 Index, const FPEPInventoryEntry& RemoteEntry)
+{
+	FPEPInventoryEntry& Snapshot = SessionView.Entries[Index];
+	/*
+	 * Compared by reflection rather than field by field, so state a later schema adds to the item
+	 * is compared too. An unchanged entry is left alone: marking it would send it again for nothing.
+	 */
+	if (Snapshot.Location == RemoteEntry.Location
+		&& FPEPItemInstance::StaticStruct()->CompareScriptStruct(&Snapshot.Item, &RemoteEntry.Item, PPF_None))
+	{
+		return false;
+	}
+	Snapshot.Item = RemoteEntry.Item;
+	Snapshot.Location = RemoteEntry.Location;
+	SessionView.MarkItemDirty(Snapshot);
+	return true;
+}
+
+void UPEPInventorySessionComponent::RemoveSessionSnapshotAt(const int32 Index)
+{
+	TArray<FPEPInventoryEntry>& Entries = SessionView.Entries;
+	const FPEPItemId RemovedId = Entries[Index].Item.ItemId;
+	const int32 LastIndex = Entries.Num() - 1;
+	// Safe: the fast array keys entries by replication id, not by position.
+	Entries.RemoveAtSwap(Index);
+	SessionView.MarkArrayDirty();
+	if (!bSessionEntryIndexDirty)
+	{
+		/* RemoveAtSwap filled the hole with the last entry; only that one moved. */
+		SessionEntryIndex.Remove(RemovedId);
+		if (Index != LastIndex)
 		{
-			return Candidate.Item.ItemId == ItemId;
-		});
-	return Entry ? const_cast<UPEPItemDefinition*>(Entry->Item.GetDefinitionIfLoaded()) : nullptr;
+			SessionEntryIndex.Add(Entries[Index].Item.ItemId, Index);
+		}
+		SessionEntryIndexArrayNum = Entries.Num();
+	}
+}
+
+void UPEPInventorySessionComponent::ResetSessionSnapshots()
+{
+	SessionView.Entries.Reset();
+	SessionView.MarkArrayDirty();
+	SessionEntryIndex.Reset();
+	SessionEntryIndexArrayNum = 0;
+	bSessionEntryIndexDirty = false;
 }
 
 void UPEPInventorySessionComponent::HandleReplicatedSessionViewChanged()
 {
+	/* Replication rewrote the mirror without passing through the writers above. */
+	bSessionEntryIndexDirty = true;
 	NotifySessionViewChanged();
 }
 
@@ -229,8 +369,7 @@ const UPEPInventoryComponent* UPEPInventorySessionComponent::GetSessionPreviewSc
 			SessionPreviewScratch->LocationValidators.Reset();
 		}
 		SessionPreviewScratch->bAutoPlacementSlotTagsDirty = true;
-		SessionPreviewScratch->bEntryIndexDirty = true;
-		SessionPreviewScratch->bContainerSlotIndexDirty = true;
+		SessionPreviewScratch->MarkAllIndicesDirty();
 		bSessionPreviewScratchDirty = false;
 	}
 	// Set on every read: it replicates as its own property and can land after the view does.
@@ -408,8 +547,7 @@ void UPEPInventorySessionComponent::CloseTransferSession()
 	SessionLootPanelTag = FGameplayTag();
 	SessionMode = EPEPInventorySessionMode::None;
 	SessionRootItemId.Reset();
-	SessionView.Entries.Reset();
-	SessionView.MarkArrayDirty();
+	ResetSessionSnapshots();
 	NotifySessionViewChanged();
 
 	if (AActor* Owner = GetOwner(); Owner && Owner->HasAuthority())
@@ -608,36 +746,66 @@ EPEPAccessRole UPEPInventorySessionComponent::ResolveSessionRole() const
 		: EPEPAccessRole::External;
 }
 
+bool UPEPInventorySessionComponent::ShouldMirror(
+	const UPEPInventoryComponent& Remote,
+	const FPEPItemId ItemId,
+	const EPEPAccessRole Role) const
+{
+	return IsItemVisibleInExternalView(Remote, ItemId, Role)
+		&& (SessionMode != EPEPInventorySessionMode::Inspect
+			|| IsItemInInspectionProjection(Remote, ItemId, SessionRootItemId));
+}
+
 void UPEPInventorySessionComponent::RefreshSessionView()
 {
-	SessionView.Entries.Reset();
-	if (const UPEPInventoryComponent* RemoteInventory = TransferSession.GetRemote())
+	const UPEPInventoryComponent* RemoteInventory = TransferSession.GetRemote();
+	if (!RemoteInventory)
 	{
-		/*
-		 * Mirrored selectively. This snapshot is replicated to the looting client, so an entry
-		 * copied here is an entry that client has: the visibility rules have to be applied while
-		 * building it, not by whatever draws it afterwards.
-		 */
-		const EPEPAccessRole Role = ResolveSessionRole();
-		SessionView.Entries.Reserve(RemoteInventory->InventoryView.Entries.Num());
-		for (const FPEPInventoryEntry& RemoteEntry : RemoteInventory->InventoryView.Entries)
+		if (SessionView.Entries.Num() > 0)
 		{
-			if (!IsItemVisibleInExternalView(*RemoteInventory, RemoteEntry.Item.ItemId, Role))
-			{
-				continue;
-			}
-			if (SessionMode == EPEPInventorySessionMode::Inspect
-				&& !IsItemInInspectionProjection(*RemoteInventory, RemoteEntry.Item.ItemId, SessionRootItemId))
-			{
-				continue;
-			}
-			FPEPInventoryEntry& Snapshot = SessionView.Entries.AddDefaulted_GetRef();
-			Snapshot.Item = RemoteEntry.Item;
-			Snapshot.Location = RemoteEntry.Location;
-			SessionView.MarkItemDirty(Snapshot);
+			ResetSessionSnapshots();
+		}
+		NotifySessionViewChanged();
+		return;
+	}
+	/*
+	 * Mirrored selectively. This snapshot is replicated to the looting client, so an entry
+	 * copied here is an entry that client has: the visibility rules have to be applied while
+	 * building it, not by whatever draws it afterwards.
+	 *
+	 * Reconciled rather than rebuilt: recreating every entry hands each a new replication id, and
+	 * the fast array then resends the whole mirror for what may be a single pouch that moved.
+	 */
+	const EPEPAccessRole Role = ResolveSessionRole();
+	const TArray<FPEPInventoryEntry>& RemoteEntries = RemoteInventory->InventoryView.Entries;
+	TSet<FPEPItemId> Mirrored;
+	Mirrored.Reserve(RemoteEntries.Num());
+	for (const FPEPInventoryEntry& RemoteEntry : RemoteEntries)
+	{
+		const FPEPItemId ItemId = RemoteEntry.Item.ItemId;
+		if (!ShouldMirror(*RemoteInventory, ItemId, Role))
+		{
+			continue;
+		}
+		Mirrored.Add(ItemId);
+		const int32 Index = FindSessionEntryIndex(ItemId);
+		if (Index != INDEX_NONE)
+		{
+			UpdateSessionSnapshot(Index, RemoteEntry);
+		}
+		else
+		{
+			AddSessionSnapshot(RemoteEntry);
 		}
 	}
-	SessionView.MarkArrayDirty();
+	/* Backwards, so the entry RemoveAtSwap moves into a hole has already been kept. */
+	for (int32 Index = SessionView.Entries.Num() - 1; Index >= 0; --Index)
+	{
+		if (!Mirrored.Contains(SessionView.Entries[Index].Item.ItemId))
+		{
+			RemoveSessionSnapshotAt(Index);
+		}
+	}
 	NotifySessionViewChanged();
 }
 
@@ -667,19 +835,12 @@ void UPEPInventorySessionComponent::ApplySessionViewChange(const FPEPItemStoreCh
 		RefreshSessionView();
 		return;
 	}
-	/* Linear: a lootable container holds tens of entries, and this runs once per change. */
-	const int32 Index = SessionView.Entries.IndexOfByPredicate(
-		[&Change](const FPEPInventoryEntry& Entry)
-		{
-			return Entry.Item.ItemId == Change.ItemId;
-		});
+	const int32 Index = FindSessionEntryIndex(Change.ItemId);
 	if (Change.ChangeType == EPEPItemStoreChangeType::Removed)
 	{
 		if (Index != INDEX_NONE)
 		{
-			// Safe: the fast array keys entries by replication id, not by position.
-			SessionView.Entries.RemoveAtSwap(Index);
-			SessionView.MarkArrayDirty();
+			RemoveSessionSnapshotAt(Index);
 			NotifySessionViewChanged();
 		}
 		return;
@@ -697,8 +858,8 @@ void UPEPInventorySessionComponent::ApplySessionViewChange(const FPEPItemStoreCh
 	/*
 	 * A container that moved carries the visibility of everything beneath it, and a mirror updated
 	 * one entry at a time cannot see that far: a pouch dragged out of a sealed pocket reveals its
-	 * whole contents, none of which raised a change of its own. This is the case the full rebuild
-	 * exists for.
+	 * whole contents, none of which raised a change of its own. This is the case the full
+	 * reconciliation exists for.
 	 */
 	if (Change.ChangeType == EPEPItemStoreChangeType::Moved
 		&& PEPItemContainerQuery::IsContainer(RemoteEntry->Item))
@@ -710,31 +871,22 @@ void UPEPInventorySessionComponent::ApplySessionViewChange(const FPEPItemStoreCh
 	 * Re-decided on every change rather than once when the session opened: an item moved into a
 	 * pocket the looter may not see has to leave the mirror, and nothing else would say so.
 	 */
-	if (!IsItemVisibleInExternalView(*Remote, Change.ItemId, ResolveSessionRole())
-		|| (SessionMode == EPEPInventorySessionMode::Inspect
-			&& !IsItemInInspectionProjection(*Remote, Change.ItemId, SessionRootItemId)))
+	if (!ShouldMirror(*Remote, Change.ItemId, ResolveSessionRole()))
 	{
 		if (Index != INDEX_NONE)
 		{
-			SessionView.Entries.RemoveAtSwap(Index);
-			SessionView.MarkArrayDirty();
+			RemoveSessionSnapshotAt(Index);
 			NotifySessionViewChanged();
 		}
 		return;
 	}
 	if (Index != INDEX_NONE)
 	{
-		FPEPInventoryEntry& Snapshot = SessionView.Entries[Index];
-		Snapshot.Item = RemoteEntry->Item;
-		Snapshot.Location = RemoteEntry->Location;
-		SessionView.MarkItemDirty(Snapshot);
+		UpdateSessionSnapshot(Index, *RemoteEntry);
 	}
 	else
 	{
-		FPEPInventoryEntry& Snapshot = SessionView.Entries.AddDefaulted_GetRef();
-		Snapshot.Item = RemoteEntry->Item;
-		Snapshot.Location = RemoteEntry->Location;
-		SessionView.MarkItemDirty(Snapshot);
+		AddSessionSnapshot(*RemoteEntry);
 	}
 	NotifySessionViewChanged();
 }
@@ -774,6 +926,109 @@ void UPEPInventorySessionComponent::Client_ResolveInventoryRequest_Implementatio
 	OnRequestResolved.Broadcast(RequestResult);
 }
 
+FPEPItemResult UPEPInventorySessionComponent::CheckSessionRequest(
+	const FGuid ExpectedSessionId,
+	const FPEPItemId ItemId) const
+{
+	if (IsTransferSessionReadOnly())
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_UnsupportedMode, ItemId);
+	}
+	/* A stale session id is a wrong target, not a distance failure. */
+	if (!ExpectedSessionId.IsValid() || ExpectedSessionId != GetTransferSessionId())
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, ItemId);
+	}
+	if (!IsTransferSessionValid())
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_OutOfRange, ItemId);
+	}
+	return FPEPItemResult::Success(ItemId);
+}
+
+bool UPEPInventorySessionComponent::IsMirroredItem(const FPEPItemId ItemId) const
+{
+	return FindSessionEntryIndex(ItemId) != INDEX_NONE;
+}
+
+bool UPEPInventorySessionComponent::IsMirroredDestination(const FPEPItemLocation& Destination) const
+{
+	/* A named slot names no remote item, and every named-slot occupant is mirrored anyway. */
+	return Destination.Type != EPEPItemLocationType::ItemContainer
+		|| IsMirroredItem(Destination.ParentItemId);
+}
+
+FPEPItemResult UPEPInventorySessionComponent::ExecuteTakeFromSession(
+	const FGuid ExpectedSessionId,
+	const FPEPItemId RemoteItemId,
+	const FPEPItemLocation& LocalDestination)
+{
+	if (IsTransferSessionReadOnly())
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_UnsupportedMode, RemoteItemId);
+	}
+	UPEPInventoryComponent* Local = GetLocalInventory();
+	if (!Local)
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, RemoteItemId);
+	}
+	const FPEPItemResult Gate = CheckSessionRequest(ExpectedSessionId, RemoteItemId);
+	if (!Gate.bSuccess)
+	{
+		return Gate;
+	}
+	if (!IsMirroredItem(RemoteItemId))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, RemoteItemId);
+	}
+	return TransferSession.GetRemote()->TransferItemToInventory(
+		Local, RemoteItemId, LocalDestination, GetRequestContext());
+}
+
+FPEPItemResult UPEPInventorySessionComponent::ExecutePutIntoSession(
+	const FGuid ExpectedSessionId,
+	const FPEPItemId LocalItemId,
+	const FPEPItemLocation& RemoteDestination)
+{
+	if (IsTransferSessionReadOnly())
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_UnsupportedMode, LocalItemId);
+	}
+	UPEPInventoryComponent* Local = GetLocalInventory();
+	if (!Local)
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, LocalItemId);
+	}
+	const FPEPItemResult Gate = CheckSessionRequest(ExpectedSessionId, LocalItemId);
+	if (!Gate.bSuccess)
+	{
+		return Gate;
+	}
+	if (!IsMirroredDestination(RemoteDestination))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, LocalItemId);
+	}
+	return Local->TransferItemToInventory(
+		TransferSession.GetRemote(), LocalItemId, RemoteDestination, GetRequestContext());
+}
+
+FPEPItemResult UPEPInventorySessionComponent::ExecuteMoveInSession(
+	const FGuid ExpectedSessionId,
+	const FPEPItemId RemoteItemId,
+	const FPEPItemLocation& RemoteDestination)
+{
+	const FPEPItemResult Gate = CheckSessionRequest(ExpectedSessionId, RemoteItemId);
+	if (!Gate.bSuccess)
+	{
+		return Gate;
+	}
+	if (!IsMirroredItem(RemoteItemId) || !IsMirroredDestination(RemoteDestination))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, RemoteItemId);
+	}
+	return TransferSession.GetRemote()->MoveItem(RemoteItemId, RemoteDestination, GetRequestContext());
+}
+
 EPEPRequestResult UPEPInventorySessionComponent::RequestTakeFromSession(
 	const FGuid ExpectedSessionId,
 	const FPEPItemId RemoteItemId,
@@ -794,13 +1049,7 @@ EPEPRequestResult UPEPInventorySessionComponent::RequestTakeFromSession(
 	OutRequestId = AllocateRequestId();
 	if (Owner->HasAuthority())
 	{
-		UPEPInventoryComponent* Local = GetLocalInventory();
-		const FPEPItemResult Result = !Local
-			? FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, RemoteItemId)
-			: IsTransferSessionValid()
-				? TransferSession.RemoteInventory->TransferItemToInventory(
-					Local, RemoteItemId, LocalDestination, GetRequestContext())
-				: FPEPItemResult::Failure(PEPCoreTags::Reason_OutOfRange, RemoteItemId);
+		const FPEPItemResult Result = ExecuteTakeFromSession(ExpectedSessionId, RemoteItemId, LocalDestination);
 		ResolveInventoryRequest(OutRequestId, EPEPInventoryRequestKind::TakeFromSession, Result);
 		return Result.bSuccess ? EPEPRequestResult::Executed : EPEPRequestResult::Failed;
 	}
@@ -821,11 +1070,7 @@ FPEPItemResult UPEPInventorySessionComponent::PreviewTakeFromSession(
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_UnsupportedMode, RemoteItemId);
 	}
-	const FPEPInventoryEntry* SourceEntry = SessionView.Entries.FindByPredicate(
-		[RemoteItemId](const FPEPInventoryEntry& Entry)
-		{
-			return Entry.Item.ItemId == RemoteItemId;
-		});
+	const FPEPInventoryEntry* SourceEntry = FindSessionEntryPtr(RemoteItemId);
 	const UPEPInventoryComponent* Local = GetLocalInventory();
 	if (!bHasTransferSession || !SourceEntry || !Local)
 	{
@@ -855,13 +1100,7 @@ EPEPRequestResult UPEPInventorySessionComponent::RequestPutIntoSession(
 	OutRequestId = AllocateRequestId();
 	if (Owner->HasAuthority())
 	{
-		UPEPInventoryComponent* Local = GetLocalInventory();
-		const FPEPItemResult Result = !Local
-			? FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, LocalItemId)
-			: IsTransferSessionValid()
-				? Local->TransferItemToInventory(
-					TransferSession.GetRemote(), LocalItemId, RemoteDestination, GetRequestContext())
-				: FPEPItemResult::Failure(PEPCoreTags::Reason_OutOfRange, LocalItemId);
+		const FPEPItemResult Result = ExecutePutIntoSession(ExpectedSessionId, LocalItemId, RemoteDestination);
 		ResolveInventoryRequest(OutRequestId, EPEPInventoryRequestKind::PutIntoSession, Result);
 		return Result.bSuccess ? EPEPRequestResult::Executed : EPEPRequestResult::Failed;
 	}
@@ -884,7 +1123,7 @@ FPEPItemResult UPEPInventorySessionComponent::PreviewPutIntoSession(
 	}
 	const UPEPInventoryComponent* Local = GetLocalInventory();
 	const FPEPInventoryEntry* SourceEntry = Local ? Local->FindEntry(LocalItemId) : nullptr;
-	if (!bHasTransferSession || !SourceEntry)
+	if (!bHasTransferSession || !SourceEntry || !IsMirroredDestination(RemoteDestination))
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, LocalItemId);
 	}
@@ -906,17 +1145,9 @@ void UPEPInventorySessionComponent::Server_RequestTakeFromSession_Implementation
 	const FPEPItemLocation LocalDestination,
 	const int32 RequestId)
 {
-	const bool bReadOnlySession = IsTransferSessionReadOnly();
-	const bool bSessionMatches = ExpectedSessionId.IsValid() && ExpectedSessionId == GetTransferSessionId();
-	UPEPInventoryComponent* Local = GetLocalInventory();
-	const FPEPItemResult Result = RequestId > 0 && bSessionMatches && !bReadOnlySession
-		&& Local && IsTransferSessionValid()
-		? TransferSession.RemoteInventory->TransferItemToInventory(
-			Local, RemoteItemId, LocalDestination, GetRequestContext())
-		: FPEPItemResult::Failure(
-			bReadOnlySession ? PEPCoreTags::Reason_UnsupportedMode
-				: (bSessionMatches && Local ? PEPCoreTags::Reason_OutOfRange : PEPCoreTags::Reason_InvalidTarget),
-			RemoteItemId);
+	const FPEPItemResult Result = RequestId > 0
+		? ExecuteTakeFromSession(ExpectedSessionId, RemoteItemId, LocalDestination)
+		: FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, RemoteItemId);
 	ResolveInventoryRequest(RequestId, EPEPInventoryRequestKind::TakeFromSession, Result);
 }
 
@@ -926,17 +1157,9 @@ void UPEPInventorySessionComponent::Server_RequestPutIntoSession_Implementation(
 	const FPEPItemLocation RemoteDestination,
 	const int32 RequestId)
 {
-	const bool bReadOnlySession = IsTransferSessionReadOnly();
-	const bool bSessionMatches = ExpectedSessionId.IsValid() && ExpectedSessionId == GetTransferSessionId();
-	UPEPInventoryComponent* Local = GetLocalInventory();
-	const FPEPItemResult Result = RequestId > 0 && bSessionMatches && !bReadOnlySession
-		&& Local && IsTransferSessionValid()
-		? Local->TransferItemToInventory(
-			TransferSession.GetRemote(), LocalItemId, RemoteDestination, GetRequestContext())
-		: FPEPItemResult::Failure(
-			bReadOnlySession ? PEPCoreTags::Reason_UnsupportedMode
-				: (bSessionMatches && Local ? PEPCoreTags::Reason_OutOfRange : PEPCoreTags::Reason_InvalidTarget),
-			LocalItemId);
+	const FPEPItemResult Result = RequestId > 0
+		? ExecutePutIntoSession(ExpectedSessionId, LocalItemId, RemoteDestination)
+		: FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, LocalItemId);
 	ResolveInventoryRequest(RequestId, EPEPInventoryRequestKind::PutIntoSession, Result);
 }
 
@@ -959,9 +1182,7 @@ EPEPRequestResult UPEPInventorySessionComponent::RequestMoveInSession(
 	OutRequestId = AllocateRequestId();
 	if (Owner->HasAuthority())
 	{
-		const FPEPItemResult Result = IsTransferSessionValid()
-			? TransferSession.GetRemote()->MoveItem(RemoteItemId, RemoteDestination, GetRequestContext())
-			: FPEPItemResult::Failure(PEPCoreTags::Reason_OutOfRange, RemoteItemId);
+		const FPEPItemResult Result = ExecuteMoveInSession(ExpectedSessionId, RemoteItemId, RemoteDestination);
 		ResolveInventoryRequest(OutRequestId, EPEPInventoryRequestKind::MoveInSession, Result);
 		return Result.bSuccess ? EPEPRequestResult::Executed : EPEPRequestResult::Failed;
 	}
@@ -976,7 +1197,8 @@ FPEPItemResult UPEPInventorySessionComponent::PreviewMoveInSession(
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_UnsupportedMode, RemoteItemId);
 	}
-	if (!bHasTransferSession || !RemoteItemId.IsValid() || !RemoteDestination.IsStructurallyValid())
+	if (!bHasTransferSession || !RemoteItemId.IsValid() || !RemoteDestination.IsStructurallyValid()
+		|| !IsMirroredItem(RemoteItemId) || !IsMirroredDestination(RemoteDestination))
 	{
 		return FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, RemoteItemId);
 	}
@@ -994,15 +1216,8 @@ void UPEPInventorySessionComponent::Server_RequestMoveInSession_Implementation(
 	const FGuid SessionId, const FPEPItemId RemoteItemId,
 	const FPEPItemLocation RemoteDestination, const int32 RequestId)
 {
-	const bool bReadOnlySession = IsTransferSessionReadOnly();
-	const bool bSessionMatches = SessionId.IsValid() && SessionId == GetTransferSessionId();
-	/* Same reasons as Take/Put: a stale session id is a wrong target, not a distance failure. */
-	const FPEPItemResult Result = RequestId > 0 && bSessionMatches
-		&& !bReadOnlySession && IsTransferSessionValid()
-		? TransferSession.GetRemote()->MoveItem(RemoteItemId, RemoteDestination, GetRequestContext())
-		: FPEPItemResult::Failure(
-			bReadOnlySession ? PEPCoreTags::Reason_UnsupportedMode
-				: (bSessionMatches ? PEPCoreTags::Reason_OutOfRange : PEPCoreTags::Reason_InvalidTarget),
-			RemoteItemId);
+	const FPEPItemResult Result = RequestId > 0
+		? ExecuteMoveInSession(SessionId, RemoteItemId, RemoteDestination)
+		: FPEPItemResult::Failure(PEPCoreTags::Reason_InvalidTarget, RemoteItemId);
 	ResolveInventoryRequest(RequestId, EPEPInventoryRequestKind::MoveInSession, Result);
 }

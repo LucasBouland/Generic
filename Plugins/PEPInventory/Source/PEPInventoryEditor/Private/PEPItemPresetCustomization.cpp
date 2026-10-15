@@ -9,7 +9,11 @@
 #include "Item/PEPItemContainerRules.h"
 #include "Item/PEPItemDefinition.h"
 #include "Item/PEPItemPreset.h"
+#include "Misc/PackageName.h"
 #include "PropertyHandle.h"
+#include "ScopedTransaction.h"
+#include "UObject/UObjectGlobals.h"
+#include "UObject/UnrealType.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -19,6 +23,11 @@
 TSharedRef<IDetailCustomization> FPEPItemPresetCustomization::MakeInstance()
 {
 	return MakeShared<FPEPItemPresetCustomization>();
+}
+
+FPEPItemPresetCustomization::~FPEPItemPresetCustomization()
+{
+	FCoreUObjectDelegates::OnObjectPropertyChanged.Remove(ObjectPropertyChangedHandle);
 }
 
 void FPEPItemPresetCustomization::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
@@ -31,6 +40,12 @@ void FPEPItemPresetCustomization::CustomizeDetails(IDetailLayoutBuilder& DetailB
 
 	ChildrenHandle = DetailBuilder.GetProperty(
 		GET_MEMBER_NAME_CHECKED(UPEPItemPreset, Children));
+
+	FCoreUObjectDelegates::OnObjectPropertyChanged.Remove(ObjectPropertyChangedHandle);
+	ObjectPropertyChangedHandle = FCoreUObjectDelegates::OnObjectPropertyChanged.AddSP(
+		SharedThis(this),
+		&FPEPItemPresetCustomization::HandleObjectPropertyChanged);
+	RefreshBuildResult();
 
 	IDetailCategoryBuilder& CategoryBuilder = DetailBuilder.EditCategory(TEXT("Preset"));
 
@@ -60,35 +75,59 @@ void FPEPItemPresetCustomization::CustomizeDetails(IDetailLayoutBuilder& DetailB
 		];
 }
 
-FText FPEPItemPresetCustomization::GetValidationText() const
+void FPEPItemPresetCustomization::RefreshBuildResult()
 {
 	const UPEPItemPreset* Preset = EditedPreset.Get();
 	if (!Preset)
 	{
-		return FText::GetEmpty();
+		CachedBuildText = FText::GetEmpty();
+		bCachedBuildSucceeded = false;
+		return;
 	}
 
 	FPEPItemInstanceTree Tree;
 	FText Error;
-	if (Preset->CreateItemTreeForEditor(Tree, Error))
+	bCachedBuildSucceeded = Preset->CreateItemTreeForEditor(Tree, Error);
+	CachedBuildText = bCachedBuildSucceeded
+		? LOCTEXT("BuildOk", "Builds successfully.")
+		: FText::Format(LOCTEXT("BuildFailed", "Build failed: {0}"), Error);
+}
+
+void FPEPItemPresetCustomization::HandleObjectPropertyChanged(
+	UObject* Object,
+	FPropertyChangedEvent& PropertyChangedEvent)
+{
+	/* A drag reports every frame of itself; the value it settles on arrives as a final change. */
+	if (!Object || PropertyChangedEvent.ChangeType == EPropertyChangeType::Interactive)
 	{
-		return LOCTEXT("BuildOk", "Builds successfully.");
+		return;
 	}
 
-	return FText::Format(LOCTEXT("BuildFailed", "Build failed: {0}"), Error);
+	/*
+	 * A build reads the edited preset, the presets nested in it and every definition they name,
+	 * so an edit to any of those can change the answer. Undo and redo arrive here as well.
+	 */
+	if (Object == EditedPreset.Get()
+		|| Object->IsA<UPEPItemPreset>()
+		|| Object->IsA<UPEPItemDefinition>())
+	{
+		RefreshBuildResult();
+	}
+}
+
+FText FPEPItemPresetCustomization::GetValidationText() const
+{
+	return EditedPreset.IsValid() ? CachedBuildText : FText::GetEmpty();
 }
 
 FSlateColor FPEPItemPresetCustomization::GetValidationColor() const
 {
-	const UPEPItemPreset* Preset = EditedPreset.Get();
-	if (!Preset)
+	if (!EditedPreset.IsValid() || CachedBuildText.IsEmpty())
 	{
 		return FSlateColor::UseForeground();
 	}
 
-	FPEPItemInstanceTree Tree;
-	FText Error;
-	return Preset->CreateItemTreeForEditor(Tree, Error)
+	return bCachedBuildSucceeded
 		? FSlateColor(FLinearColor(0.3f, 0.85f, 0.3f))
 		: FSlateColor(FLinearColor(0.95f, 0.35f, 0.3f));
 }
@@ -98,7 +137,7 @@ TSharedRef<SWidget> FPEPItemPresetCustomization::BuildAddChildMenu()
 	FMenuBuilder MenuBuilder(/*bInShouldCloseWindowAfterMenuSelection=*/true, nullptr);
 
 	const UPEPItemPreset* Preset = EditedPreset.Get();
-	UPEPItemDefinition* RootDefinition = Preset ? Preset->RootDefinition : nullptr;
+	const UPEPItemDefinition* RootDefinition = Preset ? Preset->RootDefinition.Get() : nullptr;
 	if (!RootDefinition)
 	{
 		MenuBuilder.AddMenuEntry(
@@ -109,8 +148,8 @@ TSharedRef<SWidget> FPEPItemPresetCustomization::BuildAddChildMenu()
 		return MenuBuilder.MakeWidget();
 	}
 
-	const TArray<FPEPContainerSlotDefinition> Slots =
-		UPEPItemContainerRulesLibrary::GetContainerSlots(RootDefinition);
+	const TConstArrayView<FPEPContainerSlotDefinition> Slots =
+		PEPItemContainerRules::FindContainerSlots(RootDefinition);
 	if (Slots.IsEmpty())
 	{
 		MenuBuilder.AddMenuEntry(
@@ -121,99 +160,130 @@ TSharedRef<SWidget> FPEPItemPresetCustomization::BuildAddChildMenu()
 		return MenuBuilder.MakeWidget();
 	}
 
-	/*
-	 * Loaded once per menu open, not cached: a preset editor is opened rarely enough that a full
-	 * synchronous load of every candidate asset here is cheaper than the bookkeeping needed to
-	 * keep a cache correct across asset creation, deletion and tag edits elsewhere in the editor.
-	 */
-	FAssetRegistryModule& AssetRegistryModule =
-		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-
-	TArray<FAssetData> PresetAssets;
-	AssetRegistryModule.Get().GetAssetsByClass(
-		UPEPItemPreset::StaticClass()->GetClassPathName(), PresetAssets, /*bSearchSubClasses=*/true);
-
-	TArray<FAssetData> ItemAssets;
-	AssetRegistryModule.Get().GetAssetsByClass(
-		UPEPItemDefinition::StaticClass()->GetClassPathName(), ItemAssets, /*bSearchSubClasses=*/true);
-
+	/* Bound through the shared pointer, never a raw this: the menu can outlive the details panel. */
+	const TWeakObjectPtr<const UPEPItemDefinition> WeakRootDefinition(RootDefinition);
 	for (const FPEPContainerSlotDefinition& Slot : Slots)
 	{
-		const FName SlotName = Slot.SlotName;
-
 		MenuBuilder.AddSubMenu(
-			FText::FromName(SlotName),
+			FText::FromName(Slot.SlotName),
 			FText::GetEmpty(),
-			FNewMenuDelegate::CreateLambda(
-				[this, SlotName, RootDefinition, PresetAssets, ItemAssets](FMenuBuilder& SubMenuBuilder)
-				{
-					FText Unused;
-					bool bAnyEntry = false;
-
-					for (const FAssetData& AssetData : PresetAssets)
-					{
-						UPEPItemPreset* CandidatePreset = Cast<UPEPItemPreset>(AssetData.GetAsset());
-						if (!CandidatePreset || !CandidatePreset->RootDefinition
-							|| !UPEPItemContainerRulesLibrary::CanPlaceItemInSlot(
-								RootDefinition, SlotName, CandidatePreset->RootDefinition, Unused))
-						{
-							continue;
-						}
-
-						bAnyEntry = true;
-						SubMenuBuilder.AddMenuEntry(
-							FText::FromString(FString::Printf(TEXT("[Preset] %s"), *CandidatePreset->GetName())),
-							FText::GetEmpty(),
-							FSlateIcon(),
-							FUIAction(FExecuteAction::CreateSP(
-								this,
-								&FPEPItemPresetCustomization::AddChildEntry,
-								SlotName,
-								CandidatePreset,
-								static_cast<UPEPItemDefinition*>(nullptr))));
-					}
-
-					for (const FAssetData& AssetData : ItemAssets)
-					{
-						UPEPItemDefinition* CandidateItem = Cast<UPEPItemDefinition>(AssetData.GetAsset());
-						if (!CandidateItem
-							|| !UPEPItemContainerRulesLibrary::CanPlaceItemInSlot(
-								RootDefinition, SlotName, CandidateItem, Unused))
-						{
-							continue;
-						}
-
-						bAnyEntry = true;
-						SubMenuBuilder.AddMenuEntry(
-							FText::FromString(FString::Printf(TEXT("[Item] %s"), *CandidateItem->GetName())),
-							FText::GetEmpty(),
-							FSlateIcon(),
-							FUIAction(FExecuteAction::CreateSP(
-								this,
-								&FPEPItemPresetCustomization::AddChildEntry,
-								SlotName,
-								static_cast<UPEPItemPreset*>(nullptr),
-								CandidateItem)));
-					}
-
-					if (!bAnyEntry)
-					{
-						SubMenuBuilder.AddMenuEntry(
-							LOCTEXT("NoCandidates", "Nothing matches this slot's tag rules"),
-							FText::GetEmpty(),
-							FSlateIcon(),
-							FUIAction());
-					}
-				}));
+			FNewMenuDelegate::CreateSP(
+				this,
+				&FPEPItemPresetCustomization::FillSlotSubMenu,
+				Slot.SlotName,
+				WeakRootDefinition));
 	}
 
 	return MenuBuilder.MakeWidget();
 }
 
+void FPEPItemPresetCustomization::FillSlotSubMenu(
+	FMenuBuilder& SubMenuBuilder,
+	const FName SlotName,
+	const TWeakObjectPtr<const UPEPItemDefinition> WeakRootDefinition)
+{
+	const UPEPItemDefinition* RootDefinition = WeakRootDefinition.Get();
+	if (!RootDefinition)
+	{
+		SubMenuBuilder.AddMenuEntry(
+			LOCTEXT("RootGone", "The Root Definition is no longer loaded"),
+			FText::GetEmpty(),
+			FSlateIcon(),
+			FUIAction());
+		return;
+	}
+
+	IAssetRegistry& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+	FText Unused;
+	bool bAnyEntry = false;
+
+	/*
+	 * Presets are judged by their RootDefinition registry tag and loaded only once picked: a preset
+	 * pulls its whole recipe graph in, and opening this menu used to load every one in the project.
+	 * The definitions themselves still have to be resident, since the slot rules read their owned
+	 * tags, but those are small and normally preloaded already.
+	 */
+	TArray<FAssetData> PresetAssets;
+	AssetRegistry.GetAssetsByClass(
+		UPEPItemPreset::StaticClass()->GetClassPathName(), PresetAssets, /*bSearchSubClasses=*/true);
+	for (const FAssetData& AssetData : PresetAssets)
+	{
+		const UPEPItemDefinition* CandidateRoot = nullptr;
+		FString RootDefinitionTag;
+		if (AssetData.GetTagValue(GET_MEMBER_NAME_CHECKED(UPEPItemPreset, RootDefinition), RootDefinitionTag))
+		{
+			const FSoftObjectPath RootPath(FPackageName::ExportTextPathToObjectPath(RootDefinitionTag));
+			CandidateRoot = RootPath.IsValid() ? Cast<UPEPItemDefinition>(RootPath.TryLoad()) : nullptr;
+		}
+		else if (const UPEPItemPreset* CandidatePreset = Cast<UPEPItemPreset>(AssetData.GetAsset()))
+		{
+			/* Saved before the tag existed: the only way to know what it builds is to look. */
+			CandidateRoot = CandidatePreset->RootDefinition;
+		}
+
+		if (!CandidateRoot
+			|| !UPEPItemContainerRulesLibrary::CanPlaceItemInSlot(
+				RootDefinition, SlotName, CandidateRoot, Unused))
+		{
+			continue;
+		}
+
+		bAnyEntry = true;
+		SubMenuBuilder.AddMenuEntry(
+			FText::FromString(FString::Printf(TEXT("[Preset] %s"), *AssetData.AssetName.ToString())),
+			FText::GetEmpty(),
+			FSlateIcon(),
+			FUIAction(FExecuteAction::CreateSP(
+				this,
+				&FPEPItemPresetCustomization::AddChildEntry,
+				SlotName,
+				AssetData.GetSoftObjectPath(),
+				FSoftObjectPath())));
+	}
+
+	/* No registry tag carries an item's owned tags, so a definition must be resident to be judged. */
+	TArray<FAssetData> ItemAssets;
+	AssetRegistry.GetAssetsByClass(
+		UPEPItemDefinition::StaticClass()->GetClassPathName(), ItemAssets, /*bSearchSubClasses=*/true);
+	for (const FAssetData& AssetData : ItemAssets)
+	{
+		const UPEPItemDefinition* CandidateItem = Cast<UPEPItemDefinition>(AssetData.GetAsset());
+		if (!CandidateItem
+			|| !UPEPItemContainerRulesLibrary::CanPlaceItemInSlot(
+				RootDefinition, SlotName, CandidateItem, Unused))
+		{
+			continue;
+		}
+
+		bAnyEntry = true;
+		SubMenuBuilder.AddMenuEntry(
+			FText::FromString(FString::Printf(TEXT("[Item] %s"), *AssetData.AssetName.ToString())),
+			FText::GetEmpty(),
+			FSlateIcon(),
+			FUIAction(FExecuteAction::CreateSP(
+				this,
+				&FPEPItemPresetCustomization::AddChildEntry,
+				SlotName,
+				FSoftObjectPath(),
+				AssetData.GetSoftObjectPath())));
+	}
+
+	if (!bAnyEntry)
+	{
+		SubMenuBuilder.AddMenuEntry(
+			LOCTEXT("NoCandidates", "Nothing matches this slot's tag rules"),
+			FText::GetEmpty(),
+			FSlateIcon(),
+			FUIAction());
+	}
+}
+
 void FPEPItemPresetCustomization::AddChildEntry(
 	const FName SlotName,
-	UPEPItemPreset* PresetSource,
-	UPEPItemDefinition* ItemSource)
+	const FSoftObjectPath PresetSource,
+	const FSoftObjectPath ItemSource)
 {
 	if (!ChildrenHandle.IsValid())
 	{
@@ -225,6 +295,17 @@ void FPEPItemPresetCustomization::AddChildEntry(
 	{
 		return;
 	}
+
+	/* Loaded now that it has been picked; a source that fails to load adds nothing. */
+	UObject* PresetObject = PresetSource.IsValid() ? PresetSource.TryLoad() : nullptr;
+	UObject* ItemObject = ItemSource.IsValid() ? ItemSource.TryLoad() : nullptr;
+	if (!Cast<UPEPItemPreset>(PresetObject) && !Cast<UPEPItemDefinition>(ItemObject))
+	{
+		return;
+	}
+
+	/* One undo step for the new element and every field set on it, not one per handle write. */
+	const FScopedTransaction Transaction(LOCTEXT("AddPresetChild", "Add Preset Child"));
 
 	uint32 NumElements = 0;
 	ArrayHandle->GetNumElements(NumElements);
@@ -247,13 +328,13 @@ void FPEPItemPresetCustomization::AddChildEntry(
 	{
 		SlotHandle->SetValue(SlotName);
 	}
-	if (PresetHandle.IsValid() && PresetSource)
+	if (PresetHandle.IsValid() && Cast<UPEPItemPreset>(PresetObject))
 	{
-		PresetHandle->SetValue(static_cast<UObject*>(PresetSource));
+		PresetHandle->SetValue(PresetObject);
 	}
-	if (ItemHandle.IsValid() && ItemSource)
+	if (ItemHandle.IsValid() && Cast<UPEPItemDefinition>(ItemObject))
 	{
-		ItemHandle->SetValue(static_cast<UObject*>(ItemSource));
+		ItemHandle->SetValue(ItemObject);
 	}
 
 	if (PropertyUtilities.IsValid())

@@ -21,12 +21,14 @@ bool APEPItemWorldSpawner::StoreAuthorityTree(const FPEPItemInstanceTree& Tree)
 	APEPItemWorldActor* Item = GetWorld()->SpawnActorDeferred<APEPItemWorldActor>(
 		ActorClass, Transform, nullptr, nullptr, ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
 	if (!Item) return false;
-	if (!Item->SetItemTree(Tree))
+	/* Only ever reached from SetItemTree or a preset build, both of which validated this tree. */
+	if (!Item->ApplyValidatedItemTree(Tree))
 	{
 		Item->Destroy();
 		return false;
 	}
 	Item->FinishSpawning(Transform);
+	/* The caller sees this and stops: nothing is presented or replicated from a spawner on its way out. */
 	Destroy();
 	return true;
 }

@@ -7,6 +7,7 @@
 #include "Inventory/PEPInventorySettings.h"
 #include "Item/Fragments/PEPItemFragment_InventoryShape.h"
 #include "Item/PEPItemStateFragment.h"
+#include "Misc/ScopeExit.h"
 
 #if WITH_EDITOR
 #include "Misc/DataValidation.h"
@@ -27,6 +28,15 @@ namespace PEPItemPresetPrivate
 		FPEPItemInstance& Item,
 		FText& OutError)
 	{
+		/*
+		 * Nothing to apply leaves the item exactly as CreateItemInstance built and validated it;
+		 * validating it again here, and once more with the whole tree, bought nothing.
+		 */
+		if (Preset.StateOverrides.IsEmpty())
+		{
+			return true;
+		}
+
 		TSet<const UScriptStruct*> SeenOverrides;
 		for (const FInstancedStruct& Override : Preset.StateOverrides)
 		{
@@ -118,6 +128,12 @@ namespace PEPItemPresetPrivate
 		}
 
 		ActivePresets.Add(&Preset);
+		/* Leaves the active set on every return below, success or failure. */
+		ON_SCOPE_EXIT
+		{
+			ActivePresets.Remove(&Preset);
+		};
+
 		FPEPItemInstance Item;
 		bool bCreated = false;
 		if (bEditorPreview)
@@ -133,14 +149,12 @@ namespace PEPItemPresetPrivate
 		}
 		if (!bCreated)
 		{
-			ActivePresets.Remove(&Preset);
 			return Fail(OutError, FString::Printf(
 				TEXT("Preset '%s' could not create its root item on the authority."),
 				*Preset.GetName()));
 		}
 		if (!ApplyStateOverrides(Preset, Item, OutError))
 		{
-			ActivePresets.Remove(&Preset);
 			return false;
 		}
 
@@ -164,7 +178,6 @@ namespace PEPItemPresetPrivate
 			Preset.RootDefinition->GetDefinitionFragment<FPEPItemFragment_Container>();
 		if (!Preset.Children.IsEmpty() && !Container)
 		{
-			ActivePresets.Remove(&Preset);
 			return Fail(OutError, FString::Printf(
 				TEXT("Preset '%s' has children, but its definition is not a container."),
 				*Preset.GetName()));
@@ -178,7 +191,6 @@ namespace PEPItemPresetPrivate
 			const bool bHasDirectItemChild = Child.ItemDefinition != nullptr;
 			if (bHasPresetChild == bHasDirectItemChild || Child.ContainerSlotName.IsNone())
 			{
-				ActivePresets.Remove(&Preset);
 				return Fail(OutError, FString::Printf(
 					TEXT("Preset '%s' has a child that must specify exactly one source (a preset or a direct item) and a slot name."),
 					*Preset.GetName()));
@@ -186,7 +198,6 @@ namespace PEPItemPresetPrivate
 
 			if (bHasPresetChild && !Child.Preset->RootDefinition)
 			{
-				ActivePresets.Remove(&Preset);
 				return Fail(OutError, FString::Printf(
 					TEXT("Preset '%s' has a child preset with no root definition."),
 					*Preset.GetName()));
@@ -197,7 +208,6 @@ namespace PEPItemPresetPrivate
 				: nullptr;
 			if (!Slot || !Slot->IsValid())
 			{
-				ActivePresets.Remove(&Preset);
 				return Fail(OutError, FString::Printf(
 					TEXT("Preset '%s' targets missing or invalid slot '%s'."),
 					*Preset.GetName(),
@@ -211,7 +221,6 @@ namespace PEPItemPresetPrivate
 					Container->BlockedContainedItemTags)
 				|| !MatchesTags(ChildDefinition, Slot->RequiredItemTags, Slot->BlockedItemTags))
 			{
-				ActivePresets.Remove(&Preset);
 				return Fail(OutError, FString::Printf(
 					TEXT("Preset '%s' has a child rejected by slot '%s' tag rules."),
 					*Preset.GetName(),
@@ -224,7 +233,6 @@ namespace PEPItemPresetPrivate
 			{
 				if (OccupiedSingleSlots.Contains(Child.ContainerSlotName))
 				{
-					ActivePresets.Remove(&Preset);
 					return Fail(OutError, FString::Printf(
 						TEXT("Preset '%s' places more than one child in single slot '%s'."),
 						*Preset.GetName(),
@@ -236,15 +244,21 @@ namespace PEPItemPresetPrivate
 			{
 				FIntPoint ChildSize;
 				bool bChildCanRotate = false;
-				PEPInventorySettings().GetEffectiveInventoryShape(
+				if (!PEPInventorySettings().GetEffectiveInventoryShape(
 					ChildDefinition.GetDefinitionFragment<FPEPItemFragment_InventoryShape>(),
 					ChildSize,
-					bChildCanRotate);
+					bChildCanRotate))
+				{
+					return Fail(OutError, FString::Printf(
+						TEXT("Preset '%s' places '%s' in grid slot '%s', but its inventory shape has no positive size."),
+						*Preset.GetName(),
+						*ChildDefinition.GetName(),
+						*Child.ContainerSlotName.ToString()));
+				}
 				if (Child.bRotated)
 				{
 					if (!Slot->bAllowRotation || !bChildCanRotate)
 					{
-						ActivePresets.Remove(&Preset);
 						return Fail(OutError, FString::Printf(
 							TEXT("Preset '%s' rotates a child that slot '%s' does not allow to rotate."),
 							*Preset.GetName(),
@@ -255,19 +269,26 @@ namespace PEPItemPresetPrivate
 
 				EffectivePosition = Child.GridPosition;
 				bEffectiveRotation = Child.bRotated;
-				const FIntRect ChildRect(EffectivePosition, EffectivePosition + ChildSize);
+
+				/*
+				 * Compared by subtraction: Position + Size wraps for an authored position near
+				 * INT32_MAX and would land inside the grid. Both sizes are positive here, so the
+				 * differences cannot overflow, and once inside, the sum below cannot either.
+				 */
 				if (EffectivePosition.X < 0
 					|| EffectivePosition.Y < 0
-					|| ChildRect.Max.X > Slot->GridSize.X
-					|| ChildRect.Max.Y > Slot->GridSize.Y)
+					|| ChildSize.X > Slot->GridSize.X
+					|| ChildSize.Y > Slot->GridSize.Y
+					|| EffectivePosition.X > Slot->GridSize.X - ChildSize.X
+					|| EffectivePosition.Y > Slot->GridSize.Y - ChildSize.Y)
 				{
-					ActivePresets.Remove(&Preset);
 					return Fail(OutError, FString::Printf(
 						TEXT("Preset '%s' places a child outside grid slot '%s'."),
 						*Preset.GetName(),
 						*Child.ContainerSlotName.ToString()));
 				}
 
+				const FIntRect ChildRect(EffectivePosition, EffectivePosition + ChildSize);
 				TArray<FIntRect>& Rects = OccupiedGridRects.FindOrAdd(Child.ContainerSlotName);
 				if (Rects.ContainsByPredicate(
 					[&ChildRect](const FIntRect& Existing)
@@ -275,7 +296,6 @@ namespace PEPItemPresetPrivate
 						return RectsOverlap(Existing, ChildRect);
 					}))
 				{
-					ActivePresets.Remove(&Preset);
 					return Fail(OutError, FString::Printf(
 						TEXT("Preset '%s' has overlapping children in grid slot '%s'."),
 						*Preset.GetName(),
@@ -298,7 +318,6 @@ namespace PEPItemPresetPrivate
 					ActivePresets,
 					OutError))
 				{
-					ActivePresets.Remove(&Preset);
 					return false;
 				}
 			}
@@ -321,7 +340,6 @@ namespace PEPItemPresetPrivate
 				if (!bChildCreated)
 				{
 					OutTree.Children.Pop();
-					ActivePresets.Remove(&Preset);
 					return Fail(OutError, FString::Printf(
 						TEXT("Preset '%s' could not create child item '%s' on the authority."),
 						*Preset.GetName(),
@@ -335,7 +353,6 @@ namespace PEPItemPresetPrivate
 			}
 		}
 
-		ActivePresets.Remove(&Preset);
 		return true;
 	}
 }

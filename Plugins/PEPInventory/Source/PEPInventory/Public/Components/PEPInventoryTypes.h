@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Core/PEPTypes.h"
-#include "Engine/AssetManagerTypes.h"
+#include "UObject/PrimaryAssetId.h"
 #include "Item/PEPItemPresetTypes.h"
 #include "Item/PEPItemStore.h"
 
@@ -68,25 +68,4 @@ struct PEPINVENTORY_API FPEPInventoryPruneReport
 	{
 		return RemovedItemIds.IsEmpty();
 	}
-};
-
-/**
- * One stack a pickup would top up, and what that stack would hold afterwards.
- *
- * Planned before anything is written, so that deciding whether a pickup fits and performing it are
- * the same computation. Deciding with one and committing with another is how a full inventory came
- * to refuse ammunition it would in fact have absorbed.
- *
- * Plain C++ with no reflection: none of this reaches the wire or an editor, and it never outlives
- * the call that built it.
- */
-struct FPEPInventoryStackMerge
-{
-	/** Named rather than indexed: the plan outlives the lookup, and an index would not survive it. */
-	FPEPItemId TargetItemId;
-
-	FPEPItemInstance MergedItem;
-
-	/** Where the topped-up stack sits, which is what its StateChanged has to report. */
-	FPEPItemLocation Location;
 };

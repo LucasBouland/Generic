@@ -22,9 +22,16 @@ Le point d’entrée joueur reste `RequestInteractWithInteractionTag(Interaction
 
 Une couche Canvas héberge la fenêtre. Échap ferme la fenêtre et demande la fermeture de session. Le ramassage de la racine invalide les sessions des autres joueurs. Le contenu privé du composant au sol n’est pas répliqué ; chaque joueur ne reçoit que sa vue autorisée. Les modifications d’attachments actualisent la présentation publique.
 
+## Options et ramassage
+
+- `UPEPPickupSettings` (PEP Pickup) décide du ramassage : `bDefaultCanPickup`, `RequiredPickupTags` et `BlockedPickupTags`, appliqués par `CanPickupDefinition`. `APEPPickupItemActor` et `APEPPickupContainerActor` n’offrent Pickup que lorsque cette politique l’accepte et le refusent dans `CanInteract` (`Reason.BlockedByState`) sinon. Une entrée Pickup dans la table d’options par tag est ignorée.
+- Les options par tag (`DefaultInteractionOptionsByItemTag`) sont mises en cache par définition. Le cache est vidé quand les réglages sont modifiés ou rechargés et, dans l’éditeur, quand une définition d’item est modifiée. Après une modification à l’exécution, appeler `InvalidateInteractionOptionCache`.
+- Après un ramassage réussi, les deux acteurs appellent `HandlePickedUp` (BlueprintNativeEvent) sur l’autorité ; l’implémentation par défaut détruit l’acteur.
+- `APEPPickupContainerActor::ExecuteInteraction` revalide par l’interface (`Execute_CanInteract`), donc une surcharge Blueprint de `CanInteract` est respectée.
+
 ## Migration et vérification
 
-`Tools/migrate_world_item_storage.py` est une migration explicite des Blueprints du projet, déjà appliquée. L’outil éditeur PEPPickupEditor adapte leurs lectures aux contextes et relie le rafraîchissement de session. Il ne modifie aucun asset automatiquement au chargement.
+`Tools/migrate_world_item_storage.py` est une migration explicite des Blueprints du projet, déjà appliquée. L’outil éditeur PEPPickupEditor adapte leurs lectures aux contextes et relie le rafraîchissement de session. Il ne modifie aucun asset automatiquement au chargement. `MigrateWidget` vérifie d’abord tout ce dont il a besoin et refuse sans rien modifier un graphe qu’il ne sait pas migrer ; ses modifications forment une seule transaction annulable.
 
 Tests automatisés : `PEP.Items.WorldActor`, `PEP.Inventory`, `PEP.Pickup`. Le test `PEP.Pickup.WorldStorage.OpenTransferAndDrop` couvre les deux stockages, les containers vides/verrouillés, deux sessions simultanées, les modifications d’attachments et les drops refusés sans perte.
 
