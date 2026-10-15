@@ -1,0 +1,16 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "PEPCamera",
+	"Description": "Reusable first-person, third-person and strategy (RTS / top-down) camera modes with blending for PEP projects.",
+	"Category": "PEP",
+	"CanContainContent": false,
+	"Installed": false,
+	"Plugins": [
+		{ "Name": "EnhancedInput", "Enabled": true }
+	],
+	"Modules": [
+		{ "Name": "PEPCamera", "Type": "Runtime", "LoadingPhase": "Default" }
+	]
+}
