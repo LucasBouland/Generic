@@ -12,6 +12,7 @@ class UInputAction;
 class UInputMappingContext;
 class UUserWidget;
 class UEnhancedInputLocalPlayerSubsystem;
+class UEnhancedPlayerInput;
 class IPEPPlayerHUDContract;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPEPMenuCommand, UInputAction*, Action);
@@ -65,14 +66,21 @@ public:
 	virtual FOnPEPPlayerInputStateChanged& GetOnPlayerInputStateChanged() override { return OnPlayerInputStateChanged; }
 
 	/**
-	 * Matches a key press against the menu shortcuts while the menu is open, reading the live Enhanced Input mappings
-	 * (active contexts, player remaps). Only Boolean press mappings qualify: no trigger, Down or Pressed, plus chords on
-	 * modifier keys (Shift/Ctrl/Alt/Cmd). Ctrl, Alt or Cmd held without a chord requiring them suppresses the mapping.
-	 * OutAction is set only for Matched.
+	 * Matches a key press against the menu shortcuts while the menu is open, through a key table built lazily from the
+	 * live Enhanced Input mappings (active contexts, player remaps). Only Boolean press mappings qualify: no trigger, Down
+	 * or Pressed, plus chords on modifier keys (Shift/Ctrl/Alt/Cmd). Ctrl, Alt or Cmd held without a chord requiring them
+	 * suppresses the mapping. OutAction is set only for Matched.
 	 */
 	EPEPMenuShortcutMatch ResolveMenuShortcut(const FKey& Key, const FModifierKeysState& ModifierKeys, UInputAction*& OutAction) const;
 	/** Focused UMG shortcut bridge: dispatches a matched action (not on repeats). True when matched; the caller consumes the key. */
 	bool RouteMenuShortcut(const FKey& Key, bool bRepeat, const FModifierKeysState& ModifierKeys);
+	/**
+	 * Drops the menu shortcut key table; the next lookup rebuilds it from the live mappings. Enhanced Input mapping
+	 * rebuilds (contexts, player remaps), menu transitions and Pawn changes already do this. Call it after changing what
+	 * the table reads without an Enhanced Input rebuild: action-level triggers, or remaps applied by a custom system.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Input")
+	void InvalidateMenuShortcutCache();
 
 	UPROPERTY(BlueprintAssignable, Category="PEP|UI")
 	FOnPEPPlayerInputStateChanged OnPlayerInputStateChanged;
@@ -118,9 +126,39 @@ protected:
 	TArray<TObjectPtr<UInputAction>> MenuCommandActions;
 
 private:
+	/** One bridged mapping of a key, flattened from the live mappings when the shortcut table is built. */
+	struct FMenuShortcutCandidate
+	{
+		TWeakObjectPtr<UInputAction> Action;
+		/** FindMenuShortcutAction precedence. */
+		int32 Rank = INDEX_NONE;
+		/** Chords on the mapping and its action: the most specific chord wins. */
+		int32 ChordCount = 0;
+		/** Modifier groups of those chords; holding them does not suppress the mapping. */
+		int32 RequiredModifiers = 0;
+		/** Bit N is set when the held modifier groups N pass every chord and chord blocker of the mapping. */
+		int32 AcceptedModifierStates = 0;
+	};
+	/** Key to bridged mappings, plus what it was built from: a different player input or mappings array means it is stale. */
+	struct FMenuShortcutTable
+	{
+		TMap<FKey, TArray<FMenuShortcutCandidate, TInlineAllocator<2>>> Candidates;
+		TWeakObjectPtr<UEnhancedPlayerInput> SourceInput;
+		/** Identity of the mappings array only, never dereferenced. */
+		const void* SourceMappingsData = nullptr;
+		int32 SourceMappingsNum = 0;
+		bool bValid = false;
+	};
+
 	UEnhancedInputLocalPlayerSubsystem* GetInputSubsystem() const;
 	/** Routed action matching Action and its precedence (Close, Toggle, Open, then MenuCommandActions order). */
 	UInputAction* FindMenuShortcutAction(const UInputAction* Action, int32& OutRank) const;
+	/** Rebuilds the shortcut table from the live mappings when it was invalidated or no longer matches them. */
+	void UpdateMenuShortcutTable(const UEnhancedInputLocalPlayerSubsystem* Subsystem, UEnhancedPlayerInput& EnhancedInput) const;
+	/** Moves the control mappings rebuild subscription to Subsystem (null unsubscribes). */
+	void WatchControlMappingsRebuilt(UEnhancedInputLocalPlayerSubsystem* Subsystem);
+	UFUNCTION()
+	void HandleControlMappingsRebuilt();
 	void HandleMenuAction(UInputAction* Action);
 	void HandleMenuCommand(UInputAction* Action);
 	void CancelPlayerDragDrop();
@@ -136,6 +174,10 @@ private:
 	EPEPPlayerInputState InputState = EPEPPlayerInputState::Gameplay;
 	TWeakObjectPtr<APawn> ObservedPawn;
 	TWeakObjectPtr<APawn> MenuPawn;
+	/** Built on the first lookup after invalidation, never eagerly: the menu context is added with a deferred rebuild. */
+	mutable FMenuShortcutTable MenuShortcutTable;
+	/** Subsystem whose control mappings rebuilds invalidate the table; the table is only trusted for this subsystem. */
+	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> WatchedInputSubsystem;
 	bool bMenuInputBlocksApplied = false;
 	bool bTransitionInProgress = false;
 	bool bMenuContextAdded = false;

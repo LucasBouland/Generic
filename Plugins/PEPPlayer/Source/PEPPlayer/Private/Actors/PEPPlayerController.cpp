@@ -29,6 +29,9 @@ namespace
 	constexpr int32 ShortcutCommand = 1 << 3;
 	/** Held modifiers that reject a shortcut unless one of its chords requires them. Shift alone is tolerated. */
 	constexpr int32 ShortcutExclusiveModifiers = ShortcutControl | ShortcutAlt | ShortcutCommand;
+	/** Combinations of held modifier groups. Bit N of a state mask stands for the held groups N. */
+	constexpr int32 ShortcutModifierStateCount = 1 << 4;
+	constexpr int32 ShortcutAllModifierStates = (1 << ShortcutModifierStateCount) - 1;
 
 	int32 GetShortcutModifier(const FKey& Key)
 	{
@@ -78,13 +81,28 @@ namespace
 		return Modifiers;
 	}
 
+	/** State mask of the held modifier combinations that include at least one group of Modifiers. */
+	int32 GetModifierStatesHolding(const int32 Modifiers)
+	{
+		int32 States = 0;
+		for (int32 HeldModifiers = 0; HeldModifiers < ShortcutModifierStateCount; ++HeldModifiers)
+		{
+			if ((HeldModifiers & Modifiers) != 0)
+			{
+				States |= 1 << HeldModifiers;
+			}
+		}
+		return States;
+	}
+
 	/**
-	 * Evaluates one trigger list (action-level or mapping-level) as a single key press. Returns false for triggers the
-	 * bridge cannot honor (Hold, Tap, Released, Pulse, combos, custom triggers): those mappings stay on the normal
-	 * Enhanced Input path. Chords on modifier keys must be held; injected chord blockers reject while their chord is held.
+	 * Evaluates one trigger list (action-level or mapping-level) as a single key press, for every held modifier
+	 * combination at once. Returns false for triggers the bridge cannot honor (Hold, Tap, Released, Pulse, combos, custom
+	 * triggers): those mappings stay on the normal Enhanced Input path. Chords on modifier keys must be held; injected
+	 * chord blockers reject while their chord is held. InOutAcceptedStates keeps the combinations passing both.
 	 */
 	bool EvaluateShortcutTriggers(const TArray<TObjectPtr<UInputTrigger>>& Triggers,
-		const TConstArrayView<FEnhancedActionKeyMapping> Mappings, const int32 HeldModifiers,
+		const TConstArrayView<FEnhancedActionKeyMapping> Mappings, int32& InOutAcceptedStates,
 		int32& InOutRequiredModifiers, int32& InOutChordCount)
 	{
 		for (const TObjectPtr<UInputTrigger>& TriggerPtr : Triggers)
@@ -97,19 +115,14 @@ namespace
 			if (const UInputTriggerChordAction* Chord = Cast<UInputTriggerChordAction>(Trigger))
 			{
 				const int32 ChordModifiers = GetChordModifiers(Chord->ChordAction.Get(), Mappings);
+				const int32 ChordHeldStates = GetModifierStatesHolding(ChordModifiers);
 				if (Trigger->IsA<UInputTriggerChordBlocker>())
 				{
-					if ((ChordModifiers & HeldModifiers) != 0)
-					{
-						return false;
-					}
+					InOutAcceptedStates &= ~ChordHeldStates;
 				}
 				else
 				{
-					if ((ChordModifiers & HeldModifiers) == 0)
-					{
-						return false;
-					}
+					InOutAcceptedStates &= ChordHeldStates;
 					InOutRequiredModifiers |= ChordModifiers;
 					++InOutChordCount;
 				}
@@ -178,6 +191,7 @@ void APEPPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	RestoreContexts(false);
 	ReleaseMenuInputBlocks();
+	WatchControlMappingsRebuilt(nullptr);
 	if (IPEPPlayerHUDContract* HUD = GetPlayerHUDContract())
 	{
 		HUD->NotifyControlledPawnChanged(ObservedPawn.Get(), nullptr);
@@ -220,6 +234,7 @@ void APEPPlayerController::SynchronizePawn()
 	{
 		return;
 	}
+	InvalidateMenuShortcutCache();
 	APawn* PreviousPawn = ObservedPawn.Get();
 	ObservedPawn = GetPawn();
 	if (IPEPPlayerHUDContract* HUD = GetPlayerHUDContract())
@@ -359,44 +374,36 @@ EPEPMenuShortcutMatch APEPPlayerController::ResolveMenuShortcut(const FKey& Key,
 	{
 		return EPEPMenuShortcutMatch::None;
 	}
-	// One allocation-free pass over the live mappings: the deferred menu context rebuild and player remaps are always
-	// reflected, so no cached key table can go stale.
-	const TConstArrayView<FEnhancedActionKeyMapping> Mappings = EnhancedInput->GetEnhancedActionMappingsView();
+	UpdateMenuShortcutTable(Subsystem, *EnhancedInput);
+	const TArray<FMenuShortcutCandidate, TInlineAllocator<2>>* KeyCandidates = MenuShortcutTable.Candidates.Find(Key);
+	if (!KeyCandidates)
+	{
+		return EPEPMenuShortcutMatch::None;
+	}
 	// A modifier key pressed on its own is the shortcut, not a modifier of it.
 	const int32 HeldModifiers = GetHeldShortcutModifiers(ModifierKeys) & ~GetShortcutModifier(Key);
+	const int32 HeldState = 1 << HeldModifiers;
 	bool bSuppressed = false;
 	int32 BestChordCount = INDEX_NONE;
 	int32 BestRank = MAX_int32;
-	for (const FEnhancedActionKeyMapping& Mapping : Mappings)
+	for (const FMenuShortcutCandidate& Candidate : *KeyCandidates)
 	{
-		if (Mapping.Key != Key)
+		UInputAction* Action = Candidate.Action.Get();
+		if (!Action || (Candidate.AcceptedModifierStates & HeldState) == 0)
 		{
 			continue;
 		}
-		int32 Rank = INDEX_NONE;
-		UInputAction* Action = FindMenuShortcutAction(Mapping.Action.Get(), Rank);
-		if (!Action)
-		{
-			continue;
-		}
-		int32 RequiredModifiers = 0;
-		int32 ChordCount = 0;
-		if (!EvaluateShortcutTriggers(Action->Triggers, Mappings, HeldModifiers, RequiredModifiers, ChordCount)
-			|| !EvaluateShortcutTriggers(Mapping.Triggers, Mappings, HeldModifiers, RequiredModifiers, ChordCount))
-		{
-			continue;
-		}
-		if ((HeldModifiers & ~RequiredModifiers & ShortcutExclusiveModifiers) != 0)
+		if ((HeldModifiers & ~Candidate.RequiredModifiers & ShortcutExclusiveModifiers) != 0)
 		{
 			bSuppressed = true;
 			continue;
 		}
 		// The most specific chord wins (Shift+Tab over Tab), then the configured precedence.
-		if (ChordCount > BestChordCount || (ChordCount == BestChordCount && Rank < BestRank))
+		if (Candidate.ChordCount > BestChordCount || (Candidate.ChordCount == BestChordCount && Candidate.Rank < BestRank))
 		{
 			OutAction = Action;
-			BestChordCount = ChordCount;
-			BestRank = Rank;
+			BestChordCount = Candidate.ChordCount;
+			BestRank = Candidate.Rank;
 		}
 	}
 	if (OutAction)
@@ -404,6 +411,81 @@ EPEPMenuShortcutMatch APEPPlayerController::ResolveMenuShortcut(const FKey& Key,
 		return EPEPMenuShortcutMatch::Matched;
 	}
 	return bSuppressed ? EPEPMenuShortcutMatch::Suppressed : EPEPMenuShortcutMatch::None;
+}
+
+void APEPPlayerController::UpdateMenuShortcutTable(const UEnhancedInputLocalPlayerSubsystem* Subsystem,
+	UEnhancedPlayerInput& EnhancedInput) const
+{
+	const TConstArrayView<FEnhancedActionKeyMapping> Mappings = EnhancedInput.GetEnhancedActionMappingsView();
+	FMenuShortcutTable& ShortcutTable = MenuShortcutTable;
+	// Rebuilds of this subsystem invalidate the table through its delegate. As a safety net, another player input or a
+	// resized/reallocated mappings array also means it is stale; an unwatched subsystem is never trusted.
+	if (ShortcutTable.bValid && WatchedInputSubsystem.Get() == Subsystem && ShortcutTable.SourceInput.Get() == &EnhancedInput
+		&& ShortcutTable.SourceMappingsData == Mappings.GetData() && ShortcutTable.SourceMappingsNum == Mappings.Num())
+	{
+		return;
+	}
+	ShortcutTable.Candidates.Reset();
+	for (const FEnhancedActionKeyMapping& Mapping : Mappings)
+	{
+		int32 Rank = INDEX_NONE;
+		UInputAction* Action = FindMenuShortcutAction(Mapping.Action.Get(), Rank);
+		if (!Action)
+		{
+			continue;
+		}
+		// Trigger eligibility does not depend on the key event; chords and blockers are resolved for every combination of
+		// held modifier groups, so a key press only tests one bit per candidate.
+		int32 AcceptedStates = ShortcutAllModifierStates;
+		int32 RequiredModifiers = 0;
+		int32 ChordCount = 0;
+		if (!EvaluateShortcutTriggers(Action->Triggers, Mappings, AcceptedStates, RequiredModifiers, ChordCount)
+			|| !EvaluateShortcutTriggers(Mapping.Triggers, Mappings, AcceptedStates, RequiredModifiers, ChordCount)
+			|| AcceptedStates == 0)
+		{
+			continue;
+		}
+		FMenuShortcutCandidate& Candidate = ShortcutTable.Candidates.FindOrAdd(Mapping.Key).AddDefaulted_GetRef();
+		Candidate.Action = Action;
+		Candidate.Rank = Rank;
+		Candidate.ChordCount = ChordCount;
+		Candidate.RequiredModifiers = RequiredModifiers;
+		Candidate.AcceptedModifierStates = AcceptedStates;
+	}
+	ShortcutTable.SourceInput = &EnhancedInput;
+	ShortcutTable.SourceMappingsData = Mappings.GetData();
+	ShortcutTable.SourceMappingsNum = Mappings.Num();
+	ShortcutTable.bValid = true;
+}
+
+void APEPPlayerController::InvalidateMenuShortcutCache()
+{
+	MenuShortcutTable.bValid = false;
+}
+
+void APEPPlayerController::WatchControlMappingsRebuilt(UEnhancedInputLocalPlayerSubsystem* Subsystem)
+{
+	// Engine API: broadcast at the end of a frame in which this player's control mappings were rebuilt (context
+	// changes, player remaps). This function is the only place naming it.
+	UEnhancedInputLocalPlayerSubsystem* WatchedSubsystem = WatchedInputSubsystem.Get();
+	if (WatchedSubsystem && WatchedSubsystem != Subsystem)
+	{
+		WatchedSubsystem->ControlMappingsRebuiltDelegate.RemoveDynamic(this, &ThisClass::HandleControlMappingsRebuilt);
+	}
+	if (Subsystem)
+	{
+		Subsystem->ControlMappingsRebuiltDelegate.AddUniqueDynamic(this, &ThisClass::HandleControlMappingsRebuilt);
+	}
+	if (WatchedSubsystem != Subsystem)
+	{
+		WatchedInputSubsystem = Subsystem;
+		InvalidateMenuShortcutCache();
+	}
+}
+
+void APEPPlayerController::HandleControlMappingsRebuilt()
+{
+	InvalidateMenuShortcutCache();
 }
 
 bool APEPPlayerController::RouteMenuShortcut(const FKey& Key, const bool bRepeat, const FModifierKeysState& ModifierKeys)
@@ -440,6 +522,8 @@ bool APEPPlayerController::OpenMenu()
 	{
 		TGuardValue<bool> Guard(bTransitionInProgress, true);
 		UEnhancedInputLocalPlayerSubsystem* Subsystem = GetInputSubsystem();
+		// Shortcut lookups only run while the menu is open: subscribing here covers every lookup.
+		WatchControlMappingsRebuilt(Subsystem);
 		InputState = EPEPPlayerInputState::Menu;
 		MenuPawn = GetPawn();
 		FModifyContextOptions Options;
@@ -458,6 +542,8 @@ bool APEPPlayerController::OpenMenu()
 		{
 			Subsystem->AddMappingContext(MenuMappingContext, MenuMappingPriority, Options);
 		}
+		// The deferred rebuild has not run yet: the next lookup builds the table, never this function.
+		InvalidateMenuShortcutCache();
 		SetIgnoreMoveInput(true);
 		SetIgnoreLookInput(true);
 		bMenuInputBlocksApplied = true;
@@ -502,6 +588,7 @@ void APEPPlayerController::RestoreContexts(const bool bRestoreGameplay)
 	}
 	SuspendedContexts.Reset();
 	bMenuContextAdded = false;
+	InvalidateMenuShortcutCache();
 }
 
 void APEPPlayerController::CloseMenu()
