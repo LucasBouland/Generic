@@ -24,7 +24,12 @@ public:
 	void OnControlledPawnChanged(APawn* PreviousPawn, APawn* NewPawn);
 
 protected:
+	/** Routes menu shortcuts before focused children, unless the event's Slate user is typing in an editable text. */
 	virtual FReply NativeOnPreviewKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
+	/** Keys a focused editable text leaves unhandled: non-typing keys route, typing keys mapped to shortcuts are swallowed. */
+	virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
+	/** True when the event's Slate user focuses an SEditableText or SMultiLineEditableText (text, search and spin boxes). */
+	virtual bool IsTextEntryFocused(const FKeyEvent& InKeyEvent) const;
 
 	UPROPERTY(BlueprintReadOnly, meta=(BindWidget), Category="PEP|UI")
 	TObjectPtr<UWidgetSwitcher> HUDSwitcher;

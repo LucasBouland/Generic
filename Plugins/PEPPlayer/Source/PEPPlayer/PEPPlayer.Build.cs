@@ -18,5 +18,7 @@ public class PEPPlayer : ModuleRules
 			"InputCore",
 			"UMG"
 		});
+
+		PrivateDependencyModuleNames.AddRange(new[] { "ApplicationCore", "Slate", "SlateCore" });
 	}
 }

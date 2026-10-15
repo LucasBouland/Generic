@@ -10,7 +10,7 @@ struct PEPUTILITY_API FPEPTaggedMagnitude
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Data", meta=(Categories="Attribute,SetByCaller"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Data")
 	FGameplayTag Tag;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="PEP|Data")

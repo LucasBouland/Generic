@@ -1,121 +1,51 @@
 #include "Core/PEPReasonTextLibrary.h"
+
 #include "Core/PEPCoreTags.h"
+#include "Core/PEPReasonTextRegistry.h"
 
+FText UPEPReasonTextLibrary::GetReasonText(const FGameplayTag ReasonTag)
+{
+	FPEPReasonText Text;
+	if (FPEPReasonTextRegistry::Find(ReasonTag, Text) && !Text.PlayerText.IsEmpty())
+	{
+		return Text.PlayerText;
+	}
+	return NSLOCTEXT("PEPReason", "Generic_Player", "Action failed.");
+}
 
-FText UPEPReasonTextLibrary::GetReasonText(
-	const FGameplayTag ReasonTag)
+FText UPEPReasonTextLibrary::GetDeveloperReasonText(const FGameplayTag ReasonTag)
 {
 	if (!ReasonTag.IsValid())
 	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"MissingReason",
-			"Failure reason is missing.");
+		return NSLOCTEXT("PEPReason", "MissingReason", "Failure reason is missing.");
 	}
-
-	if (ReasonTag == PEPCoreTags::Reason_None)
+	FPEPReasonText Text;
+	if (FPEPReasonTextRegistry::Find(ReasonTag, Text))
 	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"None",
-			"No error.");
+		if (!Text.DeveloperText.IsEmpty())
+		{
+			return Text.DeveloperText;
+		}
+		if (!Text.PlayerText.IsEmpty())
+		{
+			return Text.PlayerText;
+		}
 	}
-
-	if (ReasonTag ==
-		PEPCoreTags::Reason_InvalidTarget)
-	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"InvalidTarget",
-			"Invalid item or target.");
-	}
-
-	if (ReasonTag ==
-		PEPCoreTags::Reason_OutOfRange)
-	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"OutOfRange",
-			"Target is out of range.");
-	}
-
-	if (ReasonTag ==
-		PEPCoreTags::Reason_NotAuthority)
-	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"NotAuthority",
-			"Action must be executed by the authority.");
-	}
-
-	if (ReasonTag ==
-		PEPCoreTags::Reason_BlockedByState)
-	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"BlockedByState",
-			"Action is blocked by the current state.");
-	}
-
-	if (ReasonTag ==
-		PEPCoreTags::Reason_NoFreeSlot)
-	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"NoFreeSlot",
-			"No free inventory space.");
-	}
-
-	if (ReasonTag ==
-		PEPCoreTags::Reason_StateMismatch)
-	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"StateMismatch",
-			"These items differ in a way that keeps them apart.");
-	}
-
-	if (ReasonTag ==
-		PEPCoreTags::Reason_UnsupportedMode)
-	{
-		return NSLOCTEXT(
-			"PEPReason",
-			"UnsupportedMode",
-			"Unsupported operation mode.");
-	}
-
 	return FText::Format(
-		NSLOCTEXT(
-			"PEPReason",
-			"Unknown",
-			"Action failed: {0}"),
-		FText::FromName(
-			ReasonTag.GetTagName()));
+		NSLOCTEXT("PEPReason", "Unknown", "Action failed: {0}"),
+		FText::FromName(ReasonTag.GetTagName()));
 }
 
 FText UPEPReasonTextLibrary::GetSuggestedFixText(const FGameplayTag ReasonTag)
 {
-	if (ReasonTag == PEPCoreTags::Reason_NoFreeSlot)
+	if (ReasonTag == PEPCoreTags::Reason_None)
 	{
-		return NSLOCTEXT("PEPReasonFix", "NoFreeSlot", "Move or remove items, or choose a larger container.");
+		return FText::GetEmpty();
 	}
-	if (ReasonTag == PEPCoreTags::Reason_NotAuthority)
+	FPEPReasonText Text;
+	if (FPEPReasonTextRegistry::Find(ReasonTag, Text) && !Text.SuggestedFix.IsEmpty())
 	{
-		return NSLOCTEXT("PEPReasonFix", "NotAuthority",
-		                 "Submit the request through the server-authoritative request path instead of calling the authority executor directly.");
-	}
-	if (ReasonTag == PEPCoreTags::Reason_BlockedByState)
-	{
-		return NSLOCTEXT("PEPReasonFix", "BlockedByState", "Check the current state and operation preconditions.");
-	}
-	if (ReasonTag == PEPCoreTags::Reason_InvalidTarget)
-	{
-		return NSLOCTEXT("PEPReasonFix", "InvalidTarget", "Check item id, target location, and required data.");
-	}
-	if (ReasonTag == PEPCoreTags::Reason_StateMismatch)
-	{
-		return NSLOCTEXT("PEPReasonFix", "StateMismatch",
-		                 "Keep the items in separate stacks, or clear the state that differentiates them.");
+		return Text.SuggestedFix;
 	}
 	return NSLOCTEXT("PEPReasonFix", "Generic", "Inspect the validation report and operation inputs.");
 }
@@ -128,7 +58,17 @@ FPEPFailureMessage UPEPReasonTextLibrary::MakeFailureMessageFromOperationResult(
 	Message.bSuccess = Result.bSuccess;
 	Message.ReasonTag = Result.ReasonTag;
 	Message.BadField = BadField;
-	Message.Message = GetReasonText(Result.ReasonTag);
-	Message.SuggestedFix = GetSuggestedFixText(Result.ReasonTag);
+	// Successes need no reason; describe them as Reason.None rather than as a missing failure reason.
+	FGameplayTag TextTag = Result.ReasonTag;
+	if (Result.bSuccess && !TextTag.IsValid())
+	{
+		TextTag = PEPCoreTags::Reason_None;
+	}
+	Message.Message = GetReasonText(TextTag);
+	Message.DeveloperMessage = GetDeveloperReasonText(TextTag);
+	if (!Result.bSuccess)
+	{
+		Message.SuggestedFix = GetSuggestedFixText(TextTag);
+	}
 	return Message;
 }
