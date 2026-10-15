@@ -1,0 +1,10 @@
+{
+  "ue-mcp": [
+    "ue-mcp-animation",
+    "ue-mcp-blueprint",
+    "ue-mcp-epic-routing",
+    "ue-mcp-native-cpp",
+    "ue-mcp-niagara",
+    "ue-mcp-workflow"
+  ]
+}

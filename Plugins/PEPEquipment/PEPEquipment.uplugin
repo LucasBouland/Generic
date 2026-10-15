@@ -1,0 +1,38 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0",
+  "FriendlyName": "PEPEquipment",
+  "Description": "Public replicated equipment projection and local equipped-item presentation.",
+  "Category": "PEP",
+  "CanContainContent": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "PEPEquipment",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "PEPEquipmentUI",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "PEPEquipmentEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    { "Name": "PEPCore", "Enabled": true },
+    { "Name": "PEPItems", "Enabled": true },
+    { "Name": "PEPInventory", "Enabled": true, "TargetAllowList": [ "Editor" ] },
+    { "Name": "PEPCoreUI", "Enabled": true },
+    {
+      "Name": "DataValidation",
+      "Enabled": true,
+      "TargetAllowList": [ "Editor" ]
+    }
+  ]
+}

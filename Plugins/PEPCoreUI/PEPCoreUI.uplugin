@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "PEPCoreUI",
+	"Description": "Shared UI foundations for reusable PEP plugins, built on CommonUI.",
+	"Category": "PEP",
+	"CreatedBy": "Schmurf",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Plugins": [
+		{
+			"Name": "CommonUI",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "PEPCoreUI",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

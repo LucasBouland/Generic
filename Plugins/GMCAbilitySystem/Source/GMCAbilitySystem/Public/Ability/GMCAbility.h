@@ -1,0 +1,350 @@
+﻿#pragma once
+#include "GameplayTagContainer.h"
+#include "GMCAbilityData.h"
+#include "GMCAbilitySystem.h"
+#include "GameplayTaskOwnerInterface.h"
+#include "GMCAbilityComponent.h"
+#include "StructUtils/InstancedStruct.h"
+#include "Effects/GMCAbilityEffect.h"
+#include "GMCAbility.generated.h"
+
+UENUM(BlueprintType)
+enum class EAbilityState : uint8
+{
+	PreExecution,
+	Initialized,
+	Running,
+	Waiting,
+	Ended
+};
+
+
+// Forward Declarations
+class UGMC_AbilitySystemComponent;
+class UGMCAbilityTaskBase;
+class UGMC_MovementUtilityCmp;
+
+UCLASS(Blueprintable, BlueprintType)
+class GMCABILITYSYSTEM_API UGMCAbility : public UObject, public IGameplayTaskOwnerInterface
+{
+	GENERATED_BODY()
+
+public:
+	
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	virtual UWorld* GetWorld() const override;
+
+
+	//// Ability State
+	// EAbilityState. Use Getters/Setters
+	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
+	EAbilityState AbilityState = EAbilityState::PreExecution;
+
+	// Data used to execute this ability
+	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
+	FGMCAbilityData AbilityData;
+
+	// Assign a new, incrementing, Task ID
+	UFUNCTION()
+	int GetNextTaskID(){TaskIDCounter += 1;
+		return TaskIDCounter;}
+
+	bool IsActive() const;
+
+	int GetAbilityID() const {return AbilityID;};;
+	
+	UPROPERTY()
+	TMap<int, UGMCAbilityTaskBase*> RunningTasks;
+
+	void RegisterTask(int Id, UGMCAbilityTaskBase* Task) {RunningTasks.Add(Id, Task);}
+	void TickTasks(float DeltaTime);
+	void AncillaryTickTasks(float DeltaTime);
+
+	// Multi-line diagnostic snapshot of this ability and every registered task (state,
+	// completion, heartbeat counters/ages). Built for the [AbilityCut]/[TaskDiag] logs that
+	// fire when an ability dies abnormally — answers "what was still running, what had the
+	// server/client seen, and were we replaying" without needing a debugger attached.
+	FString GetAbilityCutDiagnostics() const;
+	
+	void Execute(UGMC_AbilitySystemComponent* InAbilityComponent, int InAbilityID, const UInputAction* InputAction = nullptr);
+	
+	// Called by AbilityComponent (this is a prediction tick so should be used for movement)
+	virtual void Tick(float DeltaTime);
+	
+	// Called by AbilityComponent from AncillaryTick (won't be rolled back on mispredictions)
+	virtual void AncillaryTick(float DeltaTime);
+	
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Tick Ability"), Category="GMCAbilitySystem|Ability")
+	void TickEvent(float DeltaTime);
+
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Ancillary Tick Ability"), Category="GMCAbilitySystem|Ability")
+	void AncillaryTickEvent(float DeltaTime);
+
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Ability PreExecution Check"), Category="GMCAbilitySystem|Ability")
+	bool PreExecuteCheckEvent();
+
+	// Declare an effect, that will allow to automatically end it when the ability ends
+	void DeclareEffect(int OutEffectHandle, EGMCAbilityEffectQueueType EffectType);
+
+	UFUNCTION()
+	virtual bool PreBeginAbility();
+	
+	UFUNCTION()
+	virtual void BeginAbility();
+	
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Begin Ability", Keywords = "BeginPlay"), Category="GMCAbilitySystem|Ability")
+	void BeginAbilityEvent();
+
+	UFUNCTION(BlueprintCallable, meta=(DisplayName="End Ability"), Category="GMCAbilitySystem|Ability")
+	virtual void EndAbility();
+
+	/** End an ability without triggering the EndAbilityEvent.
+	 * This is useful for abilities that need to end immediately without any additional logic, usual for dead born abilities. */
+	UFUNCTION(BlueprintCallable, meta=(DisplayName="Cancel Ability"), Category="GMCAbilitySystem|Ability")
+	virtual void CancelAbility();
+
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="End Ability"), Category="GMCAbilitySystem|Ability")
+	void EndAbilityEvent();
+
+	UFUNCTION(BlueprintPure, Category="GMCAbilitySystem|Ability")
+	AActor* GetOwnerActor() const;
+
+	/** Get the Pawn associated with ability if applicable. */
+	UFUNCTION(BlueprintPure, Category="GMCAbilitySystem|Ability")
+	AGMC_Pawn* GetOwnerPawn() const;
+
+	/** Get the Player Controller associated with the owning pawn if applicable. */
+	UFUNCTION(BlueprintPure, Category="GMCAbilitySystem|Ability")
+	AGMC_PlayerController* GetOwningPlayerController() const;
+
+	// Get Ability Owner Attribute value by Name from a passed AbilityComponent
+	UFUNCTION(BlueprintPure, Category="GMCAbilitySystem|Ability")
+	float GetOwnerAttributeValueByTag(FGameplayTag AttributeTag) const;
+
+	UFUNCTION(BlueprintCallable, Category="GMCAbilitySystem|Ability")
+	void SetOwnerJustTeleported(bool bValue);
+
+	// Tag to identify this ability. Required for setting cooldowns.
+	UPROPERTY(EditAnywhere, meta=(Categories="Ability"), Category = "GMCAbilitySystem")
+	FGameplayTag AbilityTag;
+
+	// An Effect that modifies attributes when the ability is activated
+	UPROPERTY(EditAnywhere, Category = "GMCAbilitySystem")
+	TSubclassOf<UGMCAbilityEffect> AbilityCost;
+
+	// How long in seconds ability should go on cooldown when activated
+	// Requires AbilityTag to be set
+	UPROPERTY(EditAnywhere, Category = "GMCAbilitySystem")
+	float CooldownTime;
+
+	// If true, the ability will apply the Cooldown when activated
+	// If false, the ability will NOT apply the Cooldown when the ability begins
+	// You can still apply the cooldown manually with CommitAbilityCooldown or CommitAbilityCostAndCooldown
+	UPROPERTY(EditAnywhere, Category = "GMCAbilitySystem")
+	bool bApplyCooldownAtAbilityBegin{true};
+
+	// If true, more than one instance of this ability can be active at once. If false, the actual activation (but not
+	// the queuing) of an ability will fail if the ability already is active.
+	UPROPERTY(EditAnywhere, Category = "GMCAbilitySystem")
+	bool bAllowMultipleInstances {false};
+	
+	// Check to see if affected attributes in the AbilityCost would still be >= 0 after committing the cost
+	// Delta time can be required if the cost is time based.
+	UFUNCTION(BlueprintPure, Category = "GMCAbilitySystem")
+	virtual bool CanAffordAbilityCost(float DeltaTime = 1.f) const;
+
+	// Apply the effects in AbilityCost and (Re-)apply the CooldownTime of this ability
+	// Warning : Will apply CooldownTime regardless of already being on cooldown
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	virtual void CommitAbilityCostAndCooldown();
+	
+	// (Re-)Apply the CooldownTime of this ability
+	// Warning : Will apply CooldownTime regardless of already being on cooldown
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	virtual void CommitAbilityCooldown();
+	
+	// Apply the effects in AbilityCost
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	virtual void CommitAbilityCost();
+
+	// Remove the ability cost effect (if applicable)
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	virtual void RemoveAbilityCost();
+
+	// Live modifying the BlockOtherAbility tags
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	virtual void ModifyBlockOtherAbility(FGameplayTagContainer TagToAdd, FGameplayTagContainer TagToRemove);
+
+	// Reset the BlockOtherAbility tags to the default values
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	virtual void ResetBlockOtherAbility();
+
+	// GMC_AbilitySystemComponent that owns this ability
+	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
+	UGMC_AbilitySystemComponent* OwnerAbilityComponent;
+
+	// The GMC Movement Component on the same actor as OwnerAbilityComponent
+	UFUNCTION(BlueprintPure, Category = "GMCAbilitySystem")
+	UGMC_MovementUtilityCmp* GetOwnerMovementComponent() const {return OwnerAbilityComponent->GMCMovementComponent; };
+	
+	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
+	TObjectPtr<const UInputAction> AbilityInputAction;
+
+	// Pass data into the Task
+	void HandleTaskData(int TaskID, FInstancedStruct TaskData);
+
+	void HandleTaskHeartbeat(int TaskID);
+
+	// UFUNCTION(BlueprintCallable)
+	// bool HasAuthority();
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "GMCAbilitySystem")
+	bool AbilityEnded() {return AbilityState == EAbilityState::Ended;};
+
+	// Tags
+	// Tags that the owner must have to activate the ability. BeginAbility will not be called if the owner does not have these tags.
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem")
+	FGameplayTagContainer ActivationRequiredTags;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem")
+	// Tags that the owner must not have to activate ability. BeginAbility will not be called if the owner has these tags.
+	FGameplayTagContainer ActivationBlockedTags;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(Categories="Ability"))
+	// Cancel Abilities with these tags when this ability is activated
+	FGameplayTagContainer CancelAbilitiesWithTag;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(Categories="Ability"))
+	// Prevent Abilities with these tags from activating when this ability is activated
+	FGameplayTagContainer BlockOtherAbility;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(Categories="Ability"))
+	// If those ability are active, they will prevent this ability from activating
+	FGameplayTagContainer BlockedByOtherAbility;
+
+	// Effect classes to apply when this ability ends (whether via EndAbility or CancelAbility).
+	// Each entry is applied via ApplyAbilityEffectShort using a queue type chosen at runtime:
+	// Predicted while inside a GMC tick (movement/ancillary) or Standalone, PredictedQueued
+	// otherwise. Symmetric with the existing CancelAbilityOnEnd (effects-side equivalent).
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "GMCAbilitySystem|Chain")
+	TArray<TSubclassOf<UGMCAbilityEffect>> ApplyEffectOnEnd;
+
+	// EffectTags to remove from the owner when this ability ends. Each tag matches active
+	// effects via RemoveEffectByTagSafe (NumToRemove = -1, removes all matching). Same queue
+	// type policy as ApplyEffectOnEnd.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "GMCAbilitySystem|Chain", meta = (Categories = "Effect"))
+	FGameplayTagContainer RemoveEffectOnEnd;
+
+	/**
+	 * Cancels active abilities based on specific conditions.
+	 *
+	 * This method performs the cancellation of abilities on the owner ability component depending on the tags specified in
+	 * `CancelAbilitiesWithTag` and `EndOtherAbilitiesQuery`. It also prevents an ability from unintentionally canceling itself.
+	 *
+	 * Abilities are checked and canceled as follows:
+	 * - Each tag in `CancelAbilitiesWithTag` is evaluated against the current ability tag (`AbilityTag`). If the tag matches,
+	 *   the current ability is skipped.
+	 * - Calls `EndAbilitiesByTag` on the owner ability component for abilities matching a tag in `CancelAbilitiesWithTag`.
+	 * - Iterates through the active abilities in the owner ability component and checks if they match the query in
+	 *   `EndOtherAbilitiesQuery`. If a match is found, those abilities are set to pending end.
+	 *
+	 */
+	virtual void CancelConflictingAbilities();
+	
+	/** 
+	 * If true, activate on movement tick, if false, activate on ancillary tick. Defaults to true.
+	 * Should be set to false for actions that should not be replayed on mispredictions. i.e. firing a weapon
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GMCAbilitySystem")
+	bool bActivateOnMovementTick = true; 
+
+	UFUNCTION()
+	void ServerConfirm();
+
+	UFUNCTION()
+	void SetPendingEnd();
+	
+	// --------------------------------------
+	//	IGameplayTaskOwnerInterface
+	// --------------------------------------	
+	virtual UGameplayTasksComponent* GetGameplayTasksComponent(const UGameplayTask& Task) const override;
+	virtual AActor* GetGameplayTaskOwner(const UGameplayTask* Task) const override;
+	virtual AActor* GetGameplayTaskAvatar(const UGameplayTask* Task) const override;
+	virtual void OnGameplayTaskInitialized(UGameplayTask& Task) override;
+	virtual void OnGameplayTaskActivated(UGameplayTask& Task) override;
+	virtual void OnGameplayTaskDeactivated(UGameplayTask& Task) override;
+
+	// Returns true if the server has confirmed this ability activation.
+	bool IsServerConfirmed() const { return bServerConfirmed; }
+
+protected:
+
+	// How long to wait for server to confirm ability before cancelling on client
+	UPROPERTY(AdvancedDisplay, EditDefaultsOnly, Category="GMCAbilitySystem")
+	float ServerConfirmTimeout = 2.f;
+
+private:
+
+	void FinishEndAbility();
+
+	int AbilityID = -1;
+	int TaskIDCounter = -1;
+
+	bool bServerConfirmed = false;
+
+	bool bEndPending = false;
+
+	// [TaskDiag] census state (server-side diagnostics only, wall-clock): when this ability was
+	// first observed Active with no live task (0 = has live tasks / not yet observed), and a
+	// once-only latch for the stalled-ability log line. See UGMCAbility::AncillaryTick.
+	double TasklessSinceTime = 0.0;
+	bool bTasklessCensusLogged = false;
+
+	// [TaskDiag] once-per-TaskID latch for the heartbeat divergence Warning — a long-lived
+	// divergent task beats at 1/s for the rest of the ability's life; only the first beat
+	// per ID warrants a Warning + full dump.
+	TSet<int> WarnedDivergentTaskIDs;
+
+	float ClientStartTime = 0.f;
+	
+
+
+	/** List of currently active tasks, do not modify directly */
+	UPROPERTY()
+	TArray<TObjectPtr<UGameplayTask>> ActiveTasks;
+
+	UPROPERTY()
+	UGMCAbilityEffect* AbilityCostInstance = nullptr;
+
+	bool IsOnCooldown() const;
+
+public:
+	FString ToString() const{
+		return FString::Printf(TEXT("[name: %s] [Tag %s] (%s) | NumTasks %d"), *GetName().Left(30), *AbilityTag.ToString(), *EnumToString(AbilityState), RunningTasks.Num());
+	}
+
+		UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem")
+	// Container for a more generalized definition of abilities
+	FGameplayTagContainer AbilityDefinition;
+
+	
+	TMap<int, EGMCAbilityEffectQueueType> DeclaredEffect;
+
+		// Queries
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(DisplayName="Activation Tags Query"))
+	// query must match at activation
+	FGameplayTagQuery ActivationQuery;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(DisplayName="Cancel Ability via Definition Query"))
+	// End Abilities via Definition
+	FGameplayTagQuery EndOtherAbilitiesQuery;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(DisplayName="Block Other Ability via Definition Query"))
+	// Block Abilities via Definition
+	FGameplayTagQuery BlockOtherAbilitiesQuery;
+
+	UFUNCTION(BlueprintCallable, Category = "GMAS|Abilities|Queries")
+	void ModifyBlockOtherAbilitiesViaDefinitionQuery(const FGameplayTagQuery& NewQuery);
+
+};
+

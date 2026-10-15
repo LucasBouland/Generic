@@ -1,0 +1,26 @@
+# PEPPlayer
+
+`PEPPlayer` owns player-level behavior independent of the controlled Pawn: its controller, local input state and player lifecycle coordination. `PEPPlayerUI` owns the player's presentation and depends on `PEPCoreUI`. The player module only knows the `IPEPPlayerHUDContract`; it does not depend on the concrete HUD implementation.
+
+The controller currently derives from GMC's player controller and uses Enhanced Input. These are direct dependencies of `PEPPlayer`, not of `PEPCore`. Domain UI modules that need to react to the player menu state may depend on `PEPPlayer`.
+
+## Configuring the current player menu
+
+1. Set the GameMode's Player Controller class to a Blueprint derived from `APEPPlayerController`. Use `EnhancedInputComponent` as the project's default Input Component Class. Use `EnhancedPlayerInput` as the controller's input class.
+2. Reparent `WBP_PEP_HUD` to `UPEPPlayerHUD` from `PEPPlayerUI`. It uses a `WidgetSwitcher` named `HUDSwitcher` with direct child UserWidgets named `GameplayScreen` and `PlayerMenuScreen`. Those three names are required by `BindWidget`; incompatible or missing widgets fail Blueprint compilation. Screen selection uses widget references, so designers may reorder the children. Assign the class to `PlayerHUDClass` on the controller. Do not create a duplicate HUD in Blueprint.
+3. Create Boolean press actions `IA_TogglePlayerMenu` (mapped in gameplay and menu IMCs), `IA_OpenPlayerMenu` (optional opening key in the gameplay IMC), and `IA_ClosePlayerMenu` (Escape in the menu IMC). Assign `ToggleMenuAction`, `OpenMenuAction`, `CloseMenuAction` and `MenuMappingContext`. Each action binds once on `Started`; remove duplicate Pawn bindings. The fields are optional, so Toggle alone or Open/Close alone also works. Avoid mapping multiple state actions to the same key in one active context. If the same asset is assigned to multiple fields, only one binding is made and dispatch precedence is Toggle, Close, Open; use distinct assets for distinct semantics.
+4. Populate `GameplayMappingContexts` with every context that provides Pawn gameplay input. The Pawn installs/removes those contexts normally; the controller suspends only currently active contexts and remembers their priorities. The controller owns installation/removal of the menu context. Independent contexts that remain active should contain only commands allowed during the menu.
+5. Optionally assign Boolean press actions in `MenuCommandActions`, map them in `IMC_PlayerMenu`, and handle `OnMenuCommand` to switch tabs or issue UI commands. Buttons may call `CloseMenu` directly. `ToggleMenu`, `OpenMenu` and `CloseMenu` are also callable from Blueprint.
+6. In `UPEPPlayerHUD::OnControlledPawnChanged`, detach the previous Pawn's delegates and attach the new Pawn's data. The new Pawn may be null. Use the owning controller; do not use `GetPlayerController(0)`.
+
+Opening the menu removes the registered gameplay contexts and adds the menu context, displays the menu, shows the cursor and applies Game And UI with menu focus. Closing reverses those changes, cancels drag-and-drop and restores viewport focus. Movement/look ignore calls are balanced without resetting another system's locks. A valid possessed Pawn is required; possession changes close the menu. Context rebuilds are deferred to the engine's normal rebuild point, outside input delegate execution.
+
+Game And UI gives Slate first access to input. The HUD's preview handler forwards configured menu shortcuts to the controller using `QueryKeysMappedToAction` to resolve currently active/remapped keys. It consumes handled keys and repeats to prevent focused children from swallowing close actions or causing duplicate dispatch. This bridge supports keyboard Boolean press shortcuts only; it does not evaluate modifiers, chords, Hold/Tap triggers or text-entry/modal policies. Mouse/gamepad events follow the normal CommonUI / Enhanced Input path and need project-specific navigation validation. A configured menu shortcut intentionally takes precedence over child widgets, including text fields.
+
+Held Boolean keys are suppressed until release during context restoration. This does not provide custom axis/gamepad-neutral tracking. Axis handlers should clear stored intentions on termination, and analog controls may resume while still held. Removing a mapping context does not stop independent timers, abilities or latched gameplay states that ignore input termination. Do not use `DisableInput`, `EnableInput` or `ClearAllMappings` in menu callbacks.
+
+The retained widget avoids recreating the screen, but does not guarantee prebuilt list entries, loaded assets or a precomputed Slate layout.
+
+## Validation
+
+Build the editor target, then validate in standalone and as an owning multiplayer client: remapped open/close keys; closing while a child button has focus; holding the shortcut; input cleanup when opening during an active action; held Boolean keys and movement axes on return; drag-and-drop; unpossess/destroy/switch Pawn while the menu is open; rejected opening without a Pawn; camera capture on return; alt-tab. Compilation does not verify Blueprint input cleanup, mappings or real Slate mouse capture.

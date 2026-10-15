@@ -1,0 +1,44 @@
+{
+  "FileVersion": 3,
+  "Version": 2,
+  "VersionName": "2.0",
+  "FriendlyName": "PEPItems",
+  "Description": "Generic PEP item definitions, instances, state fragments, queries, and presentation.",
+  "Category": "PEP",
+  "CreatedBy": "Schmurf",
+  "CanContainContent": true,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "PEPItemUI",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "PEPItemCore",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "PEPItemCoreEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "PEPCore",
+      "Enabled": true
+    },
+    {
+      "Name": "PEPCoreUI",
+      "Enabled": true
+    },
+    {
+      "Name": "CommonUI",
+      "Enabled": true
+    }
+  ]
+}

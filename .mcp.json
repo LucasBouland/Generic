@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ue-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "ue-mcp@latest",
+        "F:/UE/Projects/Generic/Generic.uproject"
+      ]
+    }
+  }
+}

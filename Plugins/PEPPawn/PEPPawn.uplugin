@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "PEPPawn",
+	"Description": "Reusable pawn components and adapters for the PEP plugin family.",
+	"Category": "PEP",
+	"CanContainContent": false,
+	"Installed": false,
+	"Plugins": [
+		{ "Name": "GMC", "Enabled": true },
+		{ "Name": "GMCAbilitySystem", "Enabled": true },
+		{ "Name": "GMCMotion", "Enabled": true }
+	],
+	"Modules": [
+		{ "Name": "PEPPawn", "Type": "Runtime", "LoadingPhase": "Default" }
+	]
+}

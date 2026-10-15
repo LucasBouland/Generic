@@ -1,0 +1,28 @@
+{
+  "FileVersion": 3,
+  "Version": 2,
+  "VersionName": "2.0",
+  "FriendlyName": "PEPInteraction",
+  "Description": "Generic interaction targeting, validation, and execution framework for PEP.",
+  "Category": "PEP",
+  "CanContainContent": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "PEPInteraction",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "PEPInteractionTests",
+      "Type": "DeveloperTool",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "PEPCore",
+      "Enabled": true
+    }
+  ]
+}

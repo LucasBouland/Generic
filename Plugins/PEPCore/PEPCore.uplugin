@@ -1,0 +1,23 @@
+﻿{
+	"FileVersion": 3,
+	"Version": 2,
+	"VersionName": "2.0",
+	"FriendlyName": "PEPCore",
+	"Description": "Shared PEP contracts, foundational types, canonical reason tags, logging and debug settings.",
+	"Category": "PEP",
+	"CreatedBy": "Schmurf",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "PEPCore",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

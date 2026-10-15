@@ -1,0 +1,18 @@
+[
+	{
+		"file": "F:\\UE\\Projects\\Generic\\Source\\Generic\\Generic.cpp",
+		"arguments": [
+			"C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\bin\\Hostx64\\x64\\cl.exe",
+			"@F:\\UE\\Projects\\Generic\\.vscode\\compileCommands_Default\\Generic.0.rsp"
+		],
+		"directory": "C:\\Program Files\\Epic Games\\UE_5.8\\Engine\\Source"
+	},
+	{
+		"file": "F:\\UE\\Projects\\Generic\\Source\\Generic\\GenericGameModeBase.cpp",
+		"arguments": [
+			"C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\bin\\Hostx64\\x64\\cl.exe",
+			"@F:\\UE\\Projects\\Generic\\.vscode\\compileCommands_Default\\Generic.0.rsp"
+		],
+		"directory": "C:\\Program Files\\Epic Games\\UE_5.8\\Engine\\Source"
+	}
+]

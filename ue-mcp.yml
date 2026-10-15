@@ -1,0 +1,11 @@
+ue-mcp:
+  version: 1
+  disable:
+    - gas
+    - demo
+  context:
+    strategy: lean
+  contentRoots:
+    - /Game/
+tasks: {}
+flows: {}

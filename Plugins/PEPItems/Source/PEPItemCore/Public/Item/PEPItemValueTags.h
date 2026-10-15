@@ -1,0 +1,10 @@
+#pragma once
+
+#include "NativeGameplayTags.h"
+
+namespace PEPItemValueTags
+{
+	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Stack_Count);
+	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Durability);
+	PEPITEMCORE_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Resource);
+}

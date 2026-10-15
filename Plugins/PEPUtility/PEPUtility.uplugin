@@ -1,0 +1,16 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "PEPUtility",
+	"Description": "Reusable helper libraries that do not belong to a gameplay domain or PEPCore.",
+	"Category": "PEP",
+	"CanContainContent": false,
+	"Installed": false,
+	"Plugins": [
+		{ "Name": "PEPCore", "Enabled": true }
+	],
+	"Modules": [
+		{ "Name": "PEPUtility", "Type": "Runtime", "LoadingPhase": "Default" }
+	]
+}

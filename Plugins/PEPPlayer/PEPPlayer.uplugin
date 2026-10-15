@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "PEPPlayer",
+	"Description": "Reusable player ownership, controller and local input behavior for PEP projects.",
+	"Category": "PEP",
+	"CanContainContent": true,
+	"Installed": false,
+	"Plugins": [
+		{ "Name": "GMC", "Enabled": true },
+		{ "Name": "EnhancedInput", "Enabled": true },
+		{ "Name": "PEPCoreUI", "Enabled": true }
+	],
+	"Modules": [
+		{ "Name": "PEPPlayer", "Type": "Runtime", "LoadingPhase": "Default" },
+		{ "Name": "PEPPlayerUI", "Type": "Runtime", "LoadingPhase": "Default" }
+	]
+}
