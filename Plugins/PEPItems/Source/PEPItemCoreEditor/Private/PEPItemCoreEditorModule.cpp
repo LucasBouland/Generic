@@ -7,7 +7,6 @@
 #include "Logging/TokenizedMessage.h"
 #include "MessageLogModule.h"
 #include "Misc/CoreDelegates.h"
-#include "Misc/Paths.h"
 #include "PEPItemDefinitionCustomization.h"
 #include "PropertyEditorModule.h"
 
@@ -48,8 +47,17 @@ namespace PEPItemCoreEditorPrivate
 				MoveTemp(Directories), TArray<FSoftObjectPath>());
 		}
 
-		const FString DefaultGameIni = FPaths::Combine(FPaths::ProjectConfigDir(), TEXT("DefaultGame.ini"));
-		Settings->SaveConfig(CPF_Config, *DefaultGameIni);
+		/*
+		 * Written to the settings' own default config file the way Project Settings writes it,
+		 * checked out or made writable as needed, instead of SaveConfig to a hand-built path.
+		 */
+		if (!Settings->TryUpdateDefaultConfigFile())
+		{
+			FMessageLog(AssetManagerLogName).Error(LOCTEXT(
+				"ItemDefinitionScanNotSaved",
+				"Could not write the PEP ItemDef scan to the project's DefaultGame.ini. Check that the file is writable or checked out."));
+			return;
+		}
 		FMessageLog(AssetManagerLogName).Info(LOCTEXT(
 			"ItemDefinitionScanAdded",
 			"Added the PEP ItemDef scan to Config/DefaultGame.ini. Restart the editor for Asset Manager to apply it."));
