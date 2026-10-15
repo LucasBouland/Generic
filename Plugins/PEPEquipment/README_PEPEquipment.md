@@ -30,24 +30,47 @@ Les APIs publiques distinguent :
 
 - `GetPublicEquipmentRoots()` : items occupant directement un slot Equipment ;
 - `GetPublicPresentationNodes()` : racines et attachments visibles ;
-- `GetPublicAttachments()` : enfants visibles directs ou récursifs.
+- `GetPublicAttachments()` : enfants visibles directs ou récursifs ;
+- `FindPublicPresentationNode()` : un nœud (racine ou attachment) par `ItemId`, en temps constant.
 
-`FindLocalPresentationTarget()` fournit une cible générique pour les acteurs attachés et les parties modulaires. `FindLocalPresentationActor()` reste disponible pour la compatibilité des consommateurs existants.
+Getters et événements renvoient `FPEPEquippedItemInfo`, une valeur simple (`ItemId`, `DefinitionId`, `SlotTag`, `ParentItemId`, `ParentSlotName`). `FPEPEquippedItemPublic` est l’élément interne du Fast Array répliqué et n’est plus exposé aux Blueprints.
+
+`FindLocalPresentationTarget()` fournit une cible générique pour les acteurs attachés et les parties modulaires ; l’acteur d’un visuel attaché est `PresentationActor` de cette cible.
+
+La présentation locale n’est jamais construite avant le `BeginPlay` du composant : un Fast Array reçu dans le premier bunch d’un late joiner, ou un store rempli sur l’autorité avant `BeginPlay`, aurait sinon accroché ses visuels à la racine (la capsule) faute de mesh découvert. `BeginPlay` découvre le mesh, détruit tout visuel éventuel puis reconstruit la projection (autorité) et la présentation une seule fois. Les props temporaires suivent la même règle.
+
+Un acteur `APEPEquippedPresentationActor` présente un seul nœud pendant toute sa vie : `OnPublicStateApplied` est levé une fois, depuis `InitializePresentation`, avant le chargement du visuel ; un nœud qui change (slot, parent, définition) reçoit un nouvel acteur. Un prop temporaire reçoit un état dont seul `DefinitionId` est renseigné.
 
 ## Réplication
 
-`PublicEquipmentView` est un Fast Array contenant seulement `ItemId`, `DefinitionId`, slot, main et relation publique parent/attachment. `PostReplicatedReceive` déclenche une reconstruction locale complète et déterministe.
+`PublicEquipmentView` est un Fast Array contenant seulement `ItemId`, `DefinitionId`, slot et relation publique parent/attachment. La main n’est pas répliquée : chaque machine la déduit du slot via le même profil. `PostReplicatedReceive` met à jour l’index `ItemId → entrée` puis réconcilie la présentation locale par différence.
 
-Les props temporaires (`RequestShowTemporaryItemPresentation`) sont eux aussi de l’état répliqué (`TemporaryPresentationView`), pas des RPC : un pion qui devient pertinent reçoit ses props courants, et une demande répétée écrase la précédente au lieu de remplir la file reliable.
+Les props temporaires (`RequestShowTemporaryItemPresentation`) sont eux aussi de l’état répliqué (`TemporaryPresentationView`), pas des RPC : un pion qui devient pertinent reçoit ses props courants, et une demande répétée écrase la précédente au lieu de remplir la file reliable. Le serveur borne cet état :
+
+- au plus `MaxTemporaryPresentations` clés vivantes (4 par défaut, réglable sur le composant) ; une nouvelle clé au-delà est refusée, remplacer une clé vivante reste permis ;
+- l’item doit être dans le store du composant et atteignable pour au moins une des `TemporaryPresentationAccessTags` (`IPEPItemStore::HasGrantedGameplayAccess` ; Equip, Reload et Use par défaut, vide = tout item du store) ;
+- le socket doit exister sur le mesh quand la machine en a un.
+
+Les refus sont silencieux et bon marché (cap, socket puis store), sans rien écrire. Le client propriétaire applique les mêmes règles avant d’afficher son prop immédiat ; il ne diverge du serveur que sur une course, et le prop local disparaît alors au prochain changement répliqué de la vue. Les chargements d’un prop temporaire partagent les ensembles d’échecs de la présentation normale : un asset introuvable n’est demandé qu’une fois, et le handle n’est gardé que tant que le chargement est en cours.
 
 Les acteurs, composants et meshes de présentation ne sont pas répliqués. Il n’y a pas de prédiction client : le client demande, le serveur valide via `IPEPItemStore`, puis sa projection confirmée est répliquée.
 
+## Reconstruction différée
+
+Sur l’autorité, chaque événement de store qui peut toucher un slot marque la projection comme sale ; elle est reconstruite une seule fois au tick moteur suivant (core ticker, qui tourne aussi monde en pause), quel que soit le nombre d’écritures. Un `StateChanged` (charges, munitions, durabilité) ne reconstruit rien, sauf si un nœud projeté change de définition : la projection ne porte aucun état d’item et le caractère public d’un enfant dépend de son emplacement (`GetPublicChildren`).
+
+Les requêtes exécutées par le composant (`RequestEquipItem`, `RequestUnequipItem`, `UnequipItem` sur l’autorité) regroupent leurs écritures (un échange lève deux événements) et reconstruisent la projection avant de rendre la main. Un code serveur qui écrit directement dans le store et doit lire la projection dans la même frame appelle `FlushDeferredUpdates()`.
+
+Les fins de chargement d’assets de présentation demandent de même une seule réconciliation au tick suivant, et `RegisterPresentationTarget` / `SetPresentationMesh` ne reconstruisent qu’une fois, et seulement si quelque chose a changé.
+
 ## Événements d’équipement
 
-`OnItemEquipped` et `OnItemUnequipped` (paramètre `FPEPEquipmentChange` : type, nœud public, slot racine, profondeur) sont levés sur chaque machine, par différence entre la projection précédemment annoncée et la nouvelle :
+`OnItemEquipped` et `OnItemUnequipped` (paramètre `FPEPEquipmentChange` : type, nœud public `FPEPEquippedItemInfo`, slot racine, profondeur) sont levés sur chaque machine, par différence entre la projection précédemment annoncée et la nouvelle :
 
-- sur l’autorité quand `RefreshPublicProjection` modifie la projection ;
-- sur chaque client quand le Fast Array répliqué arrive (`HandlePublicEquipmentReplicated`).
+- sur l’autorité quand la reconstruction (différée ou de fin de requête) modifie la projection ;
+- sur chaque client quand le Fast Array répliqué arrive.
+
+Seuls les slots publics y participent : un item dans un slot dont `bShowPublicly` est faux ne lève aucun événement.
 
 L’autorité ne reçoit jamais son propre Fast Array : un listen server annonce une seule fois, chaque client une seule fois. Une réception qui ne change rien n’annonce rien.
 
@@ -64,13 +87,22 @@ Les événements peuvent être levés avant le `BeginPlay` d’un écouteur sur 
 - Une cible qui est elle-même un slot de ce composant est refusée (`Reason.InvalidTarget`) : c’est un équipement, avec ses règles d’échange et d’éligibilité.
 - Le déséquipement est toujours un `MoveItem`, jamais un échange : déplacer l’occupant de la cible dans le slot serait un équipement implicite.
 
+## Requêtes et identité
+
+Une requête est résolue sur la machine qui l’a émise, et les identifiants sont propres à chaque machine :
+
+- émise sur l’autorité (code serveur, IA, hôte listen server) : la valeur de retour est le résultat (`Executed`/`Failed`) et `OnEquipmentRequestResolved` est levé localement **au tick suivant**, pour qu’un appelant (Blueprint compris) détienne déjà `OutRequestId` à son arrivée. Elle n’est jamais envoyée au client propriétaire, dont les identifiants entreraient en collision ;
+- envoyée par le client propriétaire : `Submitted`, puis `Client_ResolveEquipRequest` vers ce client seulement.
+
+Le store est interrogé au nom du contrôleur du propriétaire quand il y en a un. Sans contrôleur, une requête locale sur l’autorité est un changement piloté par le serveur (pion non possédé, mannequin, loadout scripté) et utilise délibérément `FPEPItemAccessContext::System()` ; une requête arrivée par RPC client n’est jamais faite en `System()` et est refusée (`Reason.NotAuthority`). Une preview client sans contrôleur interroge en `From(nullptr)`, qui n’est jamais système.
+
 ## Éligibilité
 
 Un item entre dans un slot si, dans l’ordre (premier refus gagnant) :
 
 1. il respecte les `RequiredItemTags` / `BlockedItemTags` du slot ;
 2. `CanEquipItemInSlot` (BlueprintNativeEvent protégé, pour les sous-classes) l’accepte ;
-3. chaque objet du propriétaire implémentant `IPEPEquipmentEligibilityProvider` l’accepte : l’acteur propriétaire d’abord, puis ses composants triés par nom.
+3. chaque objet du propriétaire implémentant `IPEPEquipmentEligibilityProvider` l’accepte : l’acteur propriétaire d’abord, puis ses composants implémenteurs triés par nom (filtrés avant le tri ; un seul implémenteur n’est jamais trié).
 
 Cette règle s’applique dans `PreviewEquipItem`, dans le chemin autoritaire d’équipement et dans le validateur de location enregistré sur le store : un déplacement vers un slot depuis une UI d’inventaire, un échange ou un placement automatique y est soumis. Les fournisseurs reçoivent la définition seulement si elle est déjà chargée (jamais de chargement synchrone) et doivent rester des requêtes pures, appelées sur les clients pour les previews et éventuellement plusieurs fois par requête. Un refus sans `ReasonTag` est normalisé en `Reason.BlockedByState`.
 
@@ -81,9 +113,11 @@ Le module runtime `PEPEquipmentGMAS` relie l’équipement au GMC Ability System
 - `FPEPItemFragment_EquipmentAbilities` (fragment de définition) : `AbilityMaps` (`FAbilityMapData` : InputTag → abilities), `AbilityMapPriority`, `EquippedEffects`, `ActiveInSlots` (slots racines où l’item accorde quelque chose ; vide = tous), `RequiredActiveTags` / `BlockedActiveTags` (éligibilité selon les tags actifs GMAS du porteur) et `bApplyWhenAttachment` (faux par défaut : seuls les occupants de slot accordent).
 - `UPEPEquipmentAbilityBridgeComponent` se place sur le pion à côté de `UPEPEquipmentComponent` et `UGMC_AbilitySystemComponent`, suit `OnItemEquipped` / `OnItemUnequipped` et implémente `IPEPEquipmentEligibilityProvider` pour les tags actifs requis/bloqués.
 
+**Les grants suivent la projection PUBLIQUE.** Un item n’accorde rien tant qu’il n’est pas un nœud de la projection : le contenu privé d’un conteneur n’accorde rien, et un item équipé dans un slot dont `bShowPublicly` est faux n’accorde rien non plus, quel que soit son fragment. La validation du profil émet un avertissement pour chaque slot caché. Pour restreindre où un item accorde, utiliser `ActiveInSlots`, jamais un slot caché.
+
 Répartition réseau :
 
-- L’`AbilityMap` de GMAS est une donnée locale non répliquée : les entrées sont écrites sur le serveur et sur chaque client, toujours avec `bGrantedByDefault` à faux pour qu’un client n’accorde jamais localement.
+- L’`AbilityMap` de GMAS est une donnée locale non répliquée : les entrées sont écrites sur l’autorité et sur le client propriétaire (rôle autonome), toujours avec `bGrantedByDefault` à faux pour qu’un client n’accorde jamais localement. Un proxy simulé (le pion d’un autre joueur) n’active jamais d’ability depuis une entrée : le pont n’y fait rien et rend ce qu’il aurait écrit. Un changement de contrôleur (possession après le spawn, dépossession) déclenche une réconciliation au tick suivant.
 - `GrantedAbilityTags` est lié par GMC en `ServerAuth_Output_ClientValidated` : seule l’autorité appelle `GrantAbilityByTag` / `RemoveGrantedAbilityByTag`, et seulement pour un tag qu’elle a elle-même accordé (un tag déjà accordé par ailleurs n’est jamais retiré par le pont).
 - Les `EquippedEffects` sont appliqués par l’autorité en `ServerAuth` et retirés par `RemoveEffectByIdSafe(..., ServerAuth)` avec les identifiants conservés par item. Les changements d’équipement arrivent par RPC serveur, écriture de store ou réplication, hors du cycle de mouvement GMC : ni `Predicted` ni `PredictedQueued` ne conviennent, et rien d’irréversible n’est déclenché dans un chemin de prédiction ou de replay. Pour la même raison, ne jamais émettre de requête d’équipement depuis un tick d’ability prédit.
 
@@ -93,15 +127,34 @@ Le pont attend le `BeginPlay` de l’ASC (qui remplit son `AbilityMap` et écras
 
 ## Mains et dégainage
 
-L’API runtime de `PEPEquipment` évolue de façon additive : les ajouts (événements typés, déséquipement, fournisseurs d’éligibilité) ne changent pas le comportement des appels existants. `EPEPEquipmentHand`, `Hand` sur les slots et `GetActiveHandItem` restent comme lecture de la projection (« quel item occupe quelle main »).
+`EPEPEquipmentHand` et `Hand` sur les slots du profil restent comme lecture de la projection (« quel item occupe quelle main »). La main n’est plus un champ répliqué : `GetSlotHand(SlotTag)` la lit dans le profil effectif, et `FindItemInHand(Hand)` (anciennement `GetActiveHandItem`) renvoie la racine publique du premier slot, **dans l’ordre du profil**, qui déclare cette main — donc la même réponse sur chaque machine, même avec un profil invalide donnant une main à deux slots.
 
-`UPEPEquipmentComponent` ne porte plus de logique de main active (dégainer, rengainer, notifies `Equip`/`Unequip`, slot source réservé). Un slot peut déclarer une `Hand` et `GetActiveHandItem` lit la projection, mais choisir quelle arme est en main est une règle de jeu : elle sera réimplémentée dans un composant dédié, au-dessus de celui-ci, configuré par le profil.
+`UPEPEquipmentComponent` ne porte plus de logique de main active (dégainer, rengainer, notifies `Equip`/`Unequip`, slot source réservé). Choisir quelle arme est en main est une règle de jeu : elle sera réimplémentée dans un composant dédié, au-dessus de celui-ci, configuré par le profil.
 
-La présentation locale est maintenant réconciliée par différence : un visuel dont le nœud public n’a pas changé est conservé, y compris son socket courant. Changer un `PresentationTarget`, le mesh principal ou le profil reconstruit tout.
+La présentation locale est réconciliée par différence : un visuel dont le nœud public n’a pas changé est conservé, y compris son socket courant ; un nœud invalidé emporte ses descendants en un seul parcours. Changer un `PresentationTarget`, le mesh principal ou le profil reconstruit tout, une fois.
+
+## Migration (API)
+
+Changements cassants de cette révision, sans consommateur dans le dépôt :
+
+| Avant | Après |
+| --- | --- |
+| `FPEPEquippedItemPublic` dans les getters, `FPEPEquipmentChange::Node`, `APEPEquippedPresentationActor::PublicState` / `OnPublicStateApplied` | `FPEPEquippedItemInfo` (mêmes champs, sans `Hand`) |
+| `FPEPEquippedItemPublic::Hand` (répliqué) | `GetSlotHand(SlotTag)` |
+| `GetActiveHandItem` | `FindItemInHand` (CoreRedirect) |
+| `FindPublicEquippedItem` | `FindPublicPresentationNode` (CoreRedirect) |
+| `FindLocalPresentationActor` | `FindLocalPresentationTarget(...).PresentationActor` |
+| `UPEPEquipmentProfile::FindSlot`, `APEPEquippedPresentationActor::ApplyPublicState` / `MatchesPresentationNode` | supprimés (inutilisés) |
+| `HandlePublicEquipmentReplicated` / `HandleTemporaryPresentationsReplicated` publics | privés (appelés par les vues Fast Array, amies) |
+| `FPEPPublicEquipmentView` `BlueprintType`, `OwnerComponent` public | ni `BlueprintType` ni membre public |
+
+Les CoreRedirects (`Config/DefaultEngine.ini`) gardent les nœuds Blueprint existants ; le type de leur broche de sortie change (`FPEPEquippedItemInfo`), et une liaison vers un « Break » de l’ancien type est à refaire.
 
 ## Validation
 
-`Validate Assets` détecte notamment les visuels invalides, les overrides dupliqués, les slots/profils en conflit et les sockets ou bones absents pour les attachments. Le code de validation croisée réside dans le module éditeur `PEPEquipmentEditor`.
+`Validate Assets` détecte notamment les visuels invalides, les overrides dupliqués, les slots/profils en conflit et les sockets ou bones absents pour les attachments. Le code de validation croisée réside dans le module éditeur `PEPEquipmentEditor`. Les sockets d’attachment ne sont vérifiés que contre un mesh nommé par le fragment : un visuel `Actor` sans `MeshVisual` apporte sa géométrie dans sa propre classe et n’est pas (faussement) refusé. Le profil avertit pour chaque slot dont `bShowPublicly` est faux.
+
+L’avertissement « no item store found » (et « claimed no slot ») n’est émis qu’après `BeginPlay` dans un monde de jeu : `OnRegister` tourne aussi dans les mondes d’éditeur et de preview, et avant que tous les composants du propriétaire existent.
 
 ## UI
 
@@ -112,7 +165,7 @@ son contenu imbriqué, et si l'UI doit rafraîchir ou vider l'image de l'item ra
 
 ## Tests
 
-Les tests d’automatisation (`PEP.Equipment.*`) utilisent `UPEPTestItemStoreComponent` et `UPEPTestEquipmentListenerComponent` (dans `Private/Tests`). Ce sont des `UCLASS` : UHT ne permet pas de les exclure du build Shipping par un `#if` sans casser le code généré ; ils y restent compilés mais ne sont jamais instanciés hors des tests. Les tests du pont GMAS (`PEP.Equipment.GMAS.*`) couvrent le ledger et le fragment, sans ASC.
+Les tests d’automatisation (`PEP.Equipment.*`) utilisent `UPEPTestItemStoreComponent` et `UPEPTestEquipmentListenerComponent` (dans `Private/Tests`). Le monde de test n’a pas de game mode : les fixtures appellent `DispatchBeginPlay` sur le propriétaire, puis `FlushDeferredUpdates` après chaque écriture directe dans le store, puisque rien n’y fait avancer le tick. Ce sont des `UCLASS` : UHT ne permet pas de les exclure du build Shipping par un `#if` sans casser le code généré ; ils y restent compilés mais ne sont jamais instanciés hors des tests. Les tests du pont GMAS (`PEP.Equipment.GMAS.*`) couvrent le ledger et le fragment, sans ASC.
 
 ## Dépendances
 

@@ -73,6 +73,15 @@ void UPEPTestItemStoreComponent::GetPublicChildren(
 	}
 }
 
+bool UPEPTestItemStoreComponent::HasGrantedGameplayAccess(
+	const FPEPItemId& ItemId,
+	const FGameplayTag ActionTag) const
+{
+	return ActionTag.IsValid()
+		&& FindStoredItem(ItemId) != nullptr
+		&& !DeniedGameplayAccess.Contains(ItemId);
+}
+
 FPEPItemResult UPEPTestItemStoreComponent::AddItem(
 	const FPEPItemInstance& Item,
 	const FPEPItemLocation& Destination,

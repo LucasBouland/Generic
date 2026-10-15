@@ -14,8 +14,13 @@ class UGMCAbilityEffect;
  * UPEPEquipmentAbilityBridgeComponent, which must sit on the same pawn as the equipment and the
  * GMC ability system components.
  *
- * Granting follows the public equipment projection: the item counts while it is a node of it, so
- * a container's private content never grants anything.
+ * Granting follows the PUBLIC equipment projection: the item counts while it is a node of it and
+ * only then. Two consequences designers must know:
+ *  - a container's private content never grants anything;
+ *  - an item in a slot whose profile entry has bShowPublicly off grants nothing either, even though
+ *    it is equipped: that slot never enters the projection, so it raises no OnItemEquipped. The
+ *    equipment profile's data validation warns about every such slot.
+ * Use ActiveInSlots to narrow where an item grants, never a hidden slot.
  */
 USTRUCT(BlueprintType, meta=(DisplayName="Equipment Abilities (GMAS)"))
 struct PEPEQUIPMENTGMAS_API FPEPItemFragment_EquipmentAbilities : public FPEPItemFragment
@@ -44,8 +49,8 @@ struct PEPEQUIPMENTGMAS_API FPEPItemFragment_EquipmentAbilities : public FPEPIte
 
 	/**
 	 * Equipment slots in which the item grants anything, matched against the slot of the root it
-	 * hangs under. Empty means any slot: set it to Hand slots for a weapon whose abilities should
-	 * not follow it onto the back.
+	 * hangs under. Empty means any public slot: set it to Hand slots for a weapon whose abilities
+	 * should not follow it onto the back. A slot with bShowPublicly off never grants, listed or not.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Equipment|Abilities",
 		meta=(Categories="Equipment.Slot"))

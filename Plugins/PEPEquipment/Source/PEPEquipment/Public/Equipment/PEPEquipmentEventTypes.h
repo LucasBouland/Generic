@@ -1,7 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Equipment/PEPEquipmentNetTypes.h"
+#include "Equipment/PEPEquipmentTypes.h"
 #include "GameplayTagContainer.h"
 
 #include "PEPEquipmentEventTypes.generated.h"
@@ -31,7 +31,7 @@ struct PEPEQUIPMENT_API FPEPEquipmentChange
 
 	/** The node as it is now for Equipped, as it was for Unequipped. */
 	UPROPERTY(BlueprintReadOnly, Category="PEP|Equipment|Event")
-	FPEPEquippedItemPublic Node;
+	FPEPEquippedItemInfo Node;
 
 	/**
 	 * Equipment slot of the root this node hangs under: Node.SlotTag for a root, the ancestor's
@@ -50,11 +50,11 @@ namespace PEPEquipmentEvents
 {
 	/**
 	 * Whether two public nodes describe the same equipped state: same item and definition in the
-	 * same slot or under the same parent slot. Hand is left out: it follows from the slot.
+	 * same slot or under the same parent slot. Everything a local visual is built from, too.
 	 */
 	PEPEQUIPMENT_API bool IsSameEquippedNode(
-		const FPEPEquippedItemPublic& A,
-		const FPEPEquippedItemPublic& B);
+		const FPEPEquippedItemInfo& A,
+		const FPEPEquippedItemInfo& B);
 
 	/**
 	 * Turns two projections into the changes between them, deterministically.
@@ -70,8 +70,8 @@ namespace PEPEquipmentEvents
 	 * Both outputs are reset.
 	 */
 	PEPEQUIPMENT_API void DiffPublicProjection(
-		const TArray<FPEPEquippedItemPublic>& Previous,
-		const TArray<FPEPEquippedItemPublic>& Current,
+		const TArray<FPEPEquippedItemInfo>& Previous,
+		const TArray<FPEPEquippedItemInfo>& Current,
 		TArray<FPEPEquipmentChange>& OutUnequipped,
 		TArray<FPEPEquipmentChange>& OutEquipped);
 }

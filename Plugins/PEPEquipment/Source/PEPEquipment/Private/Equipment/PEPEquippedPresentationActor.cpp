@@ -26,12 +26,13 @@ APEPEquippedPresentationActor::APEPEquippedPresentationActor()
 }
 
 void APEPEquippedPresentationActor::InitializePresentation(
-	const FPEPEquippedItemPublic& InPublicState,
+	const FPEPEquippedItemInfo& InPublicState,
 	const FPEPEquipmentPresentationFragment& InPresentation)
 {
 	PublicState = InPublicState;
 	Presentation = InPresentation;
 	bPresentationReady = false;
+	OnPublicStateApplied(PublicState);
 	RequestPresentationAssets();
 }
 
@@ -122,13 +123,6 @@ void APEPEquippedPresentationActor::ApplyLoadedAssets()
 	OnPresentationInitialized();
 }
 
-void APEPEquippedPresentationActor::ApplyPublicState(
-	const FPEPEquippedItemPublic& InPublicState)
-{
-	PublicState = InPublicState;
-	OnPublicStateApplied(PublicState);
-}
-
 USceneComponent* APEPEquippedPresentationActor::GetPresentationAttachComponent() const
 {
 	if (SkeletalMeshComponent && SkeletalMeshComponent->GetSkeletalMeshAsset())
@@ -140,14 +134,4 @@ USceneComponent* APEPEquippedPresentationActor::GetPresentationAttachComponent()
 		return StaticMeshComponent;
 	}
 	return PresentationRoot;
-}
-
-bool APEPEquippedPresentationActor::MatchesPresentationNode(
-	const FPEPEquippedItemPublic& State) const
-{
-	return PublicState.ItemId == State.ItemId
-		&& PublicState.DefinitionId == State.DefinitionId
-		&& PublicState.SlotTag == State.SlotTag
-		&& PublicState.ParentItemId == State.ParentItemId
-		&& PublicState.ParentSlotName == State.ParentSlotName;
 }

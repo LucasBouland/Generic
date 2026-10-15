@@ -37,7 +37,8 @@ namespace PEPEquipmentTest
 
 		explicit FFixture(
 			const bool bEnablePresentation = false,
-			UPEPEquipmentProfile* EquipmentProfile = nullptr)
+			UPEPEquipmentProfile* EquipmentProfile = nullptr,
+			const bool bBeginPlay = true)
 		{
 			World = UWorld::CreateWorld(EWorldType::Game, false);
 			FWorldContext& Context = GEngine->CreateNewWorldContext(EWorldType::Game);
@@ -53,6 +54,29 @@ namespace PEPEquipmentTest
 			Equipment->SetEquipmentProfile(EquipmentProfile);
 			Equipment->RegisterComponent();
 			World->BeginPlay();
+			/* The fixture world has no game mode, so nothing begins play unless told to. */
+			if (bBeginPlay)
+			{
+				BeginPlay();
+			}
+		}
+
+		void BeginPlay()
+		{
+			Owner->DispatchBeginPlay();
+		}
+
+		/* Store writes fold into one projection rebuild at the next tick; tests do not tick. */
+		void Flush()
+		{
+			Equipment->FlushDeferredUpdates();
+		}
+
+		bool Add(const FPEPItemInstance& Item, const FPEPItemLocation& Location)
+		{
+			const bool bAdded = Store->AddItem(Item, Location, FPEPItemAccessContext::System()).bSuccess;
+			Flush();
+			return bAdded;
 		}
 
 		~FFixture()
@@ -118,23 +142,24 @@ bool FPEPEquipmentDualHandsTest::RunTest(const FString& Parameters)
 	const FPEPItemId LeftId = LeftItem.ItemId;
 	const FPEPItemId RightId = RightItem.ItemId;
 
-	TestTrue(TEXT("left hand accepts its item"), Fixture.Store->AddItem(
+	TestTrue(TEXT("left hand accepts its item"), Fixture.Add(
 		LeftItem,
-		PEPEquipmentTest::HandLocation(EPEPEquipmentHand::Left),
-		FPEPItemAccessContext::System()).bSuccess);
-	TestTrue(TEXT("right hand accepts a different item"), Fixture.Store->AddItem(
+		PEPEquipmentTest::HandLocation(EPEPEquipmentHand::Left)));
+	TestTrue(TEXT("right hand accepts a different item"), Fixture.Add(
 		RightItem,
-		PEPEquipmentTest::HandLocation(EPEPEquipmentHand::Right),
-		FPEPItemAccessContext::System()).bSuccess);
+		PEPEquipmentTest::HandLocation(EPEPEquipmentHand::Right)));
 
-	FPEPEquippedItemPublic LeftPublic;
-	FPEPEquippedItemPublic RightPublic;
-	TestTrue(TEXT("left hand is active"),
-		Fixture.Equipment->GetActiveHandItem(EPEPEquipmentHand::Left, LeftPublic));
-	TestTrue(TEXT("right hand is active"),
-		Fixture.Equipment->GetActiveHandItem(EPEPEquipmentHand::Right, RightPublic));
+	FPEPEquippedItemInfo LeftPublic;
+	FPEPEquippedItemInfo RightPublic;
+	TestTrue(TEXT("left hand is occupied"),
+		Fixture.Equipment->FindItemInHand(EPEPEquipmentHand::Left, LeftPublic));
+	TestTrue(TEXT("right hand is occupied"),
+		Fixture.Equipment->FindItemInHand(EPEPEquipmentHand::Right, RightPublic));
 	TestTrue(TEXT("the hands expose two different item identities"),
 		LeftPublic.ItemId == LeftId && RightPublic.ItemId == RightId && LeftId != RightId);
+	FPEPEquippedItemInfo Unused;
+	TestFalse(TEXT("no item is ever in the None hand"),
+		Fixture.Equipment->FindItemInHand(EPEPEquipmentHand::None, Unused));
 
 	return true;
 }
@@ -200,32 +225,38 @@ bool FPEPEquipmentContentPrivacyTest::RunTest(const FString& Parameters)
 	const FPEPItemId BagId = Bag.ItemId;
 	const FPEPItemId ContentId = Content.ItemId;
 
-	TestTrue(TEXT("bag equips on the back"), Fixture.Store->AddItem(
+	TestTrue(TEXT("bag equips on the back"), Fixture.Add(
 		Bag,
-		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Back),
-		FPEPItemAccessContext::System()).bSuccess);
-	TestTrue(TEXT("content enters the equipped bag"), Fixture.Store->AddItem(
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Back)));
+	TestTrue(TEXT("content enters the equipped bag"), Fixture.Add(
 		Content,
-		FPEPItemLocation::MakeItemContainer(BagId, TEXT("content")),
-		FPEPItemAccessContext::System()).bSuccess);
+		FPEPItemLocation::MakeItemContainer(BagId, TEXT("content"))));
 
-	const TArray<FPEPEquippedItemPublic> PublicEntries =
+	const TArray<FPEPEquippedItemInfo> PublicEntries =
 		Fixture.Equipment->GetPublicPresentationNodes();
 	TestEqual(TEXT("only the equipped bag is publicly projected"), PublicEntries.Num(), 1);
 	TestTrue(TEXT("the public identity is the bag"),
 		PublicEntries.Num() == 1 && PublicEntries[0].ItemId == BagId);
 	TestFalse(TEXT("the child item is absent from the public projection"),
-		PublicEntries.ContainsByPredicate([ContentId](const FPEPEquippedItemPublic& Entry)
+		PublicEntries.ContainsByPredicate([ContentId](const FPEPEquippedItemInfo& Entry)
 		{
 			return Entry.ItemId == ContentId;
 		}));
 
-	TestNull(TEXT("the public struct has no full Item field"),
-		FPEPEquippedItemPublic::StaticStruct()->FindPropertyByName(TEXT("Item")));
-	TestNull(TEXT("the public struct has no state fragment field"),
-		FPEPEquippedItemPublic::StaticStruct()->FindPropertyByName(TEXT("StateFragments")));
-	TestNull(TEXT("the public struct has no child/content field"),
-		FPEPEquippedItemPublic::StaticStruct()->FindPropertyByName(TEXT("Contents")));
+	const TArray<const UScriptStruct*> PublicStructs {
+		FPEPEquippedItemPublic::StaticStruct(),
+		FPEPEquippedItemInfo::StaticStruct() };
+	for (const UScriptStruct* PublicStruct : PublicStructs)
+	{
+		TestNull(TEXT("the public struct has no full Item field"),
+			PublicStruct->FindPropertyByName(TEXT("Item")));
+		TestNull(TEXT("the public struct has no state fragment field"),
+			PublicStruct->FindPropertyByName(TEXT("StateFragments")));
+		TestNull(TEXT("the public struct has no child/content field"),
+			PublicStruct->FindPropertyByName(TEXT("Contents")));
+		TestNull(TEXT("the hand is derived from the profile, never replicated"),
+			PublicStruct->FindPropertyByName(TEXT("Hand")));
+	}
 
 	return true;
 }
@@ -273,51 +304,46 @@ bool FPEPEquipmentVisibleAttachmentTreeTest::RunTest(const FString& Parameters)
 	const FPEPItemId PrivateContentId = PrivateContent.ItemId;
 	const FPEPItemId HiddenAttachmentId = HiddenAttachment.ItemId;
 
-	TestTrue(TEXT("weapon equips as the public root"), Fixture.Store->AddItem(
+	TestTrue(TEXT("weapon equips as the public root"), Fixture.Add(
 		Weapon,
-		PEPEquipmentTest::HandLocation(EPEPEquipmentHand::Right),
-		FPEPItemAccessContext::System()).bSuccess);
-	TestTrue(TEXT("optic enters an attachment slot"), Fixture.Store->AddItem(
+		PEPEquipmentTest::HandLocation(EPEPEquipmentHand::Right)));
+	TestTrue(TEXT("optic enters an attachment slot"), Fixture.Add(
 		Optic,
-		FPEPItemLocation::MakeItemContainer(WeaponId, OpticSlotName),
-		FPEPItemAccessContext::System()).bSuccess);
-	TestTrue(TEXT("cover enters a nested attachment slot"), Fixture.Store->AddItem(
+		FPEPItemLocation::MakeItemContainer(WeaponId, OpticSlotName)));
+	TestTrue(TEXT("cover enters a nested attachment slot"), Fixture.Add(
 		Cover,
-		FPEPItemLocation::MakeItemContainer(OpticId, CoverSlotName),
-		FPEPItemAccessContext::System()).bSuccess);
-	TestTrue(TEXT("private item enters a content slot"), Fixture.Store->AddItem(
+		FPEPItemLocation::MakeItemContainer(OpticId, CoverSlotName)));
+	TestTrue(TEXT("private item enters a content slot"), Fixture.Add(
 		PrivateContent,
-		FPEPItemLocation::MakeItemContainer(WeaponId, ContentSlotName),
-		FPEPItemAccessContext::System()).bSuccess);
-	TestTrue(TEXT("an attachment may exist inside the private content"), Fixture.Store->AddItem(
+		FPEPItemLocation::MakeItemContainer(WeaponId, ContentSlotName)));
+	TestTrue(TEXT("an attachment may exist inside the private content"), Fixture.Add(
 		HiddenAttachment,
 		FPEPItemLocation::MakeItemContainer(
 			PrivateContentId,
-			HiddenAttachmentSlotName),
-		FPEPItemAccessContext::System()).bSuccess);
+			HiddenAttachmentSlotName)));
 
-	const TArray<FPEPEquippedItemPublic> PublicEntries =
+	const TArray<FPEPEquippedItemInfo> PublicEntries =
 		Fixture.Equipment->GetPublicPresentationNodes();
 	TestEqual(TEXT("root and two recursive attachments are public"), PublicEntries.Num(), 3);
 	TestFalse(TEXT("content remains absent"), PublicEntries.ContainsByPredicate(
-		[PrivateContentId](const FPEPEquippedItemPublic& Entry)
+		[PrivateContentId](const FPEPEquippedItemInfo& Entry)
 		{
 			return Entry.ItemId == PrivateContentId;
 		}));
 	TestFalse(TEXT("an attachment below private content also remains absent"),
 		PublicEntries.ContainsByPredicate(
-			[HiddenAttachmentId](const FPEPEquippedItemPublic& Entry)
+			[HiddenAttachmentId](const FPEPEquippedItemInfo& Entry)
 			{
 				return Entry.ItemId == HiddenAttachmentId;
 			}));
 
-	const FPEPEquippedItemPublic* PublicOptic = PublicEntries.FindByPredicate(
-		[OpticId](const FPEPEquippedItemPublic& Entry)
+	const FPEPEquippedItemInfo* PublicOptic = PublicEntries.FindByPredicate(
+		[OpticId](const FPEPEquippedItemInfo& Entry)
 		{
 			return Entry.ItemId == OpticId;
 		});
-	const FPEPEquippedItemPublic* PublicCover = PublicEntries.FindByPredicate(
-		[CoverId](const FPEPEquippedItemPublic& Entry)
+	const FPEPEquippedItemInfo* PublicCover = PublicEntries.FindByPredicate(
+		[CoverId](const FPEPEquippedItemInfo& Entry)
 		{
 			return Entry.ItemId == CoverId;
 		});
@@ -333,6 +359,12 @@ bool FPEPEquipmentVisibleAttachmentTreeTest::RunTest(const FString& Parameters)
 		Fixture.Equipment->GetPublicEquipmentRoots().Num(), 1);
 	TestEqual(TEXT("recursive attachment query returns optic and cover"),
 		Fixture.Equipment->GetPublicAttachments(WeaponId, true).Num(), 2);
+	FPEPEquippedItemInfo IndexedCover;
+	TestTrue(TEXT("a nested attachment is found by id"),
+		Fixture.Equipment->FindPublicPresentationNode(CoverId, IndexedCover)
+		&& IndexedCover.ParentItemId == OpticId);
+	TestFalse(TEXT("private content is not found by id"),
+		Fixture.Equipment->FindPublicPresentationNode(PrivateContentId, IndexedCover));
 
 	return true;
 }
@@ -373,10 +405,9 @@ bool FPEPEquipmentModularPresentationTest::RunTest(const FString& Parameters)
 	FPEPItemInstance Item = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
 	const FPEPItemId ItemId = Item.ItemId;
 
-	TestTrue(TEXT("modular item equips"), Fixture.Store->AddItem(
+	TestTrue(TEXT("modular item equips"), Fixture.Add(
 		Item,
-		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Body_Head),
-		FPEPItemAccessContext::System()).bSuccess);
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Body_Head)));
 	TestTrue(TEXT("equipment applies the skeletal override"),
 		Target->GetSkeletalMeshAsset() == EquippedMesh);
 
@@ -387,12 +418,13 @@ bool FPEPEquipmentModularPresentationTest::RunTest(const FString& Parameters)
 		LocalTarget.Policy, EPEPEquipmentPresentationPolicy::ModularSkeletal);
 	TestTrue(TEXT("modular target supplies its component for sockets"),
 		LocalTarget.SocketProvider.Get() == Target);
-	TestNull(TEXT("modular presentation does not require an actor"),
-		Fixture.Equipment->FindLocalPresentationActor(ItemId));
+	TestFalse(TEXT("modular presentation does not require an actor"),
+		LocalTarget.PresentationActor.IsValid());
 
 	TestTrue(TEXT("modular item can be removed"), Fixture.Store->RemoveItem(
 		ItemId,
 		FPEPItemAccessContext::System()).bSuccess);
+	Fixture.Flush();
 	TestTrue(TEXT("removing equipment restores the registered base mesh"),
 		Target->GetSkeletalMeshAsset() == BaseMesh);
 	return true;
@@ -466,6 +498,17 @@ bool FPEPEquipmentProfileTargetSchemaTest::RunTest(const FString& Parameters)
 		InvalidProfile->IsDataValid(InvalidContext), EDataValidationResult::Invalid);
 	TestTrue(TEXT("the undeclared target reports a validation error"),
 		InvalidContext.GetNumErrors() > 0);
+
+	UPEPEquipmentProfile* HiddenSlotProfile =
+		NewObject<UPEPEquipmentProfile>(GetTransientPackage());
+	FPEPEquipmentSlotDefinition& HiddenSlot = HiddenSlotProfile->Slots.AddDefaulted_GetRef();
+	HiddenSlot.SlotTag = PEPEquipmentTags::Equipment_Slot_Belt;
+	HiddenSlot.bShowPublicly = false;
+	FDataValidationContext HiddenContext;
+	TestTrue(TEXT("a slot hidden from the projection is legitimate"),
+		HiddenSlotProfile->IsDataValid(HiddenContext) != EDataValidationResult::Invalid);
+	TestEqual(TEXT("but warns that it raises no event and grants nothing"),
+		HiddenContext.GetNumWarnings(), 1u);
 	return true;
 }
 #endif
@@ -494,13 +537,14 @@ bool FPEPEquipmentPresentationMeshComponentTagsTest::RunTest(const FString& Para
 	FPEPItemInstance Item = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
 	const FPEPItemId ItemId = Item.ItemId;
 
-	TestTrue(TEXT("tagged item equips"), Fixture.Store->AddItem(
+	TestTrue(TEXT("tagged item equips"), Fixture.Add(
 		Item,
-		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Primary),
-		FPEPItemAccessContext::System()).bSuccess);
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Primary)));
 
+	FPEPLocalPresentationTarget LocalTarget;
+	Fixture.Equipment->FindLocalPresentationTarget(ItemId, LocalTarget);
 	const APEPEquippedPresentationActor* Actor =
-		Fixture.Equipment->FindLocalPresentationActor(ItemId);
+		Cast<APEPEquippedPresentationActor>(LocalTarget.PresentationActor.Get());
 	TestNotNull(TEXT("tagged item has a local presentation"), Actor);
 	const USceneComponent* MeshComponent = Actor
 		? Actor->GetPresentationAttachComponent()
@@ -537,14 +581,12 @@ bool FPEPEquipmentGenericStoreTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("equipment slots accept automatic placement"),
 		Fixture.Store->DoesLocationAllowAutoPlacement(
 			PEPEquipmentTags::Equipment_Slot_Hand_Right));
-	TestTrue(TEXT("the generic store accepts a source slot item"), Fixture.Store->AddItem(
+	TestTrue(TEXT("the generic store accepts a source slot item"), Fixture.Add(
 		Item,
-		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Belt),
-		FPEPItemAccessContext::System()).bSuccess);
-	TestTrue(TEXT("the target hand starts occupied"), Fixture.Store->AddItem(
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Belt)));
+	TestTrue(TEXT("the target hand starts occupied"), Fixture.Add(
 		PreviousHandItem,
-		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Hand_Right),
-		FPEPItemAccessContext::System()).bSuccess);
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Hand_Right)));
 	TestTrue(TEXT("preview validates without moving the item"),
 		Fixture.Equipment->PreviewEquipItem(
 			ItemId,
@@ -564,15 +606,184 @@ bool FPEPEquipmentGenericStoreTest::RunTest(const FString& Parameters)
 		static_cast<int32>(EPEPRequestResult::Executed));
 	TestTrue(TEXT("the equipment request allocates a correlation id"), RequestId > 0);
 
-	FPEPEquippedItemPublic RightHand;
+	/* An equip this component executes rebuilds the projection before returning: no flush. */
+	FPEPEquippedItemInfo RightHand;
 	TestTrue(TEXT("the public projection reflects the generic store move"),
-		Fixture.Equipment->GetActiveHandItem(EPEPEquipmentHand::Right, RightHand));
+		Fixture.Equipment->FindItemInHand(EPEPEquipmentHand::Right, RightHand));
 	TestTrue(TEXT("the right hand carries the requested item"), RightHand.ItemId == ItemId);
 	FPEPItemLocation DisplacedLocation;
 	TestTrue(TEXT("the displaced item remains in the generic store"),
 		Fixture.Store->FindItemLocation(PreviousHandItemId, DisplacedLocation));
 	TestTrue(TEXT("the displaced item atomically takes the source slot"),
 		DisplacedLocation.LocationTag == PEPEquipmentTags::Equipment_Slot_Belt);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentHandFromProfileTest,
+	"PEP.Equipment.PublicProjection.HandIsDerivedFromTheProfileDeterministically",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentHandFromProfileTest::RunTest(const FString& Parameters)
+{
+	/* Invalid as an asset (one hand on two slots), which is exactly what must stay deterministic. */
+	UPEPEquipmentProfile* Profile = NewObject<UPEPEquipmentProfile>(GetTransientPackage());
+	FPEPEquipmentSlotDefinition& PrimarySlot = Profile->Slots.AddDefaulted_GetRef();
+	PrimarySlot.SlotTag = PEPEquipmentTags::Equipment_Slot_Primary;
+	PrimarySlot.Hand = EPEPEquipmentHand::Right;
+	FPEPEquipmentSlotDefinition& HandSlot = Profile->Slots.AddDefaulted_GetRef();
+	HandSlot.SlotTag = PEPEquipmentTags::Equipment_Slot_Hand_Right;
+	HandSlot.Hand = EPEPEquipmentHand::Right;
+	FFixture Fixture(false, Profile);
+
+	TestEqual(TEXT("the profile gives the slot its hand"),
+		Fixture.Equipment->GetSlotHand(PEPEquipmentTags::Equipment_Slot_Primary),
+		EPEPEquipmentHand::Right);
+	TestEqual(TEXT("a slot outside the profile has no hand"),
+		Fixture.Equipment->GetSlotHand(PEPEquipmentTags::Equipment_Slot_Head),
+		EPEPEquipmentHand::None);
+
+	UPEPItemDefinition* Definition = Fixture.MakeDefinition(
+		TEXT("EquipmentHandFromProfile"),
+		FPEPEquipmentPresentationFragment());
+	FPEPItemInstance InHand = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	FPEPItemInstance InPrimary = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	const FPEPItemId InHandId = InHand.ItemId;
+	const FPEPItemId InPrimaryId = InPrimary.ItemId;
+
+	/* Added in the opposite order to the profile, so array order would give the other answer. */
+	TestTrue(TEXT("the hand slot takes an item"), Fixture.Add(
+		InHand,
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Hand_Right)));
+	TestTrue(TEXT("the primary slot takes an item"), Fixture.Add(
+		InPrimary,
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Primary)));
+
+	FPEPEquippedItemInfo Found;
+	TestTrue(TEXT("the right hand holds something"),
+		Fixture.Equipment->FindItemInHand(EPEPEquipmentHand::Right, Found));
+	TestTrue(TEXT("the first slot in profile order wins"), Found.ItemId == InPrimaryId);
+
+	TestTrue(TEXT("the primary item leaves"), Fixture.Store->RemoveItem(
+		InPrimaryId,
+		FPEPItemAccessContext::System()).bSuccess);
+	Fixture.Flush();
+	TestTrue(TEXT("the next declaring slot answers"),
+		Fixture.Equipment->FindItemInHand(EPEPEquipmentHand::Right, Found)
+		&& Found.ItemId == InHandId);
+	TestFalse(TEXT("an undeclared hand holds nothing"),
+		Fixture.Equipment->FindItemInHand(EPEPEquipmentHand::Left, Found));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentTemporaryPresentationGuardTest,
+	"PEP.Equipment.Presentation.TemporaryPropsAreCappedAndNeedAccess",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentTemporaryPresentationGuardTest::RunTest(const FString& Parameters)
+{
+	FFixture Fixture;
+	UPEPItemDefinition* Definition = Fixture.MakeDefinition(
+		TEXT("EquipmentTemporaryGuard"),
+		FPEPEquipmentPresentationFragment());
+
+	FPEPItemInstance Bag = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	const FPEPItemId BagId = Bag.ItemId;
+	TestTrue(TEXT("a bag equips"), Fixture.Add(
+		Bag,
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Back)));
+	TArray<FPEPItemId> Pocketed;
+	for (int32 Index = 0; Index < 6; ++Index)
+	{
+		FPEPItemInstance Item = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+		Pocketed.Add(Item.ItemId);
+		TestTrue(TEXT("an item enters the bag"), Fixture.Add(
+			Item,
+			FPEPItemLocation::MakeItemContainer(
+				BagId,
+				FName(*FString::Printf(TEXT("pocket_%d"), Index)))));
+	}
+	const FName Socket(TEXT("hand_r"));
+	const auto Show = [&Fixture, Socket](const FPEPItemId ItemId, const TCHAR* Key)
+	{
+		return Fixture.Equipment->RequestShowTemporaryItemPresentation(ItemId, FName(Key), Socket);
+	};
+
+	TestTrue(TEXT("first key"), Show(Pocketed[0], TEXT("K1")));
+	TestTrue(TEXT("second key"), Show(Pocketed[1], TEXT("K2")));
+	TestTrue(TEXT("third key"), Show(Pocketed[2], TEXT("K3")));
+	TestTrue(TEXT("fourth key reaches the default cap"), Show(Pocketed[3], TEXT("K4")));
+	TestFalse(TEXT("a fifth key is refused"), Show(Pocketed[4], TEXT("K5")));
+	TestTrue(TEXT("a live key may still be replaced"), Show(Pocketed[4], TEXT("K1")));
+
+	Fixture.Equipment->RequestHideTemporaryItemPresentation(TEXT("K2"));
+	TestTrue(TEXT("hiding a key frees its room"), Show(Pocketed[5], TEXT("K5")));
+
+	Fixture.Equipment->RequestHideTemporaryItemPresentation(TEXT("K3"));
+	Fixture.Store->DeniedGameplayAccess.Add(Pocketed[0]);
+	TestFalse(TEXT("an item out of reach for every gameplay action is refused"),
+		Show(Pocketed[0], TEXT("K6")));
+	FPEPItemId Foreign;
+	Foreign.Value = 987654;
+	TestFalse(TEXT("an item outside the store is refused"), Show(Foreign, TEXT("K6")));
+	TestFalse(TEXT("a key is required"),
+		Fixture.Equipment->RequestShowTemporaryItemPresentation(Pocketed[1], NAME_None, Socket));
+	TestFalse(TEXT("a socket is required"),
+		Fixture.Equipment->RequestShowTemporaryItemPresentation(
+			Pocketed[1],
+			TEXT("K6"),
+			NAME_None));
+	TestTrue(TEXT("a reachable item still fits the freed room"), Show(Pocketed[1], TEXT("K6")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentPresentationWaitsForBeginPlayTest,
+	"PEP.Equipment.Presentation.WaitsForBeginPlayAndAttachesToTheMesh",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentPresentationWaitsForBeginPlayTest::RunTest(const FString& Parameters)
+{
+	FFixture Fixture(true, nullptr, false);
+
+	/* A capsule-like root and the character mesh under it, as on a pawn. */
+	USceneComponent* Root = NewObject<USceneComponent>(Fixture.Owner);
+	Fixture.Owner->SetRootComponent(Root);
+	Root->RegisterComponent();
+	USkeletalMeshComponent* Mesh = NewObject<USkeletalMeshComponent>(Fixture.Owner);
+	Mesh->SetupAttachment(Root);
+	Mesh->RegisterComponent();
+
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(GetTransientPackage());
+	FPEPStaticMeshEquipmentVisual Visual;
+	Visual.Mesh = StaticMesh;
+	FPEPEquipmentPresentationFragment Presentation;
+	Presentation.Visual = FInstancedStruct::Make(Visual);
+	UPEPItemDefinition* Definition = Fixture.MakeDefinition(
+		TEXT("EquipmentWaitsForBeginPlay"),
+		Presentation);
+	FPEPItemInstance Item = PEPItemAutomationTestSupport::MakeItemForTests(Definition);
+	const FPEPItemId ItemId = Item.ItemId;
+
+	/* The store fills before BeginPlay, as on a server spawning a loadout or a late joiner. */
+	TestTrue(TEXT("the item equips before BeginPlay"), Fixture.Add(
+		Item,
+		FPEPItemLocation::MakeNamedSlot(PEPEquipmentTags::Equipment_Slot_Primary)));
+	FPEPLocalPresentationTarget Target;
+	TestFalse(TEXT("no visual is built before BeginPlay"),
+		Fixture.Equipment->FindLocalPresentationTarget(ItemId, Target));
+
+	Fixture.BeginPlay();
+	TestTrue(TEXT("BeginPlay builds the visual"),
+		Fixture.Equipment->FindLocalPresentationTarget(ItemId, Target));
+	const AActor* Actor = Target.PresentationActor.Get();
+	TestTrue(TEXT("the visual hangs off the discovered mesh, not the root"),
+		Actor && Actor->GetRootComponent()
+		&& Actor->GetRootComponent()->GetAttachParent() == Mesh);
+	FPEPEquippedItemInfo Node;
+	TestTrue(TEXT("the projection includes the item equipped before BeginPlay"),
+		Fixture.Equipment->FindPublicPresentationNode(ItemId, Node));
 	return true;
 }
 

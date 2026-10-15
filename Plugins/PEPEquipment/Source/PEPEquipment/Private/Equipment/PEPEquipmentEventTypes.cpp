@@ -4,13 +4,13 @@
 
 namespace
 {
-	using FPEPNodeIndex = TMap<FPEPItemId, const FPEPEquippedItemPublic*>;
+	using FPEPNodeIndex = TMap<FPEPItemId, const FPEPEquippedItemInfo*>;
 
-	void IndexNodes(const TArray<FPEPEquippedItemPublic>& Nodes, FPEPNodeIndex& OutIndex)
+	void IndexNodes(const TArray<FPEPEquippedItemInfo>& Nodes, FPEPNodeIndex& OutIndex)
 	{
 		OutIndex.Reset();
 		OutIndex.Reserve(Nodes.Num());
-		for (const FPEPEquippedItemPublic& Node : Nodes)
+		for (const FPEPEquippedItemInfo& Node : Nodes)
 		{
 			if (Node.ItemId.IsValid())
 			{
@@ -26,7 +26,7 @@ namespace
 		while (bGrew)
 		{
 			bGrew = false;
-			for (const TPair<FPEPItemId, const FPEPEquippedItemPublic*>& Pair : Index)
+			for (const TPair<FPEPItemId, const FPEPEquippedItemInfo*>& Pair : Index)
 			{
 				const FPEPItemId ParentItemId = Pair.Value->ParentItemId;
 				if (ParentItemId.IsValid() && !Set.Contains(Pair.Key) && Set.Contains(ParentItemId))
@@ -40,20 +40,20 @@ namespace
 
 	FPEPEquipmentChange DescribeChange(
 		const FPEPNodeIndex& Index,
-		const FPEPEquippedItemPublic& Node,
+		const FPEPEquippedItemInfo& Node,
 		const EPEPEquipmentChangeType ChangeType)
 	{
 		FPEPEquipmentChange Change;
 		Change.ChangeType = ChangeType;
 		Change.Node = Node;
 
-		const FPEPEquippedItemPublic* Current = &Node;
+		const FPEPEquippedItemInfo* Current = &Node;
 		TSet<FPEPItemId> Visited;
 		int32 Depth = 0;
 		while (Current->ParentItemId.IsValid() && !Visited.Contains(Current->ItemId))
 		{
 			Visited.Add(Current->ItemId);
-			const FPEPEquippedItemPublic* const* Parent = Index.Find(Current->ParentItemId);
+			const FPEPEquippedItemInfo* const* Parent = Index.Find(Current->ParentItemId);
 			if (!Parent)
 			{
 				break;
@@ -68,8 +68,8 @@ namespace
 }
 
 bool PEPEquipmentEvents::IsSameEquippedNode(
-	const FPEPEquippedItemPublic& A,
-	const FPEPEquippedItemPublic& B)
+	const FPEPEquippedItemInfo& A,
+	const FPEPEquippedItemInfo& B)
 {
 	return A.ItemId == B.ItemId
 		&& A.DefinitionId == B.DefinitionId
@@ -79,8 +79,8 @@ bool PEPEquipmentEvents::IsSameEquippedNode(
 }
 
 void PEPEquipmentEvents::DiffPublicProjection(
-	const TArray<FPEPEquippedItemPublic>& Previous,
-	const TArray<FPEPEquippedItemPublic>& Current,
+	const TArray<FPEPEquippedItemInfo>& Previous,
+	const TArray<FPEPEquippedItemInfo>& Current,
 	TArray<FPEPEquipmentChange>& OutUnequipped,
 	TArray<FPEPEquipmentChange>& OutEquipped)
 {
@@ -94,17 +94,17 @@ void PEPEquipmentEvents::DiffPublicProjection(
 
 	TSet<FPEPItemId> Left;
 	TSet<FPEPItemId> Entered;
-	for (const TPair<FPEPItemId, const FPEPEquippedItemPublic*>& Pair : PreviousIndex)
+	for (const TPair<FPEPItemId, const FPEPEquippedItemInfo*>& Pair : PreviousIndex)
 	{
-		const FPEPEquippedItemPublic* const* Now = CurrentIndex.Find(Pair.Key);
+		const FPEPEquippedItemInfo* const* Now = CurrentIndex.Find(Pair.Key);
 		if (!Now || !IsSameEquippedNode(*Pair.Value, **Now))
 		{
 			Left.Add(Pair.Key);
 		}
 	}
-	for (const TPair<FPEPItemId, const FPEPEquippedItemPublic*>& Pair : CurrentIndex)
+	for (const TPair<FPEPItemId, const FPEPEquippedItemInfo*>& Pair : CurrentIndex)
 	{
-		const FPEPEquippedItemPublic* const* Before = PreviousIndex.Find(Pair.Key);
+		const FPEPEquippedItemInfo* const* Before = PreviousIndex.Find(Pair.Key);
 		if (!Before || !IsSameEquippedNode(**Before, *Pair.Value))
 		{
 			Entered.Add(Pair.Key);

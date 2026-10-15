@@ -49,6 +49,8 @@ namespace PEPEquipmentEventTest
 			Listener->RegisterComponent();
 			Listener->Listen(Equipment);
 			World->BeginPlay();
+			/* The fixture world has no game mode: nothing begins play unless told to. */
+			Owner->DispatchBeginPlay();
 		}
 
 		~FEventFixture()
@@ -76,9 +78,18 @@ namespace PEPEquipmentEventTest
 			return PEPItemAutomationTestSupport::MakeItemForTests(Definition);
 		}
 
+		/** A direct store write, then the projection rebuild it would get at the next tick. */
 		bool Add(const FPEPItemInstance& Item, const FPEPItemLocation& Location)
 		{
-			return Store->AddItem(Item, Location, FPEPItemAccessContext::System()).bSuccess;
+			const bool bAdded = Store->AddItem(Item, Location, FPEPItemAccessContext::System()).bSuccess;
+			Flush();
+			return bAdded;
+		}
+
+		/* Store writes and authority resolutions land at the next tick; tests do not tick. */
+		void Flush()
+		{
+			Equipment->FlushDeferredUpdates();
 		}
 	};
 
@@ -87,13 +98,13 @@ namespace PEPEquipmentEventTest
 		return FPEPItemLocation::MakeNamedSlot(SlotTag);
 	}
 
-	FPEPEquippedItemPublic MakeNode(
+	FPEPEquippedItemInfo MakeNode(
 		const int32 ItemValue,
 		const FGameplayTag SlotTag,
 		const int32 ParentValue = INDEX_NONE,
 		const FName ParentSlotName = NAME_None)
 	{
-		FPEPEquippedItemPublic Node;
+		FPEPEquippedItemInfo Node;
 		Node.ItemId.Value = ItemValue;
 		Node.SlotTag = SlotTag;
 		Node.ParentItemId.Value = ParentValue;
@@ -128,11 +139,11 @@ bool FPEPEquipmentEventDiffOrderTest::RunTest(const FString& Parameters)
 	const FGameplayTag Head = PEPEquipmentTags::Equipment_Slot_Head;
 
 	/* Rifle 10 with optic 11 moves hand -> back; helmet 5 stays; array order is scrambled. */
-	const TArray<FPEPEquippedItemPublic> Previous {
+	const TArray<FPEPEquippedItemInfo> Previous {
 		MakeNode(11, FGameplayTag(), 10, TEXT("optic")),
 		MakeNode(5, Head),
 		MakeNode(10, Hand) };
-	const TArray<FPEPEquippedItemPublic> Current {
+	const TArray<FPEPEquippedItemInfo> Current {
 		MakeNode(5, Head),
 		MakeNode(10, Back),
 		MakeNode(11, FGameplayTag(), 10, TEXT("optic")) };
@@ -164,7 +175,7 @@ bool FPEPEquipmentEventDiffOrderTest::RunTest(const FString& Parameters)
 			return Change.Node.ItemId.Value == 5;
 		}));
 
-	TArray<FPEPEquippedItemPublic> Reordered = Current;
+	TArray<FPEPEquippedItemInfo> Reordered = Current;
 	Algo::Reverse(Reordered);
 	TArray<FPEPEquipmentChange> UnequippedAgain;
 	TArray<FPEPEquipmentChange> EquippedAgain;
@@ -217,9 +228,16 @@ bool FPEPEquipmentEventAuthorityTest::RunTest(const FString& Parameters)
 			&& Changes[1].Node.ParentItemId == RifleId);
 	}
 
-	/* A receive that changed nothing — or a listen server never receiving at all — is silent. */
+	/* A store change that leaves the projection as it was is silent. */
 	Changes.Reset();
-	Fixture.Equipment->HandlePublicEquipmentReplicated();
+	TestTrue(TEXT("the rifle's state changes in place"), Fixture.Store->MutateItem(
+		RifleId,
+		[](FPEPItemInstance&)
+		{
+			return true;
+		},
+		FPEPItemAccessContext::System()).bSuccess);
+	Fixture.Flush();
 	TestEqual(TEXT("re-announcing an unchanged projection raises nothing"), Changes.Num(), 0);
 
 	int32 RequestId = 0;
@@ -243,6 +261,7 @@ bool FPEPEquipmentEventAuthorityTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("the optic leaves the store"), Fixture.Store->RemoveItem(
 		OpticId,
 		FPEPItemAccessContext::System()).bSuccess);
+	Fixture.Flush();
 	TestTrue(TEXT("removing the optic announces only the optic"),
 		Changes.Num() == 1
 		&& IsChange(Changes[0], EPEPEquipmentChangeType::Unequipped, OpticId, Back));
@@ -279,6 +298,9 @@ bool FPEPEquipmentUnequipTest::RunTest(const FString& Parameters)
 			FPEPItemLocation(),
 			RequestId)),
 		static_cast<int32>(EPEPRequestResult::Failed));
+	TestEqual(TEXT("an authority resolution is not raised inside the call"),
+		Fixture.Listener->Resolutions.Num(), 0);
+	Fixture.Flush();
 	TestTrue(TEXT("the refusal is resolved with its request id and says why"),
 		Fixture.Listener->Resolutions.Num() == 1
 		&& Fixture.Listener->Resolutions[0].RequestId == RequestId
@@ -301,7 +323,7 @@ bool FPEPEquipmentUnequipTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("authority unequip moves the rifle"), Result.Result.bSuccess);
 	Fixture.Store->FindItemLocation(RifleId, RifleLocation);
 	TestTrue(TEXT("the rifle is now in the backpack"), RifleLocation == IntoBackpack);
-	FPEPEquippedItemPublic Unused;
+	FPEPEquippedItemInfo Unused;
 	TestFalse(TEXT("the rifle left the projection"),
 		Fixture.Equipment->FindPublicPresentationNode(RifleId, Unused));
 	TestTrue(TEXT("unequip announces the rifle leaving its slot"),
@@ -323,6 +345,7 @@ bool FPEPEquipmentUnequipTest::RunTest(const FString& Parameters)
 			IntoBackpack,
 			RequestId)),
 		static_cast<int32>(EPEPRequestResult::Failed));
+	Fixture.Flush();
 	TestTrue(TEXT("a container cannot be unequipped into itself"),
 		Fixture.Listener->Resolutions.Num() == 1
 		&& Fixture.Listener->Resolutions[0].Result.ReasonTag == PEPCoreTags::Reason_InvalidTarget);
@@ -357,6 +380,7 @@ bool FPEPEquipmentEligibilityProviderTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("the authoritative equip is refused"),
 		static_cast<int32>(Fixture.Equipment->RequestEquipItem(PistolId, Hand, RequestId)),
 		static_cast<int32>(EPEPRequestResult::Failed));
+	Fixture.Flush();
 	TestTrue(TEXT("the refusal resolves with the provider's reason"),
 		Fixture.Listener->Resolutions.Num() == 1
 		&& Fixture.Listener->Resolutions[0].Result.ReasonTag == PEPCoreTags::Reason_OutOfRange);
@@ -378,6 +402,169 @@ bool FPEPEquipmentEligibilityProviderTest::RunTest(const FString& Parameters)
 		static_cast<int32>(EPEPRequestResult::Executed));
 	TestTrue(TEXT("the provider was consulted for the allowed equip"),
 		Fixture.Listener->EligibilityQueries > QueriesBefore);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentStoreWritesFoldTest,
+	"PEP.Equipment.Events.StoreWritesFoldIntoOneRebuild",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentStoreWritesFoldTest::RunTest(const FString& Parameters)
+{
+	using PEPEquipmentEventTest::IsChange;
+	using PEPEquipmentEventTest::Slot;
+	FEventFixture Fixture;
+	const FGameplayTag Hand = PEPEquipmentTags::Equipment_Slot_Hand_Right;
+	const FGameplayTag Head = PEPEquipmentTags::Equipment_Slot_Head;
+
+	FPEPItemInstance Rifle = Fixture.MakeItem(TEXT("EquipmentFoldRifle"));
+	FPEPItemInstance Helmet = Fixture.MakeItem(TEXT("EquipmentFoldHelmet"));
+	const FPEPItemId RifleId = Rifle.ItemId;
+	const FPEPItemId HelmetId = Helmet.ItemId;
+
+	/* Written straight to the store, as an inventory UI or a loot grant would. */
+	TestTrue(TEXT("the rifle enters the store"), Fixture.Store->AddItem(
+		Rifle,
+		Slot(Hand),
+		FPEPItemAccessContext::System()).bSuccess);
+	TestTrue(TEXT("the helmet enters the store"), Fixture.Store->AddItem(
+		Helmet,
+		Slot(Head),
+		FPEPItemAccessContext::System()).bSuccess);
+	FPEPEquippedItemInfo Unused;
+	TestFalse(TEXT("the projection waits for the next tick"),
+		Fixture.Equipment->FindPublicPresentationNode(RifleId, Unused));
+	TestEqual(TEXT("no event is raised write by write"), Fixture.Listener->Changes.Num(), 0);
+
+	Fixture.Flush();
+	TArray<FPEPEquipmentChange>& Changes = Fixture.Listener->Changes;
+	TestEqual(TEXT("one rebuild announces both"), Changes.Num(), 2);
+	const FPEPItemId FirstId = RifleId.Value < HelmetId.Value ? RifleId : HelmetId;
+	TestTrue(TEXT("in ItemId order, whatever the write order"),
+		Changes.Num() == 2
+		&& Changes[0].ChangeType == EPEPEquipmentChangeType::Equipped
+		&& Changes[0].Node.ItemId == FirstId);
+
+	/* State changing in place rebuilds nothing, unless the projected definition itself changes. */
+	Changes.Reset();
+	TestTrue(TEXT("the rifle's state ticks"), Fixture.Store->MutateItem(
+		RifleId,
+		[](FPEPItemInstance&)
+		{
+			return true;
+		},
+		FPEPItemAccessContext::System()).bSuccess);
+	Fixture.Flush();
+	TestEqual(TEXT("a state change on an equipped item is silent"), Changes.Num(), 0);
+
+	const FPrimaryAssetId UpgradedDefinitionId =
+		Fixture.MakeItem(TEXT("EquipmentFoldRifleUpgraded")).DefinitionId;
+	TestTrue(TEXT("the rifle turns into another definition in place"), Fixture.Store->MutateItem(
+		RifleId,
+		[UpgradedDefinitionId](FPEPItemInstance& Item)
+		{
+			Item.DefinitionId = UpgradedDefinitionId;
+			return true;
+		},
+		FPEPItemAccessContext::System()).bSuccess);
+	Fixture.Flush();
+	TestTrue(TEXT("a definition swap re-announces the node"),
+		Changes.Num() == 2
+		&& IsChange(Changes[0], EPEPEquipmentChangeType::Unequipped, RifleId, Hand)
+		&& IsChange(Changes[1], EPEPEquipmentChangeType::Equipped, RifleId, Hand)
+		&& Changes[1].Node.DefinitionId == UpgradedDefinitionId);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentLocalResolutionTest,
+	"PEP.Equipment.Request.AuthorityResolvesLocallyAfterReturning",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentLocalResolutionTest::RunTest(const FString& Parameters)
+{
+	using PEPEquipmentEventTest::Slot;
+	FEventFixture Fixture;
+	FPEPItemInstance Pistol = Fixture.MakeItem(TEXT("EquipmentResolutionPistol"));
+	const FPEPItemId PistolId = Pistol.ItemId;
+	TestTrue(TEXT("the pistol sits on the belt"),
+		Fixture.Add(Pistol, Slot(PEPEquipmentTags::Equipment_Slot_Belt)));
+
+	int32 FirstRequestId = 0;
+	int32 SecondRequestId = 0;
+	TestEqual(TEXT("the authority executes the equip at once"),
+		static_cast<int32>(Fixture.Equipment->RequestEquipItem(
+			PistolId,
+			PEPEquipmentTags::Equipment_Slot_Hand_Right,
+			FirstRequestId)),
+		static_cast<int32>(EPEPRequestResult::Executed));
+	FPEPEquippedItemInfo Node;
+	TestTrue(TEXT("its own equip is projected before the call returns"),
+		Fixture.Equipment->FindPublicPresentationNode(PistolId, Node)
+		&& Node.SlotTag == PEPEquipmentTags::Equipment_Slot_Hand_Right);
+	TestEqual(TEXT("the moves are announced before returning too"),
+		Fixture.Listener->Changes.Num(), 3);
+	TestEqual(TEXT("a second request gets the next id"),
+		static_cast<int32>(Fixture.Equipment->RequestEquipItem(
+			PistolId,
+			PEPEquipmentTags::Equipment_Slot_Primary,
+			SecondRequestId)),
+		static_cast<int32>(EPEPRequestResult::Executed));
+	TestEqual(TEXT("nothing resolves inside the calls"), Fixture.Listener->Resolutions.Num(), 0);
+
+	Fixture.Flush();
+	TArray<FPEPEquipmentRequestResult>& Resolutions = Fixture.Listener->Resolutions;
+	TestTrue(TEXT("both resolve here, in request order, with the ids the caller holds"),
+		Resolutions.Num() == 2
+		&& Resolutions[0].RequestId == FirstRequestId
+		&& Resolutions[1].RequestId == SecondRequestId
+		&& FirstRequestId != SecondRequestId
+		&& Resolutions[0].Result.bSuccess
+		&& Resolutions[1].Result.bSuccess);
+	Fixture.Flush();
+	TestEqual(TEXT("a resolution is raised once"), Resolutions.Num(), 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPEPEquipmentEligibilityOrderTest,
+	"PEP.Equipment.Eligibility.ProvidersAnswerInNameOrder",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FPEPEquipmentEligibilityOrderTest::RunTest(const FString& Parameters)
+{
+	using PEPEquipmentEventTest::Slot;
+	FEventFixture Fixture;
+	const FGameplayTag Hand = PEPEquipmentTags::Equipment_Slot_Hand_Right;
+
+	/* Registered in the opposite order to their names: the name decides, not the registration. */
+	UPEPTestEquipmentListenerComponent* Second =
+		NewObject<UPEPTestEquipmentListenerComponent>(Fixture.Owner, TEXT("ProviderB"));
+	Second->RefusedSlotTag = Hand;
+	Second->RefusalReasonTag = PEPCoreTags::Reason_StateMismatch;
+	Second->RegisterComponent();
+	UPEPTestEquipmentListenerComponent* First =
+		NewObject<UPEPTestEquipmentListenerComponent>(Fixture.Owner, TEXT("ProviderA"));
+	First->RefusedSlotTag = Hand;
+	First->RefusalReasonTag = PEPCoreTags::Reason_OutOfRange;
+	First->RegisterComponent();
+
+	FPEPItemInstance Pistol = Fixture.MakeItem(TEXT("EquipmentEligibilityOrderPistol"));
+	const FPEPItemId PistolId = Pistol.ItemId;
+	TestTrue(TEXT("the pistol sits on the belt"),
+		Fixture.Add(Pistol, Slot(PEPEquipmentTags::Equipment_Slot_Belt)));
+
+	const FPEPItemResult Preview = Fixture.Equipment->PreviewEquipItem(PistolId, Hand);
+	TestTrue(TEXT("the first provider by name answers"),
+		!Preview.bSuccess && Preview.ReasonTag == PEPCoreTags::Reason_OutOfRange);
+	TestEqual(TEXT("the second is never asked once the first refused"),
+		Second->EligibilityQueries, 0);
+
+	First->RefusedSlotTag = FGameplayTag();
+	const FPEPItemResult Next = Fixture.Equipment->PreviewEquipItem(PistolId, Hand);
+	TestTrue(TEXT("with the first allowing, the second's refusal stands"),
+		!Next.bSuccess && Next.ReasonTag == PEPCoreTags::Reason_StateMismatch);
 	return true;
 }
 

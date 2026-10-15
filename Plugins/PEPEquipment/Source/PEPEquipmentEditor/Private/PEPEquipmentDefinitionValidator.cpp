@@ -68,7 +68,14 @@ EDataValidationResult UPEPEquipmentDefinitionValidator::ValidateLoadedAsset_Impl
 		}
 	}
 
-	if (Container && !Presentation->IsExplicitlyInvisible())
+	/*
+	 * Sockets can only be checked against a mesh the fragment names. An Actor visual without a
+	 * MeshVisual brings its geometry in its own class — components a Blueprint adds — which no
+	 * asset-level check can see; failing it here was a false positive on every such actor.
+	 */
+	const bool bHasMeshToCheck = Presentation->GetStaticMeshVisual() != nullptr
+		|| Presentation->GetSkeletalMeshVisual() != nullptr;
+	if (Container && !Presentation->IsExplicitlyInvisible() && bHasMeshToCheck)
 	{
 		for (const FPEPContainerSlotDefinition& Slot : Container->Slots)
 		{

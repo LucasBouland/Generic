@@ -9,6 +9,7 @@
 #include "Engine/StreamableManager.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/Pawn.h"
 #include "Item/Fragments/PEPItemFragment_EquipmentAbilities.h"
 #include "Item/PEPItemDefinition.h"
 #include "Item/PEPItemInstance.h"
@@ -93,10 +94,31 @@ bool UPEPEquipmentAbilityBridgeComponent::HasOwnerAuthority() const
 	return Owner && Owner->HasAuthority();
 }
 
+bool UPEPEquipmentAbilityBridgeComponent::NeedsAbilityMap() const
+{
+	/*
+	 * By role first: a listen server's view of another player's pawn is the authority and must
+	 * grant, and a client's own pawn is its autonomous proxy. Local control as well, because right
+	 * after possession the owning client can see its controller before the new role arrives.
+	 */
+	const AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return false;
+	}
+	if (Owner->GetLocalRole() != ROLE_SimulatedProxy)
+	{
+		return true;
+	}
+	const APawn* Pawn = Cast<APawn>(Owner);
+	return Pawn && Pawn->IsLocallyControlled();
+}
+
 bool UPEPEquipmentAbilityBridgeComponent::IsReadyToApply() const
 {
 	const UGMC_AbilitySystemComponent* ASC = CachedAbilitySystem.Get();
-	return bInitialSyncDone && CachedEquipment.IsValid() && ASC && ASC->HasBegunPlay();
+	return bInitialSyncDone && CachedEquipment.IsValid() && ASC && ASC->HasBegunPlay()
+		&& NeedsAbilityMap();
 }
 
 void UPEPEquipmentAbilityBridgeComponent::BeginPlay()
@@ -124,6 +146,12 @@ void UPEPEquipmentAbilityBridgeComponent::BeginPlay()
 	EquipmentComponent->OnItemUnequipped.AddDynamic(
 		this,
 		&UPEPEquipmentAbilityBridgeComponent::HandleItemUnequipped);
+	if (APawn* Pawn = Cast<APawn>(GetOwner()))
+	{
+		Pawn->ReceiveControllerChangedDelegate.AddDynamic(
+			this,
+			&UPEPEquipmentAbilityBridgeComponent::HandleControllerChanged);
+	}
 	TryInitialSync();
 }
 
@@ -137,6 +165,12 @@ void UPEPEquipmentAbilityBridgeComponent::EndPlay(const EEndPlayReason::Type End
 		EquipmentComponent->OnItemUnequipped.RemoveDynamic(
 			this,
 			&UPEPEquipmentAbilityBridgeComponent::HandleItemUnequipped);
+	}
+	if (APawn* Pawn = Cast<APawn>(GetOwner()))
+	{
+		Pawn->ReceiveControllerChangedDelegate.RemoveDynamic(
+			this,
+			&UPEPEquipmentAbilityBridgeComponent::HandleControllerChanged);
 	}
 	if (const UWorld* World = GetWorld())
 	{
@@ -196,8 +230,18 @@ void UPEPEquipmentAbilityBridgeComponent::TryInitialSync()
 void UPEPEquipmentAbilityBridgeComponent::ReconcileWithProjection()
 {
 	const UPEPEquipmentComponent* EquipmentComponent = CachedEquipment.Get();
-	if (!IsReadyToApply() || !EquipmentComponent)
+	const UGMC_AbilitySystemComponent* ASC = CachedAbilitySystem.Get();
+	if (!bInitialSyncDone || !EquipmentComponent || !ASC || !ASC->HasBegunPlay())
 	{
+		return;
+	}
+	if (!NeedsAbilityMap())
+	{
+		/*
+		 * Not, or no longer, a pawn this machine drives: drop the local entries earlier writes left
+		 * (never a grant: a simulated proxy is not the authority).
+		 */
+		RevokeAll();
 		return;
 	}
 
@@ -205,7 +249,7 @@ void UPEPEquipmentAbilityBridgeComponent::ReconcileWithProjection()
 	TArray<FPEPEquipmentChange> Unused;
 	TArray<FPEPEquipmentChange> Desired;
 	PEPEquipmentEvents::DiffPublicProjection(
-		TArray<FPEPEquippedItemPublic>(),
+		TArray<FPEPEquippedItemInfo>(),
 		EquipmentComponent->GetPublicPresentationNodes(),
 		Unused,
 		Desired);
@@ -250,9 +294,29 @@ void UPEPEquipmentAbilityBridgeComponent::HandleItemUnequipped(const FPEPEquipme
 	}
 }
 
+void UPEPEquipmentAbilityBridgeComponent::HandleControllerChanged(
+	APawn* Pawn,
+	AController* OldController,
+	AController* NewController)
+{
+	(void)Pawn;
+	(void)OldController;
+	(void)NewController;
+	/*
+	 * Next tick: on a client the new role can land in the same bunch as the controller, after this
+	 * callback. Reconciling is idempotent, so a role that did not change costs one diff.
+	 */
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimerForNextTick(
+			this,
+			&UPEPEquipmentAbilityBridgeComponent::ReconcileWithProjection);
+	}
+}
+
 void UPEPEquipmentAbilityBridgeComponent::ApplyChange(const FPEPEquipmentChange& Change)
 {
-	const FPEPEquippedItemPublic& Node = Change.Node;
+	const FPEPEquippedItemInfo& Node = Change.Node;
 	UGMC_AbilitySystemComponent* ASC = CachedAbilitySystem.Get();
 	if (!ASC || !Node.ItemId.IsValid())
 	{

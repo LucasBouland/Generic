@@ -24,8 +24,6 @@ public:
 	const FPEPPresentationTargetDefinition* FindPresentationTarget(
 		FGameplayTag TargetTag) const;
 
-	const FPEPEquipmentSlotDefinition* FindSlot(FGameplayTag SlotTag) const;
-
 #if WITH_EDITOR
 	virtual EDataValidationResult IsDataValid(FDataValidationContext& Context) const override;
 #endif

@@ -4,6 +4,7 @@
 #include "Core/PEPTypes.h"
 #include "GameplayTagContainer.h"
 #include "Item/PEPItemResultTypes.h"
+#include "UObject/PrimaryAssetId.h"
 
 #include "PEPEquipmentTypes.generated.h"
 
@@ -13,6 +14,46 @@ enum class EPEPEquipmentHand : uint8
 	None,
 	Left,
 	Right
+};
+
+/**
+ * One node of the public equipment projection, as a plain value: what the getters return and the
+ * equipment events carry.
+ *
+ * The replicated Fast Array item (FPEPEquippedItemPublic) holds the same fields plus replication
+ * bookkeeping that has no business in a Blueprint payload; this is the shape everything outside
+ * the replication path reads.
+ *
+ * Which hand a node occupies is not part of it: that follows from SlotTag through the equipment
+ * profile (UPEPEquipmentComponent::GetSlotHand, FindItemInHand), so it is never sent either.
+ */
+USTRUCT(BlueprintType)
+struct PEPEQUIPMENT_API FPEPEquippedItemInfo
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	FPEPItemId ItemId;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	FPrimaryAssetId DefinitionId;
+
+	/** Equipment slot of a root. Invalid for an attachment: see ParentItemId. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment", meta=(Categories="Equipment.Slot"))
+	FGameplayTag SlotTag;
+
+	/** Valid only for a visible attachment. Invalid for an equipment-slot root. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	FPEPItemId ParentItemId;
+
+	/** Container slot on ParentItemId. The parent's presentation resolves it to a mesh socket. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	FName ParentSlotName;
+
+	bool IsAttachment() const
+	{
+		return ParentItemId.IsValid();
+	}
 };
 
 /** Determines how a root equipment slot materializes its local cosmetic presentation. */
@@ -70,6 +111,10 @@ struct PEPEQUIPMENT_API FPEPEquipmentSlotDefinition
 	EPEPEquipmentPresentationPolicy PresentationPolicy =
 		EPEPEquipmentPresentationPolicy::Attached;
 
+	/**
+	 * The hand this slot stands for, if any. Read through UPEPEquipmentComponent::GetSlotHand and
+	 * FindItemInHand; never replicated, since every machine derives it from the same profile.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
 	EPEPEquipmentHand Hand = EPEPEquipmentHand::None;
 
@@ -93,6 +138,14 @@ struct PEPEQUIPMENT_API FPEPEquipmentSlotDefinition
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
 	bool bAllowAutoEquipOnPickup = true;
 
+	/**
+	 * Whether the slot's occupant (and its visible attachments) enters the public projection.
+	 *
+	 * Everything downstream of equipment follows that projection: local visuals, OnItemEquipped /
+	 * OnItemUnequipped, and therefore anything built on those events such as the PEPEquipmentGMAS
+	 * ability bridge. A slot with this off still accepts and holds items, but an item there is
+	 * invisible to all of it: no visual, no event, no ability or effect granted.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
 	bool bShowPublicly = true;
 

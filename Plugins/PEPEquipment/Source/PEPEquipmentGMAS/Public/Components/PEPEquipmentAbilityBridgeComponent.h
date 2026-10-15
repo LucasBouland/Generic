@@ -10,6 +10,8 @@
 
 struct FStreamableHandle;
 struct FPEPItemFragment_EquipmentAbilities;
+class AController;
+class APawn;
 class UGMC_AbilitySystemComponent;
 class UPEPEquipmentComponent;
 
@@ -31,6 +33,14 @@ class UPEPEquipmentComponent;
  *
  * Equipment requests must likewise never be issued from a GMC prediction path (an ability's
  * predicted tick): they are server RPCs and would be re-sent on every replay.
+ *
+ * Only the authority and the owning client keep ability map entries: a simulated proxy (another
+ * player's pawn on this machine) never activates an ability from input, so it skips the work and
+ * holds nothing. A pawn whose role changes (possessed after spawn, unpossessed) is brought in
+ * line when its controller changes.
+ *
+ * Grants follow the PUBLIC projection: an item in a slot whose profile entry has bShowPublicly off
+ * raises no equipment event and so grants nothing, whatever its fragment says.
  */
 UCLASS(ClassGroup=(PEP), BlueprintType, meta=(BlueprintSpawnableComponent))
 class PEPEQUIPMENTGMAS_API UPEPEquipmentAbilityBridgeComponent
@@ -72,10 +82,14 @@ protected:
 	UFUNCTION()
 	void HandleItemUnequipped(const FPEPEquipmentChange& Change);
 
+	/** Possession can turn a simulated proxy into the owning client's pawn, or back. */
+	UFUNCTION()
+	void HandleControllerChanged(APawn* Pawn, AController* OldController, AController* NewController);
+
 private:
 	struct FAppliedEquipment
 	{
-		FPEPEquippedItemPublic Node;
+		FPEPEquippedItemInfo Node;
 		/** ServerAuth effect ids, authority only. */
 		TArray<int32> EffectIds;
 	};
@@ -83,6 +97,11 @@ private:
 	UGMC_AbilitySystemComponent* ResolveAbilitySystem() const;
 	UPEPEquipmentComponent* ResolveEquipment() const;
 	bool HasOwnerAuthority() const;
+	/**
+	 * Whether this machine needs ability map entries at all: the authority (which grants) and the
+	 * owning client (which activates from input) do; a simulated proxy does not.
+	 */
+	bool NeedsAbilityMap() const;
 	bool IsReadyToApply() const;
 
 	/**
@@ -90,7 +109,10 @@ private:
 	 * would overwrite anything written earlier, then applies what is already equipped.
 	 */
 	void TryInitialSync();
-	/** Brings applied state in line with the projection: used at start and after a load. */
+	/**
+	 * Brings applied state in line with the projection: used at start, after a load and after a
+	 * controller change. On a simulated proxy it gives back whatever earlier writes left.
+	 */
 	void ReconcileWithProjection();
 
 	void ApplyChange(const FPEPEquipmentChange& Change);

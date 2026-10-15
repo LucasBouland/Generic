@@ -27,6 +27,10 @@ public:
 	virtual void GetPublicChildren(
 		const FPEPItemId& ParentItemId,
 		TArray<FPEPItemId>& OutChildItemIds) const override;
+	/** Any held item, unless named in DeniedGameplayAccess. */
+	virtual bool HasGrantedGameplayAccess(
+		const FPEPItemId& ItemId,
+		FGameplayTag ActionTag) const override;
 	virtual FPEPItemResult AddItem(
 		const FPEPItemInstance& Item,
 		const FPEPItemLocation& Destination,
@@ -57,7 +61,7 @@ public:
 	virtual bool RegisterLocationValidator(
 		FGameplayTag RootLocationTag,
 		FPEPItemLocationValidator Validator,
-		bool bAllowAutoPlacement = true) override;
+		bool bAllowAutoPlacement) override;
 	virtual void UnregisterLocationValidator(
 		FGameplayTag RootLocationTag,
 		const UObject* BoundObject) override;
@@ -70,6 +74,9 @@ public:
 
 	/** This store's own notion of a public slot: a name, with no container vocabulary behind it. */
 	TSet<FName> PublicSlotNames;
+
+	/** Items this store reports as out of reach for every gameplay action, wherever they sit. */
+	TSet<FPEPItemId> DeniedGameplayAccess;
 
 private:
 	struct FStoredItem

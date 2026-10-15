@@ -9,6 +9,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StreamableManager.h"
+#include "Engine/World.h"
 #include "Equipment/PEPEquipmentEligibilityProvider.h"
 #include "Equipment/PEPEquipmentPresentationFragment.h"
 #include "Equipment/PEPEquipmentProfile.h"
@@ -41,14 +42,6 @@ namespace
 #else
 		return nullptr;
 #endif
-	}
-
-	/** Everything a local visual is built from. Hand is bookkeeping for queries, not a visual input. */
-	bool IsSamePresentationNode(
-		const FPEPEquippedItemPublic& A,
-		const FPEPEquippedItemPublic& B)
-	{
-		return PEPEquipmentEvents::IsSameEquippedNode(A, B);
 	}
 
 	/** A refusal always says why and names the item, whoever produced it. */
@@ -113,6 +106,11 @@ UPEPEquipmentComponent::UPEPEquipmentComponent()
 	SetIsReplicatedByDefault(true);
 	PublicEquipmentView.OwnerComponent = this;
 	TemporaryPresentationView.OwnerComponent = this;
+
+	/* Reachable for some gameplay action: equipped, or in a container that grants one of these. */
+	TemporaryPresentationAccessTags.AddTag(PEPItemTags::GameplayAccess_Equip);
+	TemporaryPresentationAccessTags.AddTag(PEPItemTags::GameplayAccess_Reload);
+	TemporaryPresentationAccessTags.AddTag(PEPItemTags::GameplayAccess_Use);
 
 	SlotDefinitions.Add(MakeSlot(
 		PEPEquipmentTags::Equipment_Slot_Hand_Left,
@@ -196,19 +194,43 @@ void UPEPEquipmentComponent::BeginPlay()
 		PresentationMesh = GetOwner() ? GetOwner()->FindComponentByClass<USkeletalMeshComponent>() : nullptr;
 	}
 
+	/*
+	 * Nothing local is built before this point (ReconcileLocalPresentations waits for BeginPlay),
+	 * yet a late joiner's first bunch, or a store filled on the authority before BeginPlay, may
+	 * already describe equipment. It is all built here, once, against the mesh just found rather
+	 * than the root a visual would otherwise have fallen back to. Anything that slipped through
+	 * is thrown away first.
+	 */
+	DestroyAllLocalPresentations();
+	bool bReconciled = false;
 	if (GetOwner() && GetOwner()->HasAuthority())
 	{
-		RefreshPublicProjection();
+		/* Folds every store change made before BeginPlay into one rebuild. */
+		bReconciled = RefreshPublicProjection();
 	}
 	else
 	{
+		RebuildPublicEntryIndex();
+	}
+	if (!bReconciled)
+	{
 		ReconcileLocalPresentations();
+	}
+	ApplyTemporaryPresentations();
+
+	if (bPublicProjectionDirty || bLocalPresentationReconcilePending
+		|| !PendingLocalResolutions.IsEmpty())
+	{
+		ScheduleDeferredUpdates();
 	}
 }
 
 void UPEPEquipmentComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	UninitializeItemStoreIntegration();
+	CancelDeferredUpdates();
+	PendingLocalResolutions.Reset();
+	bLocalPresentationReconcilePending = false;
 
 	for (TPair<FPrimaryAssetId, TSharedPtr<FStreamableHandle>>& Pair : DefinitionLoadHandles)
 	{
@@ -255,25 +277,40 @@ bool UPEPEquipmentComponent::SetItemStore(UObject* InItemStoreObject)
 	if (IsRegistered())
 	{
 		InitializeItemStoreIntegration();
-		RefreshPublicProjection();
+		/* Before BeginPlay, BeginPlay builds the projection from whatever store is set by then. */
+		bPublicProjectionDirty = true;
+		if (HasBegunPlay())
+		{
+			RefreshPublicProjection();
+		}
 	}
 	return true;
 }
 
 void UPEPEquipmentComponent::SetPresentationMesh(USkeletalMeshComponent* InPresentationMesh)
 {
-	if (PresentationMesh != InPresentationMesh)
-	{
-		DestroyAllLocalPresentations();
-	}
+	const bool bMeshChanged = PresentationMesh != InPresentationMesh;
 	PresentationMesh = InPresentationMesh;
+
+	bool bTargetChanged = false;
 	if (InPresentationMesh)
 	{
-		RegisterPresentationTarget(
+		RegisterPresentationTargetInternal(
 			PEPEquipmentTags::Equipment_PresentationTarget_Body_Main,
-			InPresentationMesh);
+			InPresentationMesh,
+			bTargetChanged);
 	}
-	ReconcileLocalPresentations();
+
+	/* One rebuild for both: attached roots fall back to the mesh, modular parts use the target. */
+	if (bMeshChanged || bTargetChanged)
+	{
+		RebuildLocalPresentations();
+	}
+	/* Temporary props hang off the mesh itself. */
+	if (bMeshChanged)
+	{
+		RebuildTemporaryPresentations();
+	}
 }
 
 void UPEPEquipmentComponent::SetEquipmentProfile(UPEPEquipmentProfile* InProfile)
@@ -295,27 +332,47 @@ void UPEPEquipmentComponent::SetEquipmentProfile(UPEPEquipmentProfile* InProfile
 	{
 		InitializeItemStoreIntegration();
 	}
-	DestroyAllLocalPresentations();
-	if (GetOwner() && GetOwner()->HasAuthority())
-	{
-		RefreshPublicProjection();
-	}
-	ReconcileLocalPresentations();
+	/* Setup only, so before BeginPlay: BeginPlay builds the projection and the visuals from it. */
+	bPublicProjectionDirty = true;
+	RebuildLocalPresentations();
 }
 
 bool UPEPEquipmentComponent::RegisterPresentationTarget(
 	const FGameplayTag TargetTag,
 	USceneComponent* Component)
 {
+	bool bChanged = false;
+	if (!RegisterPresentationTargetInternal(TargetTag, Component, bChanged))
+	{
+		return false;
+	}
+	/* A target moved under every visual that used it: the only honest answer is a rebuild. */
+	if (bChanged)
+	{
+		RebuildLocalPresentations();
+	}
+	return true;
+}
+
+bool UPEPEquipmentComponent::RegisterPresentationTargetInternal(
+	const FGameplayTag TargetTag,
+	USceneComponent* Component,
+	bool& bOutChanged)
+{
+	bOutChanged = false;
 	if (!TargetTag.IsValid() || !Component
 		|| (GetOwner() && Component->GetOwner() != GetOwner()))
 	{
 		return false;
 	}
 	if (const TObjectPtr<USceneComponent>* Existing =
-		RegisteredPresentationTargets.Find(TargetTag);
-		Existing && Existing->Get() != Component)
+		RegisteredPresentationTargets.Find(TargetTag))
 	{
+		if (Existing->Get() == Component)
+		{
+			/* Already there: nothing moved, nothing to rebuild. */
+			return true;
+		}
 		if (USkeletalMeshComponent* ExistingSkeletal =
 			Cast<USkeletalMeshComponent>(Existing->Get()))
 		{
@@ -330,28 +387,25 @@ bool UPEPEquipmentComponent::RegisterPresentationTarget(
 	{
 		ModularBaseMeshes.Add(TargetTag, SkeletalTarget->GetSkeletalMeshAsset());
 	}
-	/* A target moved under every visual that used it: the only honest answer is a rebuild. */
-	DestroyAllLocalPresentations();
-	ReconcileLocalPresentations();
+	bOutChanged = true;
 	return true;
 }
 
 void UPEPEquipmentComponent::UnregisterPresentationTarget(const FGameplayTag TargetTag)
 {
-	if (const TObjectPtr<USceneComponent>* Registered =
-		RegisteredPresentationTargets.Find(TargetTag))
+	const TObjectPtr<USceneComponent>* Registered = RegisteredPresentationTargets.Find(TargetTag);
+	if (!Registered)
 	{
-		if (USkeletalMeshComponent* SkeletalTarget =
-			Cast<USkeletalMeshComponent>(Registered->Get()))
-		{
-			SkeletalTarget->SetSkeletalMesh(ModularBaseMeshes.FindRef(TargetTag), false);
-		}
+		return;
+	}
+	if (USkeletalMeshComponent* SkeletalTarget = Cast<USkeletalMeshComponent>(Registered->Get()))
+	{
+		SkeletalTarget->SetSkeletalMesh(ModularBaseMeshes.FindRef(TargetTag), false);
 	}
 	RegisteredPresentationTargets.Remove(TargetTag);
 	ModularBaseMeshes.Remove(TargetTag);
 	AppliedModularItems.Remove(TargetTag);
-	DestroyAllLocalPresentations();
-	ReconcileLocalPresentations();
+	RebuildLocalPresentations();
 }
 
 bool UPEPEquipmentComponent::SetModularPresentationBaseMesh(
@@ -377,11 +431,14 @@ bool UPEPEquipmentComponent::SetModularPresentationBaseMesh(
 
 void UPEPEquipmentComponent::SetLocalPresentationEnabled(const bool bEnabled)
 {
+	if (bEnableLocalPresentation == bEnabled)
+	{
+		return;
+	}
 	bEnableLocalPresentation = bEnabled;
 	ReconcileLocalPresentations();
+	RebuildTemporaryPresentations();
 }
-
-
 
 bool UPEPEquipmentComponent::RequestShowTemporaryItemPresentation(
 	const FPEPItemId ItemId,
@@ -390,43 +447,56 @@ bool UPEPEquipmentComponent::RequestShowTemporaryItemPresentation(
 	const bool bHideOriginalPresentation)
 {
 	AActor* Owner = GetOwner();
-	const IPEPItemStore* ItemStore = GetItemStoreConst();
-	const FPEPItemInstance* Item = ItemStore ? ItemStore->FindItem(ItemId) : nullptr;
-	if (!Owner || !Item || PresentationKey.IsNone() || AttachSocket.IsNone())
+	if (!Owner)
+	{
+		return false;
+	}
+	const bool bAuthority = Owner->HasAuthority();
+	if (!bAuthority && !Owner->HasLocalNetOwner())
 	{
 		return false;
 	}
 
-	FPEPEquippedItemPublic PublicItem;
-	const FPEPItemId SuppressedItemId = bHideOriginalPresentation
-		&& FindPublicPresentationNode(ItemId, PublicItem)
-		? ItemId
-		: FPEPItemId();
-	if (Owner->HasAuthority())
+	FPrimaryAssetId DefinitionId;
+	FPEPItemId SuppressedItemId;
+	if (!ValidateTemporaryPresentationRequest(
+		ItemId,
+		PresentationKey,
+		AttachSocket,
+		bHideOriginalPresentation,
+		DefinitionId,
+		SuppressedItemId))
+	{
+		return false;
+	}
+	if (bAuthority)
 	{
 		SetTemporaryPresentationState(
 			PresentationKey,
-			Item->DefinitionId,
+			DefinitionId,
 			AttachSocket,
 			SuppressedItemId);
 		return true;
 	}
-	if (!Owner->HasLocalNetOwner())
-	{
-		return false;
-	}
 
-	// Immediate owner feedback, recorded as applied so the replicated state does not rebuild it.
-	FPEPTemporaryPresentationEntry& Applied = AppliedTemporaryPresentations.FindOrAdd(PresentationKey);
-	Applied.PresentationKey = PresentationKey;
-	Applied.DefinitionId = Item->DefinitionId;
-	Applied.AttachSocket = AttachSocket;
-	Applied.SuppressedItemId = SuppressedItemId;
-	ShowTemporaryPresentationLocal(
-		PresentationKey,
-		Item->DefinitionId,
-		AttachSocket,
-		SuppressedItemId);
+	/*
+	 * Immediate owner feedback, recorded as applied so the replicated state does not rebuild it.
+	 * Before BeginPlay there is nothing to show it on yet; the replicated entry builds it then.
+	 */
+	if (HasBegunPlay())
+	{
+		FPEPTemporaryPresentationEntry& Applied =
+			AppliedTemporaryPresentations.FindOrAdd(PresentationKey);
+		Applied.PresentationKey = PresentationKey;
+		Applied.DefinitionId = DefinitionId;
+		Applied.AttachSocket = AttachSocket;
+		Applied.SuppressedItemId = SuppressedItemId;
+		ShowTemporaryPresentationLocal(
+			PresentationKey,
+			DefinitionId,
+			AttachSocket,
+			SuppressedItemId);
+	}
 	Server_ShowTemporaryItemPresentation(
 		ItemId,
 		PresentationKey,
@@ -473,25 +543,23 @@ void UPEPEquipmentComponent::Server_ShowTemporaryItemPresentation_Implementation
 	const bool bHideOriginalPresentation)
 {
 	/*
-	 * The socket name is client-chosen and replicated to every client. Checked here, where the
-	 * server has the mesh, so a bogus name is dropped. A server with no mesh (a dedicated server
-	 * whose pawn class strips it) cannot check and lets it through.
+	 * A reliable RPC the owning client may call as often as it likes: every refusal is silent and
+	 * cheap, the key cap first and the store walk last. Nothing is written for a refused request,
+	 * so a spamming client costs one validation per call and never grows the replicated view.
 	 */
-	if (PresentationMesh && !PresentationMesh->DoesSocketExist(AttachSocket))
+	FPrimaryAssetId DefinitionId;
+	FPEPItemId SuppressedItemId;
+	if (ValidateTemporaryPresentationRequest(
+		ItemId,
+		PresentationKey,
+		AttachSocket,
+		bHideOriginalPresentation,
+		DefinitionId,
+		SuppressedItemId))
 	{
-		return;
-	}
-	const IPEPItemStore* ItemStore = GetItemStoreConst();
-	if (const FPEPItemInstance* Item = ItemStore ? ItemStore->FindItem(ItemId) : nullptr)
-	{
-		FPEPEquippedItemPublic PublicItem;
-		const FPEPItemId SuppressedItemId = bHideOriginalPresentation
-			&& FindPublicPresentationNode(ItemId, PublicItem)
-			? ItemId
-			: FPEPItemId();
 		SetTemporaryPresentationState(
 			PresentationKey,
-			Item->DefinitionId,
+			DefinitionId,
 			AttachSocket,
 			SuppressedItemId);
 	}
@@ -507,6 +575,85 @@ void UPEPEquipmentComponent::Server_HideTemporaryItemPresentation_Implementation
 	const FName PresentationKey)
 {
 	ClearTemporaryPresentationState(PresentationKey);
+}
+
+bool UPEPEquipmentComponent::ValidateTemporaryPresentationRequest(
+	const FPEPItemId ItemId,
+	const FName PresentationKey,
+	const FName AttachSocket,
+	const bool bHideOriginalPresentation,
+	FPrimaryAssetId& OutDefinitionId,
+	FPEPItemId& OutSuppressedItemId) const
+{
+	OutDefinitionId = FPrimaryAssetId();
+	OutSuppressedItemId = FPEPItemId();
+	if (!ItemId.IsValid() || PresentationKey.IsNone() || AttachSocket.IsNone()
+		|| !HasTemporaryPresentationRoom(PresentationKey))
+	{
+		return false;
+	}
+	/*
+	 * The socket name is client-chosen and replicated to every client. Checked wherever the mesh
+	 * is known, so a bogus name is dropped. A server with no mesh (a dedicated server whose pawn
+	 * class strips it) cannot check and lets it through.
+	 */
+	if (PresentationMesh && !PresentationMesh->DoesSocketExist(AttachSocket))
+	{
+		return false;
+	}
+	const IPEPItemStore* ItemStore = GetItemStoreConst();
+	const FPEPItemInstance* Item = ItemStore ? ItemStore->FindItem(ItemId) : nullptr;
+	if (!Item || !HasTemporaryPresentationAccess(*ItemStore, ItemId))
+	{
+		return false;
+	}
+	OutDefinitionId = Item->DefinitionId;
+	OutSuppressedItemId = bHideOriginalPresentation && FindPublicEntry(ItemId)
+		? ItemId
+		: FPEPItemId();
+	return true;
+}
+
+bool UPEPEquipmentComponent::HasTemporaryPresentationRoom(const FName PresentationKey) const
+{
+	const AActor* Owner = GetOwner();
+	if (Owner && Owner->HasAuthority())
+	{
+		return FindTemporaryPresentationEntry(PresentationKey) != nullptr
+			|| TemporaryPresentationView.Entries.Num() < MaxTemporaryPresentations;
+	}
+	/* The owning client counts what it shows, its own pending requests included. */
+	return AppliedTemporaryPresentations.Contains(PresentationKey)
+		|| AppliedTemporaryPresentations.Num() < MaxTemporaryPresentations;
+}
+
+bool UPEPEquipmentComponent::HasTemporaryPresentationAccess(
+	const IPEPItemStore& ItemStore,
+	const FPEPItemId ItemId) const
+{
+	const TArray<FGameplayTag>& AccessTags = TemporaryPresentationAccessTags.GetGameplayTagArray();
+	if (AccessTags.IsEmpty())
+	{
+		return true;
+	}
+	for (const FGameplayTag& AccessTag : AccessTags)
+	{
+		if (ItemStore.HasGrantedGameplayAccess(ItemId, AccessTag))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+const FPEPTemporaryPresentationEntry* UPEPEquipmentComponent::FindTemporaryPresentationEntry(
+	const FName PresentationKey) const
+{
+	return TemporaryPresentationView.Entries.FindByPredicate(
+		[PresentationKey](const FPEPTemporaryPresentationEntry& Candidate)
+		{
+			return Candidate.PresentationKey == PresentationKey;
+		});
 }
 
 void UPEPEquipmentComponent::SetTemporaryPresentationState(
@@ -562,6 +709,14 @@ void UPEPEquipmentComponent::HandleTemporaryPresentationsReplicated()
 
 void UPEPEquipmentComponent::ApplyTemporaryPresentations()
 {
+	/*
+	 * Not before BeginPlay: there is no mesh to hang a prop on yet, and recording the entry as
+	 * applied would keep BeginPlay from ever building it. BeginPlay applies the view.
+	 */
+	if (!HasBegunPlay())
+	{
+		return;
+	}
 	TSet<FName> LiveKeys;
 	for (const FPEPTemporaryPresentationEntry& Entry : TemporaryPresentationView.Entries)
 	{
@@ -604,6 +759,15 @@ void UPEPEquipmentComponent::InitializeItemStoreIntegration()
 	{
 		ItemStoreObject = FindItemStoreObjectOnOwner();
 	}
+
+	/*
+	 * Setup problems are reported only once play has begun in a game world. OnRegister also runs
+	 * in editor and preview worlds, and before the owner's other components are all there; a
+	 * missing store at that point means nothing yet, and warning about it was noise.
+	 */
+	const UWorld* World = GetWorld();
+	const bool bReportSetupProblems = HasBegunPlay() && World && World->IsGameWorld();
+
 	IPEPItemStore* ItemStore = GetItemStore();
 	if (!ItemStore)
 	{
@@ -613,13 +777,16 @@ void UPEPEquipmentComponent::InitializeItemStoreIntegration()
 		 * reports every equip as an unsupported location — in another plugin, with no mention of
 		 * equipment. Declining silently made that a very long way to find.
 		 */
-		UE_LOG(
-			LogPEP,
-			Warning,
-			TEXT("%s: no item store found on '%s'. No equipment slot will accept anything until "
-				"SetItemStore names one, or the owner carries a component implementing IPEPItemStore."),
-			*GetName(),
-			GetOwner() ? *GetOwner()->GetName() : TEXT("<no owner>"));
+		if (bReportSetupProblems)
+		{
+			UE_LOG(
+				LogPEP,
+				Warning,
+				TEXT("%s: no item store found on '%s'. No equipment slot will accept anything until "
+					"SetItemStore names one, or the owner carries a component implementing IPEPItemStore."),
+				*GetName(),
+				GetOwner() ? *GetOwner()->GetName() : TEXT("<no owner>"));
+		}
 		return;
 	}
 
@@ -649,7 +816,7 @@ void UPEPEquipmentComponent::InitializeItemStoreIntegration()
 		RegisteredSlots,
 		*ItemStoreObject->GetName());
 
-	if (RegisteredSlots == 0)
+	if (RegisteredSlots == 0 && bReportSetupProblems)
 	{
 		UE_LOG(
 			LogPEP,
@@ -800,21 +967,30 @@ void UPEPEquipmentComponent::GatherEligibilityProviders(
 		OutProviders.Add(Owner);
 	}
 
+	/*
+	 * Filtered first, so the sort only ever sees the few components that answer — usually none or
+	 * one, which need no sorting at all. This runs inside every store write into a slot.
+	 */
 	TInlineComponentArray<UActorComponent*> Components(Owner);
-	/* Component storage order is a set's; the name gives one first failure per configuration. */
-	Algo::Sort(Components, [](const UActorComponent* A, const UActorComponent* B)
-	{
-		return A && B ? A->GetFName().LexicalLess(B->GetFName()) : A != nullptr;
-	});
+	TArray<const UObject*, TInlineAllocator<4>> ComponentProviders;
 	for (const UActorComponent* Component : Components)
 	{
 		if (Component
 			&& Component->GetClass()->ImplementsInterface(
 				UPEPEquipmentEligibilityProvider::StaticClass()))
 		{
-			OutProviders.Add(Component);
+			ComponentProviders.Add(Component);
 		}
 	}
+	/* Component storage order is a set's; the name gives one first failure per configuration. */
+	if (ComponentProviders.Num() > 1)
+	{
+		Algo::Sort(ComponentProviders, [](const UObject* A, const UObject* B)
+		{
+			return A->GetFName().LexicalLess(B->GetFName());
+		});
+	}
+	OutProviders.Append(ComponentProviders);
 }
 
 const FPEPEquipmentSlotDefinition* UPEPEquipmentComponent::FindSlotDefinition(
@@ -829,19 +1005,71 @@ const FPEPEquipmentSlotDefinition* UPEPEquipmentComponent::FindSlotDefinition(
 
 void UPEPEquipmentComponent::HandleItemStoreChanged(const FPEPItemStoreChange& Change)
 {
+	const AActor* Owner = GetOwner();
+	/* Already dirty: the pending rebuild reads the store as it will be then. */
+	if (!Owner || !Owner->HasAuthority() || bPublicProjectionDirty)
+	{
+		return;
+	}
+	if (Change.ChangeType == EPEPItemStoreChangeType::StateChanged)
+	{
+		/*
+		 * The item stayed where it was. The projection carries no item state, and which children
+		 * are public is the store's decision by location (IPEPItemStore::GetPublicChildren), so the
+		 * only state change that can show is a projected node changing definition. Charges, ammo
+		 * and durability ticking on an equipped item rebuild nothing.
+		 */
+		const FPEPEquippedItemPublic* Node = FindPublicEntry(Change.ItemId);
+		if (Node && Node->DefinitionId != Change.ItemInstance.DefinitionId)
+		{
+			MarkPublicProjectionDirty();
+		}
+		return;
+	}
 	// A bandage moving between two pockets never reaches the projection; only an item under one
 	// of this component's slots, before or after the change, can.
-	if (GetOwner() && GetOwner()->HasAuthority() && DoesChangeTouchEquipment(Change))
+	if (DoesChangeTouchEquipment(Change))
+	{
+		MarkPublicProjectionDirty();
+	}
+}
+
+void UPEPEquipmentComponent::MarkPublicProjectionDirty()
+{
+	bPublicProjectionDirty = true;
+	/* Inside one of this component's own writes, the end of the batch rebuilds instead. */
+	if (ProjectionBatchDepth == 0)
+	{
+		ScheduleDeferredUpdates();
+	}
+}
+
+void UPEPEquipmentComponent::BeginProjectionBatch()
+{
+	++ProjectionBatchDepth;
+}
+
+void UPEPEquipmentComponent::EndProjectionBatch()
+{
+	if (ProjectionBatchDepth <= 0)
+	{
+		ProjectionBatchDepth = 0;
+		return;
+	}
+	--ProjectionBatchDepth;
+	/* Before BeginPlay the projection waits for BeginPlay, like any other store change. */
+	if (ProjectionBatchDepth == 0 && bPublicProjectionDirty && HasBegunPlay())
 	{
 		RefreshPublicProjection();
 	}
 }
 
-void UPEPEquipmentComponent::RefreshPublicProjection()
+bool UPEPEquipmentComponent::RefreshPublicProjection()
 {
+	bPublicProjectionDirty = false;
 	if (!GetOwner() || !GetOwner()->HasAuthority())
 	{
-		return;
+		return false;
 	}
 
 	TMap<FPEPItemId, FPEPEquippedItemPublic> DesiredEntries;
@@ -850,6 +1078,7 @@ void UPEPEquipmentComponent::RefreshPublicProjection()
 	{
 		for (const FPEPEquipmentSlotDefinition& Slot : GetEffectiveSlotDefinitions())
 		{
+			/* A hidden slot projects nothing, so nothing downstream (events, GMAS) sees it either. */
 			if (!Slot.IsValid() || !Slot.bShowPublicly)
 			{
 				continue;
@@ -873,7 +1102,6 @@ void UPEPEquipmentComponent::RefreshPublicProjection()
 			PublicEntry.ItemId = Item->ItemId;
 			PublicEntry.DefinitionId = Item->DefinitionId;
 			PublicEntry.SlotTag = Slot.SlotTag;
-			PublicEntry.Hand = Slot.Hand;
 			DesiredEntries.Add(PublicEntry.ItemId, PublicEntry);
 
 			TSet<FPEPItemId> VisitedItemIds;
@@ -897,27 +1125,28 @@ void UPEPEquipmentComponent::RefreshPublicProjection()
 			bRemovedEntry = true;
 		}
 	}
+	/* Removal swapped entries around; additions below keep the index current as they go. */
+	RebuildPublicEntryIndex();
 
 	for (const TPair<FPEPItemId, FPEPEquippedItemPublic>& Pair : DesiredEntries)
 	{
 		FPEPEquippedItemPublic* Existing = FindMutablePublicEntry(Pair.Key);
 		if (!Existing)
 		{
-			FPEPEquippedItemPublic& Added = PublicEquipmentView.Entries.Add_GetRef(Pair.Value);
-			PublicEquipmentView.MarkItemDirty(Added);
+			const int32 AddedIndex = PublicEquipmentView.Entries.Add(Pair.Value);
+			PublicEntryIndex.Add(Pair.Key, AddedIndex);
+			PublicEquipmentView.MarkItemDirty(PublicEquipmentView.Entries[AddedIndex]);
 			bProjectionChanged = true;
 			continue;
 		}
 
 		if (Existing->DefinitionId != Pair.Value.DefinitionId
 			|| Existing->SlotTag != Pair.Value.SlotTag
-			|| Existing->Hand != Pair.Value.Hand
 			|| Existing->ParentItemId != Pair.Value.ParentItemId
 			|| Existing->ParentSlotName != Pair.Value.ParentSlotName)
 		{
 			Existing->DefinitionId = Pair.Value.DefinitionId;
 			Existing->SlotTag = Pair.Value.SlotTag;
-			Existing->Hand = Pair.Value.Hand;
 			Existing->ParentItemId = Pair.Value.ParentItemId;
 			Existing->ParentSlotName = Pair.Value.ParentSlotName;
 			PublicEquipmentView.MarkItemDirty(*Existing);
@@ -927,7 +1156,7 @@ void UPEPEquipmentComponent::RefreshPublicProjection()
 
 	if (!bProjectionChanged)
 	{
-		return;
+		return false;
 	}
 
 	if (bRemovedEntry)
@@ -942,6 +1171,7 @@ void UPEPEquipmentComponent::RefreshPublicProjection()
 	{
 		Owner->ForceNetUpdate();
 	}
+	return true;
 }
 
 void UPEPEquipmentComponent::BroadcastEquipmentItemChanges()
@@ -960,8 +1190,13 @@ void UPEPEquipmentComponent::BroadcastEquipmentItemChanges()
 	do
 	{
 		bEquipmentItemChangesPending = false;
-		TArray<FPEPEquippedItemPublic> Previous = MoveTemp(AnnouncedEquipmentNodes);
-		AnnouncedEquipmentNodes = PublicEquipmentView.Entries;
+		TArray<FPEPEquippedItemInfo> Previous = MoveTemp(AnnouncedEquipmentNodes);
+		AnnouncedEquipmentNodes.Reset();
+		AnnouncedEquipmentNodes.Reserve(PublicEquipmentView.Entries.Num());
+		for (const FPEPEquippedItemPublic& Entry : PublicEquipmentView.Entries)
+		{
+			AnnouncedEquipmentNodes.Add(Entry.ToInfo());
+		}
 
 		TArray<FPEPEquipmentChange> Unequipped;
 		TArray<FPEPEquipmentChange> Equipped;
@@ -1024,38 +1259,93 @@ void UPEPEquipmentComponent::AppendPublicAttachmentEntries(
 	}
 }
 
-FPEPEquippedItemPublic* UPEPEquipmentComponent::FindMutablePublicEntry(const FPEPItemId ItemId)
+const FPEPEquippedItemPublic* UPEPEquipmentComponent::FindPublicEntry(const FPEPItemId ItemId) const
 {
-	return PublicEquipmentView.Entries.FindByPredicate(
+	if (!ItemId.IsValid())
+	{
+		return nullptr;
+	}
+	const TArray<FPEPEquippedItemPublic>& Entries = PublicEquipmentView.Entries;
+	const int32* Index = PublicEntryIndex.Find(ItemId);
+	if (Index && Entries.IsValidIndex(*Index) && Entries[*Index].ItemId == ItemId)
+	{
+		return &Entries[*Index];
+	}
+	/*
+	 * The index is rebuilt with every change to the array — by the authority's rebuild, and by
+	 * each replicated receive before anything reads it — so when it covers every entry a miss is
+	 * a miss. Out of step (a duplicated instance whose index was not copied), it answers by scan.
+	 */
+	if (!Index && PublicEntryIndex.Num() == Entries.Num())
+	{
+		return nullptr;
+	}
+	return Entries.FindByPredicate(
 		[ItemId](const FPEPEquippedItemPublic& Entry)
 		{
 			return Entry.ItemId == ItemId;
 		});
 }
 
-TArray<FPEPEquippedItemPublic> UPEPEquipmentComponent::GetPublicPresentationNodes() const
+FPEPEquippedItemPublic* UPEPEquipmentComponent::FindMutablePublicEntry(const FPEPItemId ItemId)
 {
-	return PublicEquipmentView.Entries;
+	return const_cast<FPEPEquippedItemPublic*>(
+		static_cast<const UPEPEquipmentComponent*>(this)->FindPublicEntry(ItemId));
 }
 
-TArray<FPEPEquippedItemPublic> UPEPEquipmentComponent::GetPublicEquipmentRoots() const
+const FPEPEquippedItemPublic* UPEPEquipmentComponent::FindPublicRootInSlot(
+	const FGameplayTag SlotTag) const
 {
-	TArray<FPEPEquippedItemPublic> Roots;
+	if (!SlotTag.IsValid())
+	{
+		return nullptr;
+	}
+	return PublicEquipmentView.Entries.FindByPredicate(
+		[SlotTag](const FPEPEquippedItemPublic& Entry)
+		{
+			return !Entry.IsAttachment() && Entry.SlotTag == SlotTag;
+		});
+}
+
+void UPEPEquipmentComponent::RebuildPublicEntryIndex()
+{
+	PublicEntryIndex.Reset();
+	PublicEntryIndex.Reserve(PublicEquipmentView.Entries.Num());
+	for (int32 Index = 0; Index < PublicEquipmentView.Entries.Num(); ++Index)
+	{
+		PublicEntryIndex.Add(PublicEquipmentView.Entries[Index].ItemId, Index);
+	}
+}
+
+TArray<FPEPEquippedItemInfo> UPEPEquipmentComponent::GetPublicPresentationNodes() const
+{
+	TArray<FPEPEquippedItemInfo> Nodes;
+	Nodes.Reserve(PublicEquipmentView.Entries.Num());
+	for (const FPEPEquippedItemPublic& Entry : PublicEquipmentView.Entries)
+	{
+		Nodes.Add(Entry.ToInfo());
+	}
+	return Nodes;
+}
+
+TArray<FPEPEquippedItemInfo> UPEPEquipmentComponent::GetPublicEquipmentRoots() const
+{
+	TArray<FPEPEquippedItemInfo> Roots;
 	for (const FPEPEquippedItemPublic& Entry : PublicEquipmentView.Entries)
 	{
 		if (!Entry.IsAttachment())
 		{
-			Roots.Add(Entry);
+			Roots.Add(Entry.ToInfo());
 		}
 	}
 	return Roots;
 }
 
-TArray<FPEPEquippedItemPublic> UPEPEquipmentComponent::GetPublicAttachments(
+TArray<FPEPEquippedItemInfo> UPEPEquipmentComponent::GetPublicAttachments(
 	const FPEPItemId ParentItemId,
 	const bool bRecursive) const
 {
-	TArray<FPEPEquippedItemPublic> Result;
+	TArray<FPEPEquippedItemInfo> Result;
 	if (!ParentItemId.IsValid())
 	{
 		return Result;
@@ -1077,7 +1367,7 @@ TArray<FPEPEquippedItemPublic> UPEPEquipmentComponent::GetPublicAttachments(
 			{
 				continue;
 			}
-			Result.Add(Entry);
+			Result.Add(Entry.ToInfo());
 			if (bRecursive)
 			{
 				PendingParents.Add(Entry.ItemId);
@@ -1093,45 +1383,45 @@ TArray<FPEPEquippedItemPublic> UPEPEquipmentComponent::GetPublicAttachments(
 
 bool UPEPEquipmentComponent::FindPublicPresentationNode(
 	const FPEPItemId ItemId,
-	FPEPEquippedItemPublic& OutEntry) const
+	FPEPEquippedItemInfo& OutEntry) const
 {
-	const FPEPEquippedItemPublic* Entry = PublicEquipmentView.Entries.FindByPredicate(
-		[ItemId](const FPEPEquippedItemPublic& Candidate)
-		{
-			return Candidate.ItemId == ItemId;
-		});
-	if (!Entry)
-	{
-		OutEntry = FPEPEquippedItemPublic();
-		return false;
-	}
-	OutEntry = *Entry;
-	return true;
+	const FPEPEquippedItemPublic* Entry = FindPublicEntry(ItemId);
+	OutEntry = Entry ? Entry->ToInfo() : FPEPEquippedItemInfo();
+	return Entry != nullptr;
 }
 
-bool UPEPEquipmentComponent::FindPublicEquippedItem(
-	const FPEPItemId ItemId,
-	FPEPEquippedItemPublic& OutEntry) const
-{
-	return FindPublicPresentationNode(ItemId, OutEntry);
-}
-
-bool UPEPEquipmentComponent::GetActiveHandItem(
+bool UPEPEquipmentComponent::FindItemInHand(
 	const EPEPEquipmentHand Hand,
-	FPEPEquippedItemPublic& OutEntry) const
+	FPEPEquippedItemInfo& OutEntry) const
 {
-	const FPEPEquippedItemPublic* Entry = PublicEquipmentView.Entries.FindByPredicate(
-		[Hand](const FPEPEquippedItemPublic& Candidate)
-		{
-			return Hand != EPEPEquipmentHand::None && Candidate.Hand == Hand;
-		});
-	if (!Entry)
+	OutEntry = FPEPEquippedItemInfo();
+	if (Hand == EPEPEquipmentHand::None)
 	{
-		OutEntry = FPEPEquippedItemPublic();
 		return false;
 	}
-	OutEntry = *Entry;
-	return true;
+	/*
+	 * Profile order, not the order of the replicated array, which differs between machines: the
+	 * first slot declaring this hand that holds a public root wins, identically everywhere.
+	 */
+	for (const FPEPEquipmentSlotDefinition& Slot : GetEffectiveSlotDefinitions())
+	{
+		if (Slot.Hand != Hand)
+		{
+			continue;
+		}
+		if (const FPEPEquippedItemPublic* Root = FindPublicRootInSlot(Slot.SlotTag))
+		{
+			OutEntry = Root->ToInfo();
+			return true;
+		}
+	}
+	return false;
+}
+
+EPEPEquipmentHand UPEPEquipmentComponent::GetSlotHand(const FGameplayTag SlotTag) const
+{
+	const FPEPEquipmentSlotDefinition* Slot = FindSlotDefinition(SlotTag);
+	return Slot ? Slot->Hand : EPEPEquipmentHand::None;
 }
 
 EPEPRequestResult UPEPEquipmentComponent::RequestEquipItem(
@@ -1151,8 +1441,8 @@ EPEPRequestResult UPEPEquipmentComponent::RequestEquipItem(
 	OutRequestId = AllocateRequestId();
 	if (Owner->HasAuthority())
 	{
-		const FPEPItemResult Result = ExecuteEquipItem(ItemId, SlotTag);
-		ResolveEquipRequest(OutRequestId, Result);
+		const FPEPItemResult Result = ExecuteEquipItem(ItemId, SlotTag, ERequestOrigin::Local);
+		ResolveEquipRequest(OutRequestId, Result, ERequestOrigin::Local);
 		return Result.bSuccess ? EPEPRequestResult::Executed : EPEPRequestResult::Failed;
 	}
 
@@ -1165,11 +1455,6 @@ EPEPRequestResult UPEPEquipmentComponent::RequestEquipItem(
 	Server_RequestEquipItem(ItemId, SlotTag, OutRequestId);
 	return EPEPRequestResult::Submitted;
 }
-
-
-
-
-
 
 FPEPItemResult UPEPEquipmentComponent::PreviewEquipItem(
 	const FPEPItemId ItemId,
@@ -1194,16 +1479,22 @@ FPEPItemResult UPEPEquipmentComponent::PreviewEquipItem(
 		return Eligibility;
 	}
 
+	FPEPItemAccessContext Access;
+	if (!ResolveRequestContext(ERequestOrigin::Local, Access))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, ItemId);
+	}
 	const FPEPItemLocation Destination = FPEPItemLocation::MakeNamedSlot(SlotTag);
 	FPEPItemId OccupantId;
 	return ItemStore->FindItemAtLocation(Destination, OccupantId) && OccupantId != ItemId
-		? ItemStore->CanSwapItems(ItemId, OccupantId, GetOwnerRequestContext())
-		: ItemStore->CanMoveItem(ItemId, Destination, GetOwnerRequestContext());
+		? ItemStore->CanSwapItems(ItemId, OccupantId, Access)
+		: ItemStore->CanMoveItem(ItemId, Destination, Access);
 }
 
 FPEPItemResult UPEPEquipmentComponent::ExecuteEquipItem(
 	const FPEPItemId ItemId,
-	const FGameplayTag SlotTag)
+	const FGameplayTag SlotTag,
+	const ERequestOrigin Origin)
 {
 	IPEPItemStore* ItemStore = GetItemStore();
 	if (!ItemStore || !ItemId.IsValid() || !FindSlotDefinition(SlotTag)
@@ -1226,12 +1517,22 @@ FPEPItemResult UPEPEquipmentComponent::ExecuteEquipItem(
 	{
 		return Eligibility;
 	}
+	FPEPItemAccessContext Access;
+	if (!ResolveRequestContext(Origin, Access))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, ItemId);
+	}
 
 	const FPEPItemLocation Destination = FPEPItemLocation::MakeNamedSlot(SlotTag);
 	FPEPItemId OccupantId;
-	return ItemStore->FindItemAtLocation(Destination, OccupantId) && OccupantId != ItemId
-		? ItemStore->SwapItems(ItemId, OccupantId, GetOwnerRequestContext())
-		: ItemStore->MoveItem(ItemId, Destination, GetOwnerRequestContext());
+	/* A swap raises two store events: they rebuild the projection once, before this returns. */
+	BeginProjectionBatch();
+	const FPEPItemResult Result =
+		ItemStore->FindItemAtLocation(Destination, OccupantId) && OccupantId != ItemId
+			? ItemStore->SwapItems(ItemId, OccupantId, Access)
+			: ItemStore->MoveItem(ItemId, Destination, Access);
+	EndProjectionBatch();
+	return Result;
 }
 
 bool UPEPEquipmentComponent::Server_RequestEquipItem_Validate(
@@ -1247,7 +1548,10 @@ void UPEPEquipmentComponent::Server_RequestEquipItem_Implementation(
 	const FGameplayTag SlotTag,
 	const int32 RequestId)
 {
-	ResolveEquipRequest(RequestId, ExecuteEquipItem(ItemId, SlotTag));
+	ResolveEquipRequest(
+		RequestId,
+		ExecuteEquipItem(ItemId, SlotTag, ERequestOrigin::RemoteClient),
+		ERequestOrigin::RemoteClient);
 }
 
 EPEPRequestResult UPEPEquipmentComponent::RequestUnequipItem(
@@ -1265,8 +1569,9 @@ EPEPRequestResult UPEPEquipmentComponent::RequestUnequipItem(
 	if (Owner->HasAuthority())
 	{
 		OutRequestId = AllocateRequestId();
-		const FPEPItemResult Result = ExecuteUnequipItem(ItemId, TargetLocation);
-		ResolveEquipRequest(OutRequestId, Result);
+		const FPEPItemResult Result =
+			ExecuteUnequipItem(ItemId, TargetLocation, ERequestOrigin::Local);
+		ResolveEquipRequest(OutRequestId, Result, ERequestOrigin::Local);
 		return Result.bSuccess ? EPEPRequestResult::Executed : EPEPRequestResult::Failed;
 	}
 
@@ -1295,7 +1600,7 @@ FPEPEquipmentRequestResult UPEPEquipmentComponent::UnequipItem(
 	FPEPEquipmentRequestResult RequestResult;
 	const AActor* Owner = GetOwner();
 	RequestResult.Result = Owner && Owner->HasAuthority()
-		? ExecuteUnequipItem(ItemId, TargetLocation)
+		? ExecuteUnequipItem(ItemId, TargetLocation, ERequestOrigin::Local)
 		: FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, ItemId);
 	return RequestResult;
 }
@@ -1309,7 +1614,12 @@ FPEPItemResult UPEPEquipmentComponent::PreviewUnequipItem(
 	{
 		return Validation;
 	}
-	return GetItemStoreConst()->CanMoveItem(ItemId, TargetLocation, GetOwnerRequestContext());
+	FPEPItemAccessContext Access;
+	if (!ResolveRequestContext(ERequestOrigin::Local, Access))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, ItemId);
+	}
+	return GetItemStoreConst()->CanMoveItem(ItemId, TargetLocation, Access);
 }
 
 FPEPItemResult UPEPEquipmentComponent::ValidateUnequipRequest(
@@ -1354,15 +1664,24 @@ FPEPItemResult UPEPEquipmentComponent::ValidateUnequipRequest(
 
 FPEPItemResult UPEPEquipmentComponent::ExecuteUnequipItem(
 	const FPEPItemId ItemId,
-	const FPEPItemLocation& TargetLocation)
+	const FPEPItemLocation& TargetLocation,
+	const ERequestOrigin Origin)
 {
 	const FPEPItemResult Validation = ValidateUnequipRequest(ItemId, TargetLocation);
 	if (!Validation.bSuccess)
 	{
 		return Validation;
 	}
+	FPEPItemAccessContext Access;
+	if (!ResolveRequestContext(Origin, Access))
+	{
+		return FPEPItemResult::Failure(PEPCoreTags::Reason_NotAuthority, ItemId);
+	}
 	/* A move, never a swap: displacing the target's occupant into this slot would be an equip. */
-	return GetItemStore()->MoveItem(ItemId, TargetLocation, GetOwnerRequestContext());
+	BeginProjectionBatch();
+	const FPEPItemResult Result = GetItemStore()->MoveItem(ItemId, TargetLocation, Access);
+	EndProjectionBatch();
+	return Result;
 }
 
 bool UPEPEquipmentComponent::Server_RequestUnequipItem_Validate(
@@ -1379,13 +1698,11 @@ void UPEPEquipmentComponent::Server_RequestUnequipItem_Implementation(
 	const FPEPItemLocation TargetLocation,
 	const int32 RequestId)
 {
-	ResolveEquipRequest(RequestId, ExecuteUnequipItem(ItemId, TargetLocation));
+	ResolveEquipRequest(
+		RequestId,
+		ExecuteUnequipItem(ItemId, TargetLocation, ERequestOrigin::RemoteClient),
+		ERequestOrigin::RemoteClient);
 }
-
-
-
-
-
 
 void UPEPEquipmentComponent::Client_ResolveEquipRequest_Implementation(
 	const FPEPEquipmentRequestResult RequestResult)
@@ -1411,9 +1728,37 @@ const AController* UPEPEquipmentComponent::GetOwningController() const
 	return nullptr;
 }
 
-FPEPItemAccessContext UPEPEquipmentComponent::GetOwnerRequestContext() const
+bool UPEPEquipmentComponent::ResolveRequestContext(
+	const ERequestOrigin Origin,
+	FPEPItemAccessContext& OutContext) const
 {
-	return FPEPItemAccessContext::From(GetOwningController());
+	/* Whoever drives the pawn — the player, an AI — is who the store is asked on behalf of. */
+	if (const AController* Controller = GetOwningController())
+	{
+		OutContext = FPEPItemAccessContext::From(Controller);
+		return true;
+	}
+	if (Origin == ERequestOrigin::RemoteClient)
+	{
+		/*
+		 * A client-requested change answers to that client. With no controller to name it, it is
+		 * refused rather than made as System(): that would hand the server's own authority to
+		 * whoever sent the RPC.
+		 */
+		OutContext = FPEPItemAccessContext::From(nullptr);
+		return false;
+	}
+	/*
+	 * No controller, called on this machine. On the authority that is a server-driven change — an
+	 * unpossessed pawn, a mannequin, a scripted loadout — made deliberately as System(). Anywhere
+	 * else it is only a client-side preview, asked as nobody in particular (From(nullptr) is
+	 * never System).
+	 */
+	const AActor* Owner = GetOwner();
+	OutContext = Owner && Owner->HasAuthority()
+		? FPEPItemAccessContext::System()
+		: FPEPItemAccessContext::From(nullptr);
+	return true;
 }
 
 int32 UPEPEquipmentComponent::AllocateRequestId()
@@ -1427,27 +1772,92 @@ int32 UPEPEquipmentComponent::AllocateRequestId()
 
 void UPEPEquipmentComponent::ResolveEquipRequest(
 	const int32 RequestId,
-	const FPEPItemResult& Result)
+	const FPEPItemResult& Result,
+	const ERequestOrigin Origin)
 {
 	FPEPEquipmentRequestResult RequestResult;
 	RequestResult.RequestId = RequestId;
 	RequestResult.Result = Result;
 
-	AActor* Owner = GetOwner();
-	if (Owner
-		&& Owner->HasAuthority()
-		&& Owner->GetNetMode() != NM_Standalone
-		&& Owner->HasNetOwner())
+	if (Origin == ERequestOrigin::RemoteClient)
 	{
+		/* The id is one the client allocated: only that client can match it. */
 		Client_ResolveEquipRequest(RequestResult);
 		return;
 	}
 
-	OnEquipmentRequestResolved.Broadcast(RequestResult);
+	/*
+	 * Issued on this machine, so resolved on it, and never sent to the owning client: the server
+	 * allocates its own ids, which would collide with the client's. Raised at the next tick, so a
+	 * caller already holds OutRequestId when the resolution arrives — a Blueprint node only hands
+	 * its out pins over once it returns. Before BeginPlay, it waits for BeginPlay.
+	 */
+	PendingLocalResolutions.Add(RequestResult);
+	ScheduleDeferredUpdates();
+}
+
+void UPEPEquipmentComponent::FlushDeferredUpdates()
+{
+	if (bPublicProjectionDirty)
+	{
+		/* Reconciles the visuals itself when the projection changed. */
+		RefreshPublicProjection();
+	}
+	if (bLocalPresentationReconcilePending)
+	{
+		ReconcileLocalPresentations();
+	}
+	if (!PendingLocalResolutions.IsEmpty())
+	{
+		/* Taken first: a listener may issue the next request from inside the broadcast. */
+		TArray<FPEPEquipmentRequestResult> Resolutions = MoveTemp(PendingLocalResolutions);
+		PendingLocalResolutions.Reset();
+		for (const FPEPEquipmentRequestResult& Resolution : Resolutions)
+		{
+			OnEquipmentRequestResolved.Broadcast(Resolution);
+		}
+	}
+}
+
+void UPEPEquipmentComponent::ScheduleDeferredUpdates()
+{
+	/* Before BeginPlay nothing ticks for this component; BeginPlay runs or schedules the rest. */
+	if (bDeferredUpdatesScheduled || !HasBegunPlay())
+	{
+		return;
+	}
+	bDeferredUpdatesScheduled = true;
+	/*
+	 * The core ticker rather than a world timer: timers stop while the world is paused, and a
+	 * paused inventory screen still equips. Bound to this object, so it never outlives it.
+	 */
+	DeferredUpdatesHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateUObject(this, &UPEPEquipmentComponent::TickDeferredUpdates));
+}
+
+bool UPEPEquipmentComponent::TickDeferredUpdates(const float DeltaTime)
+{
+	(void)DeltaTime;
+	/* Cleared first, so a change raised while flushing schedules its own pass. */
+	bDeferredUpdatesScheduled = false;
+	DeferredUpdatesHandle.Reset();
+	FlushDeferredUpdates();
+	return false;
+}
+
+void UPEPEquipmentComponent::CancelDeferredUpdates()
+{
+	if (bDeferredUpdatesScheduled)
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(DeferredUpdatesHandle);
+	}
+	DeferredUpdatesHandle.Reset();
+	bDeferredUpdatesScheduled = false;
 }
 
 void UPEPEquipmentComponent::HandlePublicEquipmentReplicated()
 {
+	RebuildPublicEntryIndex();
 	ReconcileLocalPresentations();
 	/*
 	 * Clients only: the authority never receives its own Fast Array, so a listen server announces
@@ -1456,13 +1866,6 @@ void UPEPEquipmentComponent::HandlePublicEquipmentReplicated()
 	 */
 	BroadcastEquipmentItemChanges();
 	OnPublicEquipmentChanged.Broadcast();
-}
-
-APEPEquippedPresentationActor* UPEPEquipmentComponent::FindLocalPresentationActor(
-	const FPEPItemId ItemId) const
-{
-	const TObjectPtr<APEPEquippedPresentationActor>* Actor = PresentationActors.Find(ItemId);
-	return Actor ? Actor->Get() : nullptr;
 }
 
 bool UPEPEquipmentComponent::FindLocalPresentationTarget(
@@ -1481,6 +1884,16 @@ bool UPEPEquipmentComponent::FindLocalPresentationTarget(
 
 void UPEPEquipmentComponent::ReconcileLocalPresentations()
 {
+	bLocalPresentationReconcilePending = false;
+	/*
+	 * Not before BeginPlay. A Fast Array receive in a late joiner's first bunch, or a store write
+	 * on the authority, can land before the mesh is discovered; a visual built then would hang off
+	 * the root (the capsule) and stay there. BeginPlay builds everything once the mesh is known.
+	 */
+	if (!HasBegunPlay())
+	{
+		return;
+	}
 	++LocalPresentationGeneration;
 	if (LocalPresentationGeneration <= 0)
 	{
@@ -1494,57 +1907,83 @@ void UPEPEquipmentComponent::ReconcileLocalPresentations()
 	}
 
 	/*
-	 * A diff, not a rebuild. This runs on every replicated delta and on every asset that finishes
+	 * A diff, not a rebuild. This runs on every replicated delta and after assets finish
 	 * loading, so tearing down eight props to add a ninth was the cost of every loot. A visual is
 	 * kept when the node it was built from is unchanged and it is still alive; it goes when its
 	 * node changed, vanished, or was suppressed by a temporary prop - and so does everything
 	 * attached beneath it, since a child rides its parent's actor.
 	 */
 	TMap<FPEPItemId, const FPEPEquippedItemPublic*> Desired;
+	TMap<FGameplayTag, const FPEPEquippedItemPublic*> RootsBySlot;
 	Desired.Reserve(PublicEquipmentView.Entries.Num());
 	for (const FPEPEquippedItemPublic& Entry : PublicEquipmentView.Entries)
 	{
-		if (Entry.ItemId.IsValid() && !SuppressedPresentationItems.Contains(Entry.ItemId))
+		if (!Entry.ItemId.IsValid())
+		{
+			continue;
+		}
+		if (!Entry.IsAttachment() && !RootsBySlot.Contains(Entry.SlotTag))
+		{
+			RootsBySlot.Add(Entry.SlotTag, &Entry);
+		}
+		if (!SuppressedPresentationItems.Contains(Entry.ItemId))
 		{
 			Desired.Add(Entry.ItemId, &Entry);
 		}
 	}
-	TArray<FPEPItemId> Stale;
+
+	TSet<FPEPItemId> Stale;
 	for (const TPair<FPEPItemId, FPEPLocalPresentationTarget>& Pair : LocalPresentationTargets)
 	{
 		const FPEPEquippedItemPublic* const* Node = Desired.Find(Pair.Key);
-		const FPEPEquippedItemPublic* Built = PresentedNodes.Find(Pair.Key);
-		if (!Node || !Built || !IsSamePresentationNode(**Node, *Built) || !Pair.Value.IsValid())
+		const FPEPEquippedItemInfo* Built = PresentedNodes.Find(Pair.Key);
+		if (!Node || !Built || !Pair.Value.IsValid()
+			|| !PEPEquipmentEvents::IsSameEquippedNode((*Node)->ToInfo(), *Built))
 		{
 			Stale.Add(Pair.Key);
 		}
 	}
-	for (int32 Index = 0; Index < Stale.Num(); ++Index)
+	if (!Stale.IsEmpty())
 	{
-		for (const TPair<FPEPItemId, FPEPEquippedItemPublic>& Pair : PresentedNodes)
+		/* One walk down a parent -> children index, instead of rescanning for every stale node. */
+		TMultiMap<FPEPItemId, FPEPItemId> ChildrenByParent;
+		for (const TPair<FPEPItemId, FPEPEquippedItemInfo>& Pair : PresentedNodes)
 		{
-			if (Pair.Value.ParentItemId == Stale[Index] && !Stale.Contains(Pair.Key))
+			if (Pair.Value.ParentItemId.IsValid())
 			{
-				Stale.Add(Pair.Key);
+				ChildrenByParent.Add(Pair.Value.ParentItemId, Pair.Key);
 			}
 		}
-	}
-	for (const FPEPItemId& ItemId : Stale)
-	{
-		DestroyLocalPresentation(ItemId);
+		TArray<FPEPItemId> PendingParents = Stale.Array();
+		TArray<FPEPItemId> Children;
+		while (!PendingParents.IsEmpty())
+		{
+			const FPEPItemId ParentItemId = PendingParents.Pop(EAllowShrinking::No);
+			Children.Reset();
+			ChildrenByParent.MultiFind(ParentItemId, Children);
+			for (const FPEPItemId ChildItemId : Children)
+			{
+				bool bAlreadyStale = false;
+				Stale.Add(ChildItemId, &bAlreadyStale);
+				if (!bAlreadyStale)
+				{
+					PendingParents.Add(ChildItemId);
+				}
+			}
+		}
+		for (const FPEPItemId ItemId : Stale)
+		{
+			DestroyLocalPresentation(ItemId);
+		}
 	}
 
 	TSet<FPEPItemId> ResolvingItems;
+	/* Roots in profile order, so two roots contending for one target resolve alike everywhere. */
 	for (const FPEPEquipmentSlotDefinition& Slot : GetEffectiveSlotDefinitions())
 	{
-		const FPEPEquippedItemPublic* Root = PublicEquipmentView.Entries.FindByPredicate(
-			[&Slot](const FPEPEquippedItemPublic& Entry)
-			{
-				return !Entry.IsAttachment() && Entry.SlotTag == Slot.SlotTag;
-			});
-		if (Root)
+		if (const FPEPEquippedItemPublic* const* Root = RootsBySlot.Find(Slot.SlotTag))
 		{
-			EnsureLocalPresentation(*Root, ResolvingItems);
+			EnsureLocalPresentation(**Root, ResolvingItems);
 		}
 	}
 	for (const FPEPEquippedItemPublic& Entry : PublicEquipmentView.Entries)
@@ -1558,10 +1997,22 @@ void UPEPEquipmentComponent::ReconcileLocalPresentations()
 	{
 		if (LocalPresentationTargets.Contains(Pair.Key))
 		{
-			PresentedNodes.Add(Pair.Key, *Pair.Value);
+			PresentedNodes.Add(Pair.Key, Pair.Value->ToInfo());
 		}
 	}
 	LocalPresentationChanged.Broadcast();
+}
+
+void UPEPEquipmentComponent::RequestLocalPresentationReconcile()
+{
+	bLocalPresentationReconcilePending = true;
+	ScheduleDeferredUpdates();
+}
+
+void UPEPEquipmentComponent::RebuildLocalPresentations()
+{
+	DestroyAllLocalPresentations();
+	ReconcileLocalPresentations();
 }
 
 bool UPEPEquipmentComponent::EnsureLocalPresentation(
@@ -1586,7 +2037,12 @@ bool UPEPEquipmentComponent::EnsureLocalPresentation(
 	if (!Definition)
 	{
 		RequestDefinitionLoad(Entry.DefinitionId);
-		return false;
+		/* A load that completed synchronously is usable in this same pass. */
+		Definition = ResolveLoadedDefinition(Entry.DefinitionId);
+		if (!Definition)
+		{
+			return false;
+		}
 	}
 
 	const FPEPEquipmentPresentationFragment* Presentation =
@@ -1600,12 +2056,7 @@ bool UPEPEquipmentComponent::EnsureLocalPresentation(
 	FName AttachSocket;
 	if (Entry.IsAttachment())
 	{
-		const FPEPEquippedItemPublic* ParentEntry =
-			PublicEquipmentView.Entries.FindByPredicate(
-				[&Entry](const FPEPEquippedItemPublic& Candidate)
-				{
-					return Candidate.ItemId == Entry.ParentItemId;
-				});
+		const FPEPEquippedItemPublic* ParentEntry = FindPublicEntry(Entry.ParentItemId);
 		if (!ParentEntry || !EnsureLocalPresentation(*ParentEntry, ResolvingItems))
 		{
 			return false;
@@ -1711,7 +2162,11 @@ bool UPEPEquipmentComponent::EnsureAttachedPresentation(
 		if (!CarrierClass)
 		{
 			RequestPresentationAssetLoad(ActorVisual->ToSoftObjectPath());
-			return false;
+			CarrierClass = ActorVisual->Get();
+			if (!CarrierClass)
+			{
+				return false;
+			}
 		}
 	}
 
@@ -1723,14 +2178,20 @@ bool UPEPEquipmentComponent::EnsureAttachedPresentation(
 		SkeletalVisual && !SkeletalVisual->IsNull() && !SkeletalVisual->Get())
 	{
 		RequestPresentationAssetLoad(SkeletalVisual->ToSoftObjectPath());
-		return false;
+		if (!SkeletalVisual->Get())
+		{
+			return false;
+		}
 	}
 	if (const TSoftObjectPtr<UStaticMesh>* StaticVisual =
 		Presentation.GetStaticMeshVisual();
 		StaticVisual && !StaticVisual->IsNull() && !StaticVisual->Get())
 	{
 		RequestPresentationAssetLoad(StaticVisual->ToSoftObjectPath());
-		return false;
+		if (!StaticVisual->Get())
+		{
+			return false;
+		}
 	}
 
 	FActorSpawnParameters SpawnParameters;
@@ -1752,7 +2213,7 @@ bool UPEPEquipmentComponent::EnsureAttachedPresentation(
 		FAttachmentTransformRules::SnapToTargetNotIncludingScale,
 		AttachSocket);
 	Actor->InitializePresentation(
-		Entry,
+		Entry.ToInfo(),
 		Presentation);
 	if (!Actor->IsPresentationReady())
 	{
@@ -1828,7 +2289,11 @@ bool UPEPEquipmentComponent::EnsureLayeredPresentation(
 	if (!Mesh)
 	{
 		RequestPresentationAssetLoad(SkeletalVisual->ToSoftObjectPath());
-		return false;
+		Mesh = SkeletalVisual->Get();
+		if (!Mesh)
+		{
+			return false;
+		}
 	}
 	if (bApplyPresentationTransform)
 	{
@@ -1909,7 +2374,11 @@ bool UPEPEquipmentComponent::ApplyModularPresentation(
 		if (!Mesh)
 		{
 			RequestPresentationAssetLoad(SkeletalVisual->ToSoftObjectPath());
-			return false;
+			Mesh = SkeletalVisual->Get();
+			if (!Mesh)
+			{
+				return false;
+			}
 		}
 	}
 
@@ -1932,23 +2401,35 @@ void UPEPEquipmentComponent::RequestDefinitionLoad(const FPrimaryAssetId Definit
 	{
 		return;
 	}
-	DefinitionLoadHandles.Add(
+	TSharedPtr<FStreamableHandle> Handle = UAssetManager::Get().LoadPrimaryAsset(
 		DefinitionId,
-		UAssetManager::Get().LoadPrimaryAsset(
-			DefinitionId,
-			TArray<FName>(),
-			FStreamableDelegate::CreateWeakLambda(this, [this, DefinitionId]()
+		TArray<FName>(),
+		FStreamableDelegate::CreateWeakLambda(this, [this, DefinitionId]()
+		{
+			DefinitionLoadHandles.Remove(DefinitionId);
+			if (ResolveLoadedDefinition(DefinitionId))
 			{
-				DefinitionLoadHandles.Remove(DefinitionId);
-				if (ResolveLoadedDefinition(DefinitionId))
-				{
-					ReconcileLocalPresentations();
-				}
-				else
-				{
-					FailedDefinitionLoads.Add(DefinitionId);
-				}
-			})));
+				/* Never reconciled from here: several loads landing in one frame share one pass. */
+				RequestLocalPresentationReconcile();
+			}
+			else
+			{
+				FailedDefinitionLoads.Add(DefinitionId);
+			}
+		}));
+	/*
+	 * A load that completes synchronously has already run the delegate; keep the handle only while
+	 * it is pending, or a completed handle would block the id for good.
+	 */
+	if (Handle.IsValid() && !Handle->HasLoadCompleted())
+	{
+		DefinitionLoadHandles.Add(DefinitionId, Handle);
+	}
+	else if (!Handle.IsValid() && !ResolveLoadedDefinition(DefinitionId))
+	{
+		/* No handle and nothing resident: the asset manager does not know this definition. */
+		FailedDefinitionLoads.Add(DefinitionId);
+	}
 }
 
 void UPEPEquipmentComponent::RequestPresentationAssetLoad(
@@ -1959,22 +2440,28 @@ void UPEPEquipmentComponent::RequestPresentationAssetLoad(
 	{
 		return;
 	}
-	PresentationAssetLoadHandles.Add(
+	TSharedPtr<FStreamableHandle> Handle = UAssetManager::GetStreamableManager().RequestAsyncLoad(
 		AssetPath,
-		UAssetManager::GetStreamableManager().RequestAsyncLoad(
-			AssetPath,
-			FStreamableDelegate::CreateWeakLambda(this, [this, AssetPath]()
+		FStreamableDelegate::CreateWeakLambda(this, [this, AssetPath]()
+		{
+			PresentationAssetLoadHandles.Remove(AssetPath);
+			if (AssetPath.ResolveObject())
 			{
-				PresentationAssetLoadHandles.Remove(AssetPath);
-				if (AssetPath.ResolveObject())
-				{
-					ReconcileLocalPresentations();
-				}
-				else
-				{
-					FailedPresentationAssetLoads.Add(AssetPath);
-				}
-			})));
+				RequestLocalPresentationReconcile();
+			}
+			else
+			{
+				FailedPresentationAssetLoads.Add(AssetPath);
+			}
+		}));
+	if (Handle.IsValid() && !Handle->HasLoadCompleted())
+	{
+		PresentationAssetLoadHandles.Add(AssetPath, Handle);
+	}
+	else if (!Handle.IsValid() && !AssetPath.ResolveObject())
+	{
+		FailedPresentationAssetLoads.Add(AssetPath);
+	}
 }
 
 bool UPEPEquipmentComponent::ShowTemporaryPresentationLocal(
@@ -1985,18 +2472,27 @@ bool UPEPEquipmentComponent::ShowTemporaryPresentationLocal(
 {
 	const FPEPItemId PreviousSuppressedItemId =
 		TemporarySuppressedItems.FindRef(PresentationKey);
-	const FPEPItemId EffectiveSuppressedItemId = SuppressedItemId.IsValid()
-		? SuppressedItemId
-		: PreviousSuppressedItemId;
 	HideTemporaryPresentationLocal(PresentationKey, false);
-	if (EffectiveSuppressedItemId.IsValid())
+	/*
+	 * The original stays hidden for exactly as long as this key's current spec asks for it,
+	 * whether or not the prop itself can be built. A spec that stops asking gives it back rather
+	 * than inheriting the previous spec's hide.
+	 */
+	if (SuppressedItemId.IsValid())
 	{
-		TemporarySuppressedItems.Add(PresentationKey, EffectiveSuppressedItemId);
-		SuppressedPresentationItems.Add(EffectiveSuppressedItemId);
+		TemporarySuppressedItems.Add(PresentationKey, SuppressedItemId);
 	}
-	if (!bEnableLocalPresentation || !PresentationMesh || !DefinitionId.IsValid()
-		|| PresentationKey.IsNone() || AttachSocket.IsNone() || !GetWorld()
-		|| GetWorld()->GetNetMode() == NM_DedicatedServer)
+	RefreshSuppressedPresentationItems();
+	if (PreviousSuppressedItemId != SuppressedItemId)
+	{
+		// Rebuild the regular projection so the suppressed item and any visual children attached
+		// to it disappear (or return) together. Temporary props are preserved by reconciliation.
+		ReconcileLocalPresentations();
+	}
+
+	if (!HasBegunPlay() || !bEnableLocalPresentation || !PresentationMesh
+		|| !DefinitionId.IsValid() || PresentationKey.IsNone() || AttachSocket.IsNone()
+		|| !GetWorld() || GetWorld()->GetNetMode() == NM_DedicatedServer)
 	{
 		return false;
 	}
@@ -2004,22 +2500,12 @@ bool UPEPEquipmentComponent::ShowTemporaryPresentationLocal(
 	const UPEPItemDefinition* Definition = ResolveLoadedDefinition(DefinitionId);
 	if (!Definition)
 	{
-		TemporaryPresentationLoadHandles.Add(
-			PresentationKey,
-			UAssetManager::Get().LoadPrimaryAsset(
-				DefinitionId,
-				TArray<FName>(),
-				FStreamableDelegate::CreateWeakLambda(
-					this,
-					[this, PresentationKey, DefinitionId, AttachSocket, EffectiveSuppressedItemId]()
-					{
-						TemporaryPresentationLoadHandles.Remove(PresentationKey);
-						ShowTemporaryPresentationLocal(
-							PresentationKey,
-							DefinitionId,
-							AttachSocket,
-							EffectiveSuppressedItemId);
-					})));
+		if (FailedDefinitionLoads.Contains(DefinitionId))
+		{
+			return false;
+		}
+		/* Shown by HandleTemporaryPresentationLoaded once it lands, if still wanted. */
+		RequestTemporaryPresentationLoad(PresentationKey, DefinitionId, FSoftObjectPath());
 		return true;
 	}
 
@@ -2034,24 +2520,19 @@ bool UPEPEquipmentComponent::ShowTemporaryPresentationLocal(
 	if (const TSoftClassPtr<APEPEquippedPresentationActor>* ActorVisual =
 		Presentation->GetActorClassVisual())
 	{
+		if (ActorVisual->IsNull())
+		{
+			return false;
+		}
 		CarrierClass = ActorVisual->Get();
 		if (!CarrierClass)
 		{
-			TemporaryPresentationLoadHandles.Add(
-				PresentationKey,
-				UAssetManager::GetStreamableManager().RequestAsyncLoad(
-					ActorVisual->ToSoftObjectPath(),
-					FStreamableDelegate::CreateWeakLambda(
-						this,
-						[this, PresentationKey, DefinitionId, AttachSocket, EffectiveSuppressedItemId]()
-						{
-							TemporaryPresentationLoadHandles.Remove(PresentationKey);
-							ShowTemporaryPresentationLocal(
-								PresentationKey,
-								DefinitionId,
-								AttachSocket,
-								EffectiveSuppressedItemId);
-						})));
+			const FSoftObjectPath ClassPath = ActorVisual->ToSoftObjectPath();
+			if (FailedPresentationAssetLoads.Contains(ClassPath))
+			{
+				return false;
+			}
+			RequestTemporaryPresentationLoad(PresentationKey, DefinitionId, ClassPath);
 			return true;
 		}
 	}
@@ -2074,31 +2555,117 @@ bool UPEPEquipmentComponent::ShowTemporaryPresentationLocal(
 		PresentationMesh,
 		FAttachmentTransformRules::SnapToTargetNotIncludingScale,
 		AttachSocket);
-	FPEPEquippedItemPublic TemporaryState;
+	/* A temporary prop presents a definition, not a projected node: only DefinitionId is set. */
+	FPEPEquippedItemInfo TemporaryState;
 	TemporaryState.DefinitionId = DefinitionId;
 	Actor->InitializePresentation(TemporaryState, *Presentation);
 	TemporaryPresentationActors.Add(PresentationKey, Actor);
-	if (EffectiveSuppressedItemId.IsValid())
-	{
-		TemporarySuppressedItems.Add(PresentationKey, EffectiveSuppressedItemId);
-		SuppressedPresentationItems.Add(EffectiveSuppressedItemId);
-		// Rebuild the regular projection so the suppressed item and any visual children attached
-		// to it disappear together. Temporary props are intentionally preserved by reconciliation.
-		ReconcileLocalPresentations();
-	}
 	return true;
+}
+
+void UPEPEquipmentComponent::RequestTemporaryPresentationLoad(
+	const FName PresentationKey,
+	const FPrimaryAssetId DefinitionId,
+	const FSoftObjectPath& AssetPath)
+{
+	const bool bLoadDefinition = !AssetPath.IsValid();
+	FStreamableDelegate OnLoaded = FStreamableDelegate::CreateWeakLambda(
+		this,
+		[this, PresentationKey, DefinitionId, AssetPath]()
+		{
+			HandleTemporaryPresentationLoaded(PresentationKey, DefinitionId, AssetPath);
+		});
+	TSharedPtr<FStreamableHandle> Handle;
+	if (bLoadDefinition)
+	{
+		Handle = UAssetManager::Get().LoadPrimaryAsset(
+			DefinitionId,
+			TArray<FName>(),
+			MoveTemp(OnLoaded));
+	}
+	else
+	{
+		Handle = UAssetManager::GetStreamableManager().RequestAsyncLoad(
+			AssetPath,
+			MoveTemp(OnLoaded));
+	}
+
+	/*
+	 * Kept only while pending. A load that completed synchronously already ran the delegate,
+	 * which showed the prop or recorded the failure; holding its finished handle would only let a
+	 * later hide cancel nothing.
+	 */
+	if (Handle.IsValid() && !Handle->HasLoadCompleted())
+	{
+		TemporaryPresentationLoadHandles.Add(PresentationKey, Handle);
+		return;
+	}
+	const bool bResident = bLoadDefinition
+		? ResolveLoadedDefinition(DefinitionId) != nullptr
+		: AssetPath.ResolveObject() != nullptr;
+	if (!Handle.IsValid() && !bResident)
+	{
+		/* Nothing started and nothing resident: unknown to the asset manager. Never asked again. */
+		if (bLoadDefinition)
+		{
+			FailedDefinitionLoads.Add(DefinitionId);
+		}
+		else
+		{
+			FailedPresentationAssetLoads.Add(AssetPath);
+		}
+	}
+}
+
+void UPEPEquipmentComponent::HandleTemporaryPresentationLoaded(
+	const FName PresentationKey,
+	const FPrimaryAssetId DefinitionId,
+	const FSoftObjectPath AssetPath)
+{
+	TemporaryPresentationLoadHandles.Remove(PresentationKey);
+	const bool bLoadDefinition = !AssetPath.IsValid();
+	const bool bLoaded = bLoadDefinition
+		? ResolveLoadedDefinition(DefinitionId) != nullptr
+		: AssetPath.ResolveObject() != nullptr;
+	if (!bLoaded)
+	{
+		/*
+		 * Recorded in the sets the regular presentation uses too, and the prop is not asked for
+		 * again: re-requesting from here is what used to reload a missing asset forever.
+		 */
+		if (bLoadDefinition)
+		{
+			FailedDefinitionLoads.Add(DefinitionId);
+		}
+		else
+		{
+			FailedPresentationAssetLoads.Add(AssetPath);
+		}
+		return;
+	}
+
+	/* Only for the spec still wanted under this key: it may have been replaced or hidden. */
+	const FPEPTemporaryPresentationEntry* Spec = AppliedTemporaryPresentations.Find(PresentationKey);
+	if (!Spec || Spec->DefinitionId != DefinitionId)
+	{
+		return;
+	}
+	const FPEPTemporaryPresentationEntry Wanted = *Spec;
+	ShowTemporaryPresentationLocal(
+		Wanted.PresentationKey,
+		Wanted.DefinitionId,
+		Wanted.AttachSocket,
+		Wanted.SuppressedItemId);
 }
 
 void UPEPEquipmentComponent::HideTemporaryPresentationLocal(
 	const FName PresentationKey,
 	const bool bRestoreSuppressedPresentation)
 {
-	bool bHadSuppressedPresentation = false;
-	if (const FPEPItemId* SuppressedItemId = TemporarySuppressedItems.Find(PresentationKey))
+	const bool bHadSuppressedPresentation = TemporarySuppressedItems.Remove(PresentationKey) > 0;
+	if (bHadSuppressedPresentation)
 	{
-		SuppressedPresentationItems.Remove(*SuppressedItemId);
-		TemporarySuppressedItems.Remove(PresentationKey);
-		bHadSuppressedPresentation = true;
+		RefreshSuppressedPresentationItems();
 	}
 	if (TSharedPtr<FStreamableHandle>* Handle =
 		TemporaryPresentationLoadHandles.Find(PresentationKey))
@@ -2121,6 +2688,33 @@ void UPEPEquipmentComponent::HideTemporaryPresentationLocal(
 	if (bRestoreSuppressedPresentation && bHadSuppressedPresentation)
 	{
 		ReconcileLocalPresentations();
+	}
+}
+
+void UPEPEquipmentComponent::RefreshSuppressedPresentationItems()
+{
+	SuppressedPresentationItems.Reset();
+	for (const TPair<FName, FPEPItemId>& Pair : TemporarySuppressedItems)
+	{
+		SuppressedPresentationItems.Add(Pair.Value);
+	}
+}
+
+void UPEPEquipmentComponent::RebuildTemporaryPresentations()
+{
+	if (!HasBegunPlay())
+	{
+		return;
+	}
+	TArray<FPEPTemporaryPresentationEntry> Specs;
+	AppliedTemporaryPresentations.GenerateValueArray(Specs);
+	for (const FPEPTemporaryPresentationEntry& Spec : Specs)
+	{
+		ShowTemporaryPresentationLocal(
+			Spec.PresentationKey,
+			Spec.DefinitionId,
+			Spec.AttachSocket,
+			Spec.SuppressedItemId);
 	}
 }
 

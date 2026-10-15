@@ -14,16 +14,6 @@ const FPEPPresentationTargetDefinition* UPEPEquipmentProfile::FindPresentationTa
 		});
 }
 
-const FPEPEquipmentSlotDefinition* UPEPEquipmentProfile::FindSlot(
-	const FGameplayTag SlotTag) const
-{
-	return Slots.FindByPredicate(
-		[SlotTag](const FPEPEquipmentSlotDefinition& Slot)
-		{
-			return Slot.SlotTag == SlotTag;
-		});
-}
-
 #if WITH_EDITOR
 EDataValidationResult UPEPEquipmentProfile::IsDataValid(
 	FDataValidationContext& Context) const
@@ -86,6 +76,18 @@ EDataValidationResult UPEPEquipmentProfile::IsDataValid(
 				*Slot.SlotTag.ToString(),
 				*Slot.PresentationTargetTag.ToString())));
 			Result = EDataValidationResult::Invalid;
+		}
+		if (!Slot.bShowPublicly)
+		{
+			/*
+			 * Legitimate (a secure pouch nobody should see), but easy to set without realising what
+			 * else hangs off the public projection: equipment events and the GMAS ability bridge.
+			 */
+			Context.AddWarning(FText::FromString(FString::Printf(
+				TEXT("Slot '%s' is not shown publicly: its occupant gets no visual, raises no "
+					"OnItemEquipped/OnItemUnequipped and grants no ability or effect through "
+					"PEPEquipmentGMAS."),
+				*Slot.SlotTag.ToString())));
 		}
 		if (Slot.Hand != EPEPEquipmentHand::None)
 		{

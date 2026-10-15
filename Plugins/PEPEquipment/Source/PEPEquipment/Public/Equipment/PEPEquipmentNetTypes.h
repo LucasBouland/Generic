@@ -10,44 +10,60 @@
 
 class UPEPEquipmentComponent;
 
-/** Public projection only: roots and visible attachments, never full instances or private content. */
-USTRUCT(BlueprintType)
+/**
+ * Replicated item of the public projection: roots and visible attachments, never full instances
+ * or private content.
+ *
+ * Internal to replication. Getters and events hand out FPEPEquippedItemInfo instead, which holds
+ * the same fields without the Fast Array bookkeeping. The hand a node occupies is not sent: every
+ * machine derives it from SlotTag through the same equipment profile.
+ */
+USTRUCT()
 struct PEPEQUIPMENT_API FPEPEquippedItemPublic : public FFastArraySerializerItem
 {
 	GENERATED_BODY()
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	UPROPERTY()
 	FPEPItemId ItemId;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	UPROPERTY()
 	FPrimaryAssetId DefinitionId;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment", meta=(Categories="Equipment.Slot"))
+	UPROPERTY()
 	FGameplayTag SlotTag;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
-	EPEPEquipmentHand Hand = EPEPEquipmentHand::None;
-
 	/** Valid only for a visible attachment. Invalid for an equipment-slot root. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	UPROPERTY()
 	FPEPItemId ParentItemId;
 
 	/** Container slot on ParentItemId. The parent's presentation resolves it to a mesh socket. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	UPROPERTY()
 	FName ParentSlotName;
 
 	bool IsAttachment() const
 	{
 		return ParentItemId.IsValid();
 	}
+
+	FPEPEquippedItemInfo ToInfo() const
+	{
+		FPEPEquippedItemInfo Info;
+		Info.ItemId = ItemId;
+		Info.DefinitionId = DefinitionId;
+		Info.SlotTag = SlotTag;
+		Info.ParentItemId = ParentItemId;
+		Info.ParentSlotName = ParentSlotName;
+		return Info;
+	}
 };
 
-USTRUCT(BlueprintType)
+/** Not Blueprint-facing: read the projection through UPEPEquipmentComponent's getters. */
+USTRUCT()
 struct PEPEQUIPMENT_API FPEPPublicEquipmentView : public FFastArraySerializer
 {
 	GENERATED_BODY()
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="PEP|Equipment")
+	UPROPERTY()
 	TArray<FPEPEquippedItemPublic> Entries;
 
 	bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParams)
@@ -61,6 +77,10 @@ struct PEPEQUIPMENT_API FPEPPublicEquipmentView : public FFastArraySerializer
 	void PostReplicatedReceive(
 		const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
 
+private:
+	friend class UPEPEquipmentComponent;
+
+	/** Raw back-reference, restored by the owner on register and BeginPlay; never serialized. */
 	UPEPEquipmentComponent* OwnerComponent = nullptr;
 };
 
@@ -125,6 +145,10 @@ struct PEPEQUIPMENT_API FPEPTemporaryPresentationView : public FFastArraySeriali
 	void PostReplicatedReceive(
 		const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
 
+private:
+	friend class UPEPEquipmentComponent;
+
+	/** Raw back-reference, restored by the owner on register and BeginPlay; never serialized. */
 	UPEPEquipmentComponent* OwnerComponent = nullptr;
 };
 
