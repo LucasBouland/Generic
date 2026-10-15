@@ -9,8 +9,11 @@
 #include "Engine/EngineTypes.h"
 #include "Engine/OverlapResult.h"
 #include "Engine/World.h"
+#include "GameFramework/GameStateBase.h"
 #include "Interaction/PEPInteractionInteractable.h"
+#include "Interaction/PEPInteractionTags.h"
 #include "Interaction/PEPInteractionTargetComponent.h"
+#include "Net/UnrealNetwork.h"
 
 namespace PEPInteractionSelection
 {
@@ -23,6 +26,29 @@ namespace PEPInteractionSelection
 	};
 }
 
+namespace PEPInteractionExecution
+{
+	/*
+	 * Listeners match outcomes to requests by target and tag; an interactable that returns a bare
+	 * Failure(Reason) must not make its outcome unidentifiable.
+	 */
+	FPEPInteractionResult WithRequestIdentity(
+		FPEPInteractionResult Result,
+		AActor* RequestedTarget,
+		const FGameplayTag InteractionTag)
+	{
+		if (!Result.Target)
+		{
+			Result.Target = RequestedTarget;
+		}
+		if (!Result.InteractionTag.IsValid())
+		{
+			Result.InteractionTag = InteractionTag;
+		}
+		return Result;
+	}
+}
+
 UPEPInteractionComponent::UPEPInteractionComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
@@ -32,6 +58,24 @@ UPEPInteractionComponent::UPEPInteractionComponent()
 void UPEPInteractionComponent::BeginPlay()
 {
 	Super::BeginPlay();
+}
+
+void UPEPInteractionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	/* The target may hold state for the interaction (a door half-open, a reserved user). */
+	if (HasInteractionAuthority())
+	{
+		CancelInteraction(PEPInteractionTags::Reason_Interaction_Interrupted);
+	}
+	Super::EndPlay(EndPlayReason);
+}
+
+void UPEPInteractionComponent::GetLifetimeReplicatedProps(
+	TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	/* Progress is only of interest to the interacting player; nobody else is told. */
+	DOREPLIFETIME_CONDITION(ThisClass, ActiveInteraction, COND_OwnerOnly);
 }
 
 void UPEPInteractionComponent::Init(AActor* InInteractor)
@@ -54,6 +98,15 @@ void UPEPInteractionComponent::TickComponent(
 		DeltaTime,
 		TickType,
 		ThisTickFunction);
+
+	/*
+	 * Before the local selection gate on purpose: on a dedicated server the interactor is a remote
+	 * pawn with no local selection, and its timed interaction must still progress there.
+	 */
+	if (IsInteractionInProgress() && HasInteractionAuthority())
+	{
+		TickActiveInteraction(GetInteractionClockSeconds());
+	}
 
 	if (!ShouldPerformLocalSelection())
 	{
@@ -112,14 +165,23 @@ UPEPInteractionComponent::RequestInteractWithInteractionTag(
 	if (Owner->HasAuthority())
 	{
 		const FPEPInteractionResult Result =
-			ExecuteInteractWithInteractionTag(
+			BeginInteractWithInteractionTag(
 				RequestedTarget,
 				InteractionTag);
 
+		if (!Result.bSuccess)
+		{
+			return RecordAndReturn(EPEPRequestResult::Failed);
+		}
+
+		/* A timed interaction accepted but not executed yet is pending, like a client request. */
+		const bool bStartedTimedInteraction = IsInteractionInProgress()
+			&& ActiveInteraction.Target == RequestedTarget
+			&& ActiveInteraction.InteractionTag == InteractionTag;
 		return RecordAndReturn(
-			Result.bSuccess
-				? EPEPRequestResult::Executed
-				: EPEPRequestResult::Failed);
+			bStartedTimedInteraction
+				? EPEPRequestResult::Submitted
+				: EPEPRequestResult::Executed);
 	}
 
 	Server_RequestInteractWithInteractionTag(
@@ -134,9 +196,37 @@ Server_RequestInteractWithInteractionTag_Implementation(
 	AActor* RequestedTarget,
 	const FGameplayTag InteractionTag)
 {
-	ExecuteInteractWithInteractionTag(
+	BeginInteractWithInteractionTag(
 		RequestedTarget,
 		InteractionTag);
+}
+
+EPEPRequestResult UPEPInteractionComponent::RequestCancelInteraction()
+{
+	const AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return EPEPRequestResult::Failed;
+	}
+
+	if (Owner->HasAuthority())
+	{
+		return CancelInteraction(PEPInteractionTags::Reason_Interaction_Cancelled)
+			? EPEPRequestResult::Executed
+			: EPEPRequestResult::Failed;
+	}
+
+	/*
+	 * Sent even when nothing looks in progress here: the replicated state lags the server, and
+	 * reliable RPCs keep this cancel ordered after the request that started the interaction.
+	 */
+	Server_RequestCancelInteraction();
+	return EPEPRequestResult::Submitted;
+}
+
+void UPEPInteractionComponent::Server_RequestCancelInteraction_Implementation()
+{
+	CancelInteraction(PEPInteractionTags::Reason_Interaction_Cancelled);
 }
 
 FPEPInteractionResult
@@ -312,6 +402,23 @@ UPEPInteractionComponent::ExecuteInteractWithInteractionTag(
 	AActor* RequestedTarget,
 	const FGameplayTag InteractionTag)
 {
+	const FPEPInteractionResult Result =
+		ValidateAndExecuteInteraction(
+			RequestedTarget,
+			InteractionTag);
+
+	if (HasInteractionAuthority())
+	{
+		NotifyInteractionCompleted(0, Result);
+	}
+	return Result;
+}
+
+FPEPInteractionResult
+UPEPInteractionComponent::ValidateAndExecuteInteraction(
+	AActor* RequestedTarget,
+	const FGameplayTag InteractionTag)
+{
 	const FPEPInteractionResult Validation =
 		ValidateInteraction(
 			RequestedTarget,
@@ -319,14 +426,375 @@ UPEPInteractionComponent::ExecuteInteractWithInteractionTag(
 
 	if (!Validation.bSuccess)
 	{
-		return Validation;
+		return PEPInteractionExecution::WithRequestIdentity(
+			Validation,
+			RequestedTarget,
+			InteractionTag);
 	}
 
-	return IPEPInteractionInteractable::
+	return PEPInteractionExecution::WithRequestIdentity(
+		IPEPInteractionInteractable::
 		Execute_ExecuteInteraction(
 			RequestedTarget,
 			Interactor,
+			InteractionTag),
+		RequestedTarget,
+		InteractionTag);
+}
+
+FPEPInteractionResult
+UPEPInteractionComponent::BeginInteractWithInteractionTag(
+	AActor* RequestedTarget,
+	const FGameplayTag InteractionTag)
+{
+	if (!HasInteractionAuthority())
+	{
+		return FPEPInteractionResult::Failure(
+			PEPCoreTags::Reason_NotAuthority,
+			RequestedTarget,
 			InteractionTag);
+	}
+
+	/* A repeated request (input repeat, duplicate RPC) must not restart the hold from zero. */
+	if (IsInteractionInProgress()
+		&& ActiveInteraction.Target == RequestedTarget
+		&& ActiveInteraction.InteractionTag == InteractionTag)
+	{
+		return FPEPInteractionResult::Success(
+			RequestedTarget,
+			InteractionTag);
+	}
+
+	const FPEPInteractionResult Validation =
+		ValidateInteraction(
+			RequestedTarget,
+			InteractionTag);
+
+	if (!Validation.bSuccess)
+	{
+		const FPEPInteractionResult Failure =
+			PEPInteractionExecution::WithRequestIdentity(
+				Validation,
+				RequestedTarget,
+				InteractionTag);
+		NotifyInteractionCompleted(0, Failure);
+		return Failure;
+	}
+
+	const float Duration =
+		ResolveInteractionDuration(
+			RequestedTarget,
+			InteractionTag);
+
+	if (Duration <= 0.0f)
+	{
+		const FPEPInteractionResult Result =
+			PEPInteractionExecution::WithRequestIdentity(
+				IPEPInteractionInteractable::
+				Execute_ExecuteInteraction(
+					RequestedTarget,
+					Interactor,
+					InteractionTag),
+				RequestedTarget,
+				InteractionTag);
+		NotifyInteractionCompleted(0, Result);
+		return Result;
+	}
+
+	/* One timed interaction at a time: the newer request wins. */
+	CancelInteraction(PEPInteractionTags::Reason_Interaction_Cancelled);
+
+	StartActiveInteraction(
+		RequestedTarget,
+		InteractionTag,
+		Duration);
+
+	return FPEPInteractionResult::Success(
+		RequestedTarget,
+		InteractionTag);
+}
+
+bool UPEPInteractionComponent::CancelInteraction(const FGameplayTag ReasonTag)
+{
+	if (!HasInteractionAuthority() || !IsInteractionInProgress())
+	{
+		return false;
+	}
+
+	const FPEPActiveInteraction Cancelled = ActiveInteraction;
+	ClearActiveInteraction();
+
+	const FGameplayTag Reason = ReasonTag.IsValid()
+		? ReasonTag
+		: PEPInteractionTags::Reason_Interaction_Cancelled.GetTag();
+
+	AActor* CancelledTarget = Cancelled.Target;
+	if (IsValid(CancelledTarget)
+		&& CancelledTarget->GetClass()->ImplementsInterface(
+			UPEPInteractionInteractable::StaticClass()))
+	{
+		IPEPInteractionInteractable::
+			Execute_OnInteractionCancelled(
+				CancelledTarget,
+				Interactor,
+				Cancelled.InteractionTag,
+				Reason);
+	}
+
+	NotifyInteractionCancelled(
+		Cancelled.InteractionId,
+		CancelledTarget,
+		Cancelled.InteractionTag,
+		Reason);
+	return true;
+}
+
+float UPEPInteractionComponent::ResolveInteractionDuration(
+	AActor* RequestedTarget,
+	const FGameplayTag InteractionTag) const
+{
+	if (!IsValid(RequestedTarget)
+		|| !RequestedTarget->GetClass()->ImplementsInterface(
+			UPEPInteractionInteractable::StaticClass()))
+	{
+		return 0.0f;
+	}
+
+	return FMath::Max(
+		0.0f,
+		IPEPInteractionInteractable::
+		Execute_GetInteractionDuration(
+			RequestedTarget,
+			Interactor,
+			InteractionTag));
+}
+
+void UPEPInteractionComponent::StartActiveInteraction(
+	AActor* RequestedTarget,
+	const FGameplayTag InteractionTag,
+	const float Duration)
+{
+	++LastAllocatedInteractionId;
+
+	ActiveInteraction.InteractionId = LastAllocatedInteractionId;
+	ActiveInteraction.Target = RequestedTarget;
+	ActiveInteraction.InteractionTag = InteractionTag;
+	ActiveInteraction.StartServerTime = GetInteractionClockSeconds();
+	ActiveInteraction.Duration = Duration;
+	LastStartedInteractionId = LastAllocatedInteractionId;
+
+	IPEPInteractionInteractable::
+		Execute_OnInteractionStarted(
+			RequestedTarget,
+			Interactor,
+			InteractionTag);
+
+	OnInteractionStarted.Broadcast(
+		RequestedTarget,
+		InteractionTag,
+		Duration);
+}
+
+void UPEPInteractionComponent::TickActiveInteraction(const double ServerTimeSeconds)
+{
+	if (!HasInteractionAuthority() || !IsInteractionInProgress())
+	{
+		return;
+	}
+
+	const FPEPInteractionResult Validation =
+		ValidateInteraction(
+			ActiveInteraction.Target,
+			ActiveInteraction.InteractionTag);
+
+	if (!Validation.bSuccess)
+	{
+		CancelInteraction(
+			Validation.ReasonTag.IsValid()
+				? Validation.ReasonTag
+				: PEPInteractionTags::Reason_Interaction_Interrupted.GetTag());
+		return;
+	}
+
+	if (ServerTimeSeconds - ActiveInteraction.StartServerTime >= ActiveInteraction.Duration)
+	{
+		CompleteActiveInteraction();
+	}
+}
+
+void UPEPInteractionComponent::CompleteActiveInteraction()
+{
+	const FPEPActiveInteraction Completed = ActiveInteraction;
+
+	/* Cleared first, so whatever the execution triggers sees no interaction in progress. */
+	ClearActiveInteraction();
+
+	const FPEPInteractionResult Result =
+		ValidateAndExecuteInteraction(
+			Completed.Target,
+			Completed.InteractionTag);
+
+	NotifyInteractionCompleted(
+		Completed.InteractionId,
+		Result);
+}
+
+void UPEPInteractionComponent::ClearActiveInteraction()
+{
+	LastEndedInteractionId = FMath::Max(
+		LastEndedInteractionId,
+		ActiveInteraction.InteractionId);
+	ActiveInteraction = FPEPActiveInteraction();
+}
+
+void UPEPInteractionComponent::NotifyInteractionCompleted(
+	const int32 InteractionId,
+	const FPEPInteractionResult& Result)
+{
+	OnInteractionCompleted.Broadcast(Result);
+
+	/* Runs locally, and is then ignored, when the owner is not a remote client. */
+	Client_NotifyInteractionCompleted(
+		InteractionId,
+		Result);
+}
+
+void UPEPInteractionComponent::NotifyInteractionCancelled(
+	const int32 InteractionId,
+	AActor* CancelledTarget,
+	const FGameplayTag InteractionTag,
+	const FGameplayTag ReasonTag)
+{
+	OnInteractionCancelled.Broadcast(
+		CancelledTarget,
+		InteractionTag,
+		ReasonTag);
+
+	Client_NotifyInteractionCancelled(
+		InteractionId,
+		CancelledTarget,
+		InteractionTag,
+		ReasonTag);
+}
+
+void UPEPInteractionComponent::Client_NotifyInteractionCompleted_Implementation(
+	const int32 InteractionId,
+	const FPEPInteractionResult& Result)
+{
+	/* The authority broadcast when it happened (listen server host, standalone, unowned actor). */
+	if (HasInteractionAuthority())
+	{
+		return;
+	}
+
+	LastEndedInteractionId = FMath::Max(
+		LastEndedInteractionId,
+		InteractionId);
+	OnInteractionCompleted.Broadcast(Result);
+}
+
+void UPEPInteractionComponent::Client_NotifyInteractionCancelled_Implementation(
+	const int32 InteractionId,
+	AActor* CancelledTarget,
+	const FGameplayTag InteractionTag,
+	const FGameplayTag ReasonTag)
+{
+	if (HasInteractionAuthority())
+	{
+		return;
+	}
+
+	LastEndedInteractionId = FMath::Max(
+		LastEndedInteractionId,
+		InteractionId);
+	OnInteractionCancelled.Broadcast(
+		CancelledTarget,
+		InteractionTag,
+		ReasonTag);
+}
+
+void UPEPInteractionComponent::OnRep_ActiveInteraction()
+{
+	/*
+	 * Started is announced from the replicated state, so listeners can already query progress.
+	 * An interaction whose end was already notified (the RPC overtook the state) stays silent.
+	 */
+	if (!IsInteractionInProgress()
+		|| ActiveInteraction.InteractionId == LastStartedInteractionId)
+	{
+		return;
+	}
+
+	LastStartedInteractionId = ActiveInteraction.InteractionId;
+	OnInteractionStarted.Broadcast(
+		ActiveInteraction.Target,
+		ActiveInteraction.InteractionTag,
+		ActiveInteraction.Duration);
+}
+
+bool UPEPInteractionComponent::IsInteractionInProgress() const
+{
+	return ActiveInteraction.IsActive()
+		&& ActiveInteraction.InteractionId > LastEndedInteractionId;
+}
+
+AActor* UPEPInteractionComponent::GetActiveInteractionTarget() const
+{
+	return IsInteractionInProgress() ? ActiveInteraction.Target.Get() : nullptr;
+}
+
+FGameplayTag UPEPInteractionComponent::GetActiveInteractionTag() const
+{
+	return IsInteractionInProgress() ? ActiveInteraction.InteractionTag : FGameplayTag();
+}
+
+float UPEPInteractionComponent::GetActiveInteractionDuration() const
+{
+	return IsInteractionInProgress() ? ActiveInteraction.Duration : 0.0f;
+}
+
+float UPEPInteractionComponent::GetInteractionProgress() const
+{
+	return GetInteractionProgressAtTime(GetInteractionClockSeconds());
+}
+
+float UPEPInteractionComponent::GetInteractionProgressAtTime(const double ServerTimeSeconds) const
+{
+	if (!IsInteractionInProgress())
+	{
+		return 0.0f;
+	}
+	if (ActiveInteraction.Duration <= KINDA_SMALL_NUMBER)
+	{
+		return 1.0f;
+	}
+
+	const double Elapsed = ServerTimeSeconds - ActiveInteraction.StartServerTime;
+	return FMath::Clamp(
+		static_cast<float>(Elapsed / ActiveInteraction.Duration),
+		0.0f,
+		1.0f);
+}
+
+double UPEPInteractionComponent::GetInteractionClockSeconds() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return 0.0;
+	}
+
+	if (const AGameStateBase* GameState = World->GetGameState())
+	{
+		return GameState->GetServerWorldTimeSeconds();
+	}
+	return World->GetTimeSeconds();
+}
+
+bool UPEPInteractionComponent::HasInteractionAuthority() const
+{
+	const AActor* Owner = GetOwner();
+	return Owner && Owner->HasAuthority();
 }
 
 void UPEPInteractionComponent::RefreshTarget()
@@ -863,5 +1331,20 @@ void UPEPInteractionComponent::DrawInteractionDebug() const
 	}
 
 	GEngine->AddOnScreenDebugMessage(BaseKey + 2, 0.0f, FColor::Yellow, InteractionLine);
+
+	if (IsInteractionInProgress())
+	{
+		const AActor* ActiveTarget = GetActiveInteractionTarget();
+		GEngine->AddOnScreenDebugMessage(
+			BaseKey + 3,
+			0.0f,
+			FColor::Orange,
+			FString::Printf(
+				TEXT("[PEPInteraction] In progress: %s on %s (%.0f%% of %.2fs)"),
+				*GetActiveInteractionTag().ToString(),
+				ActiveTarget ? *ActiveTarget->GetName() : TEXT("None"),
+				GetInteractionProgress() * 100.0f,
+				GetActiveInteractionDuration()));
+	}
 }
 #endif

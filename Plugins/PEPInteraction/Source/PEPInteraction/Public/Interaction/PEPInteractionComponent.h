@@ -19,7 +19,40 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
 	FOnPEPInteractionSelectedOptionChanged,
 	FGameplayTag, SelectedOption);
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+	FOnPEPInteractionStarted,
+	AActor*, Target,
+	FGameplayTag, InteractionTag,
+	float, Duration);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+	FOnPEPInteractionCompleted,
+	const FPEPInteractionResult&, Result);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+	FOnPEPInteractionCancelled,
+	AActor*, Target,
+	FGameplayTag, InteractionTag,
+	FGameplayTag, ReasonTag);
+
+/**
+ * Selects interaction targets for the local player and runs interactions on the authority.
+ *
+ * Selection is local and never replicated. Execution is authoritative: instant options execute
+ * as soon as the authority accepts the request; timed options (GetInteractionDuration > 0) start
+ * an active interaction that the authority re-validates every tick and executes when its duration
+ * elapses. The active interaction replicates to the owning client for progress display.
+ *
+ * Events: OnInteractionStarted, OnInteractionCompleted and OnInteractionCancelled fire on the
+ * authority and on the owning client. Every request the authority handles ends with exactly one
+ * OnInteractionCompleted (carrying the execution result, success or failure, including requests
+ * rejected by validation) or, for a timed interaction that started, OnInteractionCancelled. The
+ * only exception is a repeated request for the interaction already in progress, which is absorbed.
+ * Changing the local selection never cancels a timed interaction: cancellation is explicit
+ * (RequestCancelInteraction, CancelInteraction) or the result of failed re-validation.
+ */
 UCLASS(
+	Blueprintable,
 	ClassGroup=(PEP),
 	meta=(BlueprintSpawnableComponent))
 class PEPINTERACTION_API UPEPInteractionComponent
@@ -31,6 +64,11 @@ public:
 	UPEPInteractionComponent();
 
 	virtual void BeginPlay() override;
+
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+	virtual void GetLifetimeReplicatedProps(
+		TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	virtual void TickComponent(
 		float DeltaTime,
@@ -64,21 +102,88 @@ public:
 	FOnPEPInteractionSelectedOptionChanged OnSelectedOptionChanged;
 
 	/*
-	 * Point d'entrée depuis l'input local.
+	 * Entry point for local input, acting on the currently selected target.
+	 *
+	 * The authority handles the request through BeginInteractWithInteractionTag: an instant option
+	 * returns Executed or Failed, a timed option that started returns Submitted. A client always
+	 * returns Submitted once the request is sent; the outcome arrives through the events.
 	 */
 	UFUNCTION(BlueprintCallable, Category="PEP|Interaction")
 	EPEPRequestResult RequestInteractWithInteractionTag(
 		FGameplayTag InteractionTag);
 
 	/*
-	 * Exécuteur autoritaire.
+	 * Authority executor: validates, then executes immediately, ignoring GetInteractionDuration.
 	 *
-	 * Peut aussi être appelé depuis une ability déjà exécutée côté serveur.
+	 * For server-side code (an ability) that owns its own timing. Fires OnInteractionCompleted.
+	 * A timed interaction already in progress is left running.
 	 */
 	UFUNCTION(BlueprintCallable, Category="PEP|Interaction")
 	FPEPInteractionResult ExecuteInteractWithInteractionTag(
 		AActor* RequestedTarget,
 		FGameplayTag InteractionTag);
+
+	/*
+	 * Authority entry point honouring GetInteractionDuration.
+	 *
+	 * Validates, then executes immediately when the option is instant, or starts a timed
+	 * interaction (returning success without executing yet). Starting one cancels the previous one
+	 * with Reason.Interaction.Cancelled; requesting the interaction already in progress keeps it
+	 * running and returns success. Rejections fire OnInteractionCompleted with the failure.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Interaction")
+	FPEPInteractionResult BeginInteractWithInteractionTag(
+		AActor* RequestedTarget,
+		FGameplayTag InteractionTag);
+
+	/*
+	 * Entry point for local input releasing a timed interaction.
+	 *
+	 * The authority cancels directly (Executed, or Failed if nothing was in progress). A client
+	 * always sends the request (Submitted), even when it has not yet seen the interaction start,
+	 * so that a quick tap still stops a hold the server has just begun.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Interaction")
+	EPEPRequestResult RequestCancelInteraction();
+
+	/*
+	 * Authority executor: stops the timed interaction in progress, if any, without executing it.
+	 * An invalid ReasonTag falls back to Reason.Interaction.Cancelled. Returns false if nothing was
+	 * in progress or this is not the authority.
+	 */
+	UFUNCTION(BlueprintCallable, Category="PEP|Interaction")
+	bool CancelInteraction(
+		UPARAM(meta=(Categories="Reason")) FGameplayTag ReasonTag);
+
+	/** True while a timed interaction runs. Valid on the authority and on the owning client. */
+	UFUNCTION(BlueprintPure, Category="PEP|Interaction")
+	bool IsInteractionInProgress() const;
+
+	UFUNCTION(BlueprintPure, Category="PEP|Interaction")
+	AActor* GetActiveInteractionTarget() const;
+
+	UFUNCTION(BlueprintPure, Category="PEP|Interaction")
+	FGameplayTag GetActiveInteractionTag() const;
+
+	/** Duration of the timed interaction in progress, in seconds; 0 when none. */
+	UFUNCTION(BlueprintPure, Category="PEP|Interaction")
+	float GetActiveInteractionDuration() const;
+
+	/**
+	 * Progress of the timed interaction in progress, from 0 to 1; 0 when none. On the owning client
+	 * this is an estimate from the replicated server clock: the authority decides completion.
+	 */
+	UFUNCTION(BlueprintPure, Category="PEP|Interaction")
+	float GetInteractionProgress() const;
+
+	UPROPERTY(BlueprintAssignable, Category="PEP|Interaction")
+	FOnPEPInteractionStarted OnInteractionStarted;
+
+	UPROPERTY(BlueprintAssignable, Category="PEP|Interaction")
+	FOnPEPInteractionCompleted OnInteractionCompleted;
+
+	UPROPERTY(BlueprintAssignable, Category="PEP|Interaction")
+	FOnPEPInteractionCancelled OnInteractionCancelled;
 
 protected:
 	UFUNCTION(Server, Reliable)
@@ -86,36 +191,107 @@ protected:
 		AActor* RequestedTarget,
 		FGameplayTag InteractionTag);
 
-	FPEPInteractionResult ValidateInteraction(
+	UFUNCTION(Server, Reliable)
+	void Server_RequestCancelInteraction();
+
+	/*
+	 * Outcome notifications for the owning client. Reliable RPCs rather than replicated state:
+	 * the cleared ActiveInteraction cannot say how an interaction ended, and an instant one never
+	 * appears in it at all. InteractionId is 0 for instant executions.
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_NotifyInteractionCompleted(
+		int32 InteractionId,
+		const FPEPInteractionResult& Result);
+
+	UFUNCTION(Client, Reliable)
+	void Client_NotifyInteractionCancelled(
+		int32 InteractionId,
+		AActor* CancelledTarget,
+		FGameplayTag InteractionTag,
+		FGameplayTag ReasonTag);
+
+	UFUNCTION()
+	void OnRep_ActiveInteraction();
+
+	/*
+	 * Full authority validation: target, range (Range + ServerRangeTolerance), offered options,
+	 * line of sight and CanInteract. Used for requests and for every tick of a timed interaction.
+	 */
+	virtual FPEPInteractionResult ValidateInteraction(
 		AActor* RequestedTarget,
 		FGameplayTag InteractionTag) const;
 
-	bool ValidateLineOfSight(
+	virtual bool ValidateLineOfSight(
 		AActor* RequestedTarget) const;
 
-	bool HasLineOfSightToTarget(
+	virtual bool HasLineOfSightToTarget(
 		AActor* RequestedTarget,
 		const FVector& ViewLocation) const;
 
 	void RefreshTarget();
 
-	FVector GetTraceStartLocation() const;
+	virtual FVector GetTraceStartLocation() const;
 
-	FVector GetSelectionAxis() const;
+	virtual FVector GetSelectionAxis() const;
 
-	bool IsWithinSelectionVolume(
+	virtual bool IsWithinSelectionVolume(
 		AActor* Candidate,
 		const FVector& Start,
 		const FVector& Axis) const;
 
-	float CalculateCandidateScore(
+	virtual float CalculateCandidateScore(
 		AActor* Candidate,
 		const FVector& Start,
 		const FVector& ViewForward,
 		float& OutAimAlignment,
 		float& OutDistance) const;
 
-	bool ShouldPerformLocalSelection() const;
+	virtual bool ShouldPerformLocalSelection() const;
+
+	/* Asks the target for the option's duration. Override to scale it (skills, buffs, ...). */
+	virtual float ResolveInteractionDuration(
+		AActor* RequestedTarget,
+		FGameplayTag InteractionTag) const;
+
+	/*
+	 * Authority: re-validates the timed interaction in progress at ServerTimeSeconds, cancelling it
+	 * with the validation reason on failure, and executes it once its duration has elapsed.
+	 * Called from TickComponent with GetInteractionClockSeconds().
+	 */
+	virtual void TickActiveInteraction(double ServerTimeSeconds);
+
+	/* Server world time from the GameState when there is one, else the world's own time. */
+	double GetInteractionClockSeconds() const;
+
+	float GetInteractionProgressAtTime(double ServerTimeSeconds) const;
+
+	bool HasInteractionAuthority() const;
+
+	/* Validates then calls ExecuteInteraction on the target, without notifying anyone. */
+	FPEPInteractionResult ValidateAndExecuteInteraction(
+		AActor* RequestedTarget,
+		FGameplayTag InteractionTag);
+
+	void StartActiveInteraction(
+		AActor* RequestedTarget,
+		FGameplayTag InteractionTag,
+		float Duration);
+
+	void CompleteActiveInteraction();
+
+	/* Forgets the active interaction, remembering its id as ended. */
+	void ClearActiveInteraction();
+
+	void NotifyInteractionCompleted(
+		int32 InteractionId,
+		const FPEPInteractionResult& Result);
+
+	void NotifyInteractionCancelled(
+		int32 InteractionId,
+		AActor* CancelledTarget,
+		FGameplayTag InteractionTag,
+		FGameplayTag ReasonTag);
 
 	void NotifySelectionIfChanged();
 
@@ -162,6 +338,33 @@ protected:
 
 	UPROPERTY(Transient)
 	float TargetSelectionScore = 0.0f;
+
+	/*
+	 * Timed interaction run by the authority, replicated to the owning client only.
+	 * Independent of the local selection: changing the selected target never cancels it.
+	 */
+	UPROPERTY(
+		VisibleInstanceOnly,
+		Transient,
+		ReplicatedUsing=OnRep_ActiveInteraction,
+		Category="PEP|Interaction")
+	FPEPActiveInteraction ActiveInteraction;
+
+	/* Authority: last id allocated to a timed interaction. */
+	UPROPERTY(Transient)
+	int32 LastAllocatedInteractionId = 0;
+
+	/*
+	 * Highest interaction id known to have ended. On the owning client the end notification can
+	 * arrive before the replicated state clears; this keeps that stale state from reading as active
+	 * or from broadcasting a late OnInteractionStarted.
+	 */
+	UPROPERTY(Transient)
+	int32 LastEndedInteractionId = 0;
+
+	/* Last id OnInteractionStarted was broadcast for, so a re-sent state does not broadcast twice. */
+	UPROPERTY(Transient)
+	int32 LastStartedInteractionId = 0;
 
 	UPROPERTY(
 		EditAnywhere,

@@ -1,0 +1,93 @@
+#include "Tests/PEPInteractionTestTypes.h"
+
+#include "Components/SceneComponent.h"
+#include "Core/PEPCoreTags.h"
+
+APEPInteractionTestTarget::APEPInteractionTestTarget()
+{
+	/* A root so the tests can place the target relative to the interactor. */
+	RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+}
+
+TArray<FGameplayTag> APEPInteractionTestTarget::GetInteractOptionTags_Implementation(
+	AActor* Interactor) const
+{
+	return Options;
+}
+
+FPEPInteractionResult APEPInteractionTestTarget::CanInteract_Implementation(
+	AActor* Interactor,
+	const FGameplayTag InteractionTag) const
+{
+	if (!bAllowInteraction)
+	{
+		return FPEPInteractionResult::Failure(
+			PEPCoreTags::Reason_BlockedByState,
+			const_cast<ThisClass*>(this),
+			InteractionTag);
+	}
+	return FPEPInteractionResult::Success(
+		const_cast<ThisClass*>(this),
+		InteractionTag);
+}
+
+FPEPInteractionResult APEPInteractionTestTarget::ExecuteInteraction_Implementation(
+	AActor* Interactor,
+	const FGameplayTag InteractionTag)
+{
+	++ExecuteCount;
+	return FPEPInteractionResult::Success(this, InteractionTag);
+}
+
+float APEPInteractionTestTimedTarget::GetInteractionDuration_Implementation(
+	AActor* Interactor,
+	const FGameplayTag InteractionTag) const
+{
+	return Duration;
+}
+
+void APEPInteractionTestTimedTarget::OnInteractionStarted_Implementation(
+	AActor* Interactor,
+	const FGameplayTag InteractionTag)
+{
+	++StartedCount;
+}
+
+void APEPInteractionTestTimedTarget::OnInteractionCancelled_Implementation(
+	AActor* Interactor,
+	const FGameplayTag InteractionTag,
+	const FGameplayTag ReasonTag)
+{
+	++CancelledCount;
+	LastCancelReason = ReasonTag;
+}
+
+void UPEPInteractionTestListener::Bind(UPEPInteractionComponent* Component)
+{
+	Component->OnInteractionStarted.AddDynamic(this, &ThisClass::HandleStarted);
+	Component->OnInteractionCompleted.AddDynamic(this, &ThisClass::HandleCompleted);
+	Component->OnInteractionCancelled.AddDynamic(this, &ThisClass::HandleCancelled);
+}
+
+void UPEPInteractionTestListener::HandleStarted(
+	AActor* Target,
+	const FGameplayTag InteractionTag,
+	const float Duration)
+{
+	++StartedCount;
+}
+
+void UPEPInteractionTestListener::HandleCompleted(const FPEPInteractionResult& Result)
+{
+	++CompletedCount;
+	LastResult = Result;
+}
+
+void UPEPInteractionTestListener::HandleCancelled(
+	AActor* Target,
+	const FGameplayTag InteractionTag,
+	const FGameplayTag ReasonTag)
+{
+	++CancelledCount;
+	LastCancelReason = ReasonTag;
+}

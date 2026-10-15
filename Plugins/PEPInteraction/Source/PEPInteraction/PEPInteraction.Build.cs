@@ -13,14 +13,7 @@ public class PEPInteraction : ModuleRules
 			"DeveloperSettings",
 			"Engine",
 			"GameplayTags",
-			"PEPCore",
-			"SlateCore",
-			"UMG"
-		});
-
-		PrivateDependencyModuleNames.AddRange(new[]
-		{
-			"Slate"
+			"PEPCore"
 		});
 	}
 }
